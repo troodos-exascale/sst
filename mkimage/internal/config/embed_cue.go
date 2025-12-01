@@ -1,4 +1,4 @@
-package image
+package config
 
 import _ "embed"
 

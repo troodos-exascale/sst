@@ -1,4 +1,4 @@
-package qcow
+package image
 
 import (
 	"fmt"

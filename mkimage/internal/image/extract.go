@@ -1,8 +1,8 @@
-package qcow
+package image
 
 import (
 	"fmt"
-	"mkimage/internal/kernel"
+
 	"mkimage/internal/util"
 	"os"
 	"path/filepath"
@@ -132,7 +132,7 @@ func copyArtifacts(srcKernel, srcInitrd, destDir string) (string, string, error)
 	dstInitrd := filepath.Join(destDir, "initrd")
 
 	fmt.Printf("processing kernel...\n")
-	if err := kernel.ExtractRawKernel(srcKernel, dstKernel); err != nil {
+	if err := ExtractRawKernel(srcKernel, dstKernel); err != nil {
 		return "", "", fmt.Errorf("failed to process kernel: %w", err)
 	}
 
