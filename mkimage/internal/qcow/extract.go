@@ -2,19 +2,18 @@ package qcow
 
 import (
 	"fmt"
+	"mkimage/internal/kernel"
+	"mkimage/internal/util"
 	"os"
 	"path/filepath"
 	"strings"
-
-	"mkimage/internal/kernel"
-	"mkimage/internal/util"
 )
 
 // FindAndExtractBootArtifacts iterates over partitions on the NBD device,
 // looks for kernel and initrd, and extracts them to the destination.
 func FindAndExtractBootArtifacts(nbdDev, destDir string) (string, string, error) {
 	fmt.Printf("listing partitions on %s...\n", nbdDev)
-	
+
 	// Get potential partitions (p1..p31)
 	partitions := listDevicePartitions(nbdDev)
 	if len(partitions) == 0 {
@@ -28,7 +27,7 @@ func FindAndExtractBootArtifacts(nbdDev, destDir string) (string, string, error)
 		if err != nil {
 			// This is expected for swap, unknown FS, etc.
 			fmt.Printf("  -> skipped (mount failed: %v)\n", err)
-			continue 
+			continue
 		}
 
 		// Search in this partition
@@ -38,12 +37,12 @@ func FindAndExtractBootArtifacts(nbdDev, destDir string) (string, string, error)
 			fmt.Printf("  kernel: %s\n", k)
 			fmt.Printf("  initrd: %s\n", i)
 
-			// Copy files out
+			// Copy files out and process kernel
 			finalKernel, finalInitrd, err := copyArtifacts(k, i, destDir)
-			
+
 			// Unmount immediately after copying
 			_ = Unmount(mnt)
-			
+
 			if err != nil {
 				return "", "", err
 			}
@@ -61,7 +60,7 @@ func FindAndExtractBootArtifacts(nbdDev, destDir string) (string, string, error)
 func scanPartitionForArtifacts(mnt string) (string, string, bool) {
 	// Places to look: / and /boot
 	searchPaths := []string{
-		mnt,                      // Root of partition
+		mnt,                        // Root of partition
 		filepath.Join(mnt, "boot"), // /boot subdirectory
 	}
 
@@ -69,7 +68,7 @@ func scanPartitionForArtifacts(mnt string) (string, string, bool) {
 
 	for _, dir := range searchPaths {
 		fmt.Printf("looking for regular file vmlinu* in %s\n", dir)
-		
+
 		files, err := os.ReadDir(dir)
 		if err != nil {
 			continue
@@ -81,7 +80,7 @@ func scanPartitionForArtifacts(mnt string) (string, string, bool) {
 			if err != nil {
 				continue
 			}
-			
+
 			realPath := filepath.Join(dir, f.Name())
 
 			// If symlink, resolve it
@@ -89,7 +88,9 @@ func scanPartitionForArtifacts(mnt string) (string, string, bool) {
 				resolved, err := filepath.EvalSymlinks(realPath)
 				if err == nil {
 					info, err = os.Stat(resolved)
-					if err != nil { continue }
+					if err != nil {
+						continue
+					}
 					realPath = resolved
 				}
 			}
@@ -97,10 +98,10 @@ func scanPartitionForArtifacts(mnt string) (string, string, bool) {
 			if !info.Mode().IsRegular() {
 				continue
 			}
-			
+
 			// Heuristics based on user input
 			name := strings.ToLower(f.Name())
-			
+
 			// Kernel: starts with vmlinu, size > 5MB (avoid tiny shims)
 			if strings.HasPrefix(name, "vmlinu") && info.Size() > 5*1024*1024 {
 				if kernelPath == "" || info.Size() > 0 { // pick first valid
@@ -124,34 +125,19 @@ func scanPartitionForArtifacts(mnt string) (string, string, bool) {
 	return "", "", false
 }
 
+// copyArtifacts now ALWAYS runs the kernel through ExtractRawKernel,
+// which itself auto-detects compression (gzip/xz/zstd/lz4/none).
 func copyArtifacts(srcKernel, srcInitrd, destDir string) (string, string, error) {
 	dstKernel := filepath.Join(destDir, "kernel")
 	dstInitrd := filepath.Join(destDir, "initrd")
 
-	// Copy Kernel
-	if err := util.CopyFile(srcKernel, dstKernel); err != nil {
-		return "", "", fmt.Errorf("failed to copy kernel: %w", err)
+	fmt.Printf("processing kernel...\n")
+	if err := kernel.ExtractRawKernel(srcKernel, dstKernel); err != nil {
+		return "", "", fmt.Errorf("failed to process kernel: %w", err)
 	}
 
-	// Check compression
-	fmt.Printf("checking kernel compression...\n")
-	out, _ := util.Run("file", dstKernel)
-	lower := strings.ToLower(out)
-
-	if strings.Contains(lower, "gzip compressed data") {
-		fmt.Printf("decompressing kernel...\n")
-		rawPath := filepath.Join(destDir, "kernel.raw")
-		if err := kernel.ExtractRawKernel(dstKernel, rawPath); err != nil {
-			return "", "", fmt.Errorf("failed to decompress kernel: %w", err)
-		}
-		// Move raw to kernel, remove compressed
-		_ = os.Remove(dstKernel)
-		_ = os.Rename(rawPath, dstKernel)
-	} else {
-		fmt.Printf("kernel already decompressed or unknown format\n")
-	}
-
-	// Copy Initrd
+	// Initrd is usually just a gzip or cpio+gz; we keep the old behaviour
+	// (bitwise copy) for now.
 	if err := util.CopyFile(srcInitrd, dstInitrd); err != nil {
 		return "", "", fmt.Errorf("failed to copy initrd: %w", err)
 	}
