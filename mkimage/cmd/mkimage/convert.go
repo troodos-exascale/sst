@@ -1,126 +1,246 @@
 package main
 
 import (
-    "fmt"
-    "os"
-    "path/filepath"
-    "time"
+	"fmt"
+	"net/url"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
+	"time"
 
-    "mkimage/internal/image"
-    "mkimage/internal/qcow"
-    "mkimage/internal/util"
+	"mkimage/internal/image"
+	"mkimage/internal/qcow"
+	"mkimage/internal/util"
 
-    "github.com/spf13/cobra"
+	"github.com/spf13/cobra"
 )
 
 var (
-    flagRoot    string
-    flagForce   bool
-    flagVerbose bool
+	flagRoot    string
+	flagForce   bool
+	flagVerbose bool
 )
 
+// -----------------------------------------------------------------------------
+// Logging helpers
+// -----------------------------------------------------------------------------
+func step(msg string) {
+	if flagVerbose {
+		fmt.Println("→", msg)
+	}
+}
+
+func done(msg string) {
+	if flagVerbose {
+		fmt.Println("✓", msg)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Human-friendly upstream filename
+// -----------------------------------------------------------------------------
+func deriveUpstreamFilename(upstream string) string {
+	var base string
+
+	if util.IsURL(upstream) {
+		u, err := url.Parse(upstream)
+		if err == nil {
+			base = path.Base(u.Path)
+		}
+	}
+
+	if base == "" {
+		base = filepath.Base(upstream)
+	}
+
+	if base == "" || base == "." || base == "/" {
+		base = "upstream.img"
+	}
+
+	ext := filepath.Ext(base)
+	name := strings.TrimSuffix(base, ext)
+	if ext == "" {
+		ext = ".img"
+	}
+
+	ts := time.Now().Format("20060102-150405")
+	return fmt.Sprintf("%s-%s%s", name, ts, ext)
+}
+
+// -----------------------------------------------------------------------------
+// Cobra convert command
+// -----------------------------------------------------------------------------
 var convertCmd = &cobra.Command{
-    Use:   "convert <qcow-or-url> <image-name>",
-    Args:  cobra.ExactArgs(2),
-    Short: "Convert a qcow2/URL upstream image into an SST image directory",
-    RunE: func(cmd *cobra.Command, args []string) error {
+	Use:   "convert <qcow-or-url> <image-name>",
+	Args:  cobra.ExactArgs(2),
+	Short: "Convert a qcow2/URL upstream image into an SST image directory",
 
-        upstream := args[0]
-        imgName  := args[1]
+	RunE: func(cmd *cobra.Command, args []string) error {
+		upstream := args[0]
+		imgName := args[1]
 
-        // Resolve runtime image root
-        root := flagRoot
-        if root == "" {
-            home, _ := os.UserHomeDir()
-            root = filepath.Join(home, ".runtimes", "images")
-        }
+		// ---------------------------------------------------------------------
+		// Resolve image root and Ownership
+		// ---------------------------------------------------------------------
+		// Ensure we resolve the absolute path of the target directory to find owner
+		absRoot, _ := filepath.Abs(flagRoot)
+		
+		// Check who owns the parent directory so we can chown files to them later
+		// (since we are running as root)
+		targetUid, targetGid, _ := util.GetFileOwnership(filepath.Dir(absRoot))
 
-        dest := filepath.Join(root, imgName)
-        cloudDir := filepath.Join(dest, "cloud")
+		dest := filepath.Join(flagRoot, imgName)
+		cloudDir := filepath.Join(dest, "cloud")
 
-        if flagVerbose {
-            fmt.Println("→ mkimage convert")
-            fmt.Println("  upstream:", upstream)
-            fmt.Println("  dest:", dest)
-        }
+		if flagVerbose {
+			fmt.Println("→ mkimage convert")
+			fmt.Println("  upstream:", upstream)
+			fmt.Println("  dest:    ", dest)
+			fmt.Printf("  target owner: %d:%d\n", targetUid, targetGid)
+		}
 
-        if _, err := os.Stat(dest); err == nil && !flagForce {
-            return fmt.Errorf("destination %s exists; use --force to overwrite", dest)
-        }
+		// ---------------------------------------------------------------------
+		// Enforce directory existence rules
+		// ---------------------------------------------------------------------
+		if _, err := os.Stat(dest); err == nil && !flagForce {
+			return fmt.Errorf("destination %s exists; use --force to overwrite", dest)
+		}
 
-        // Remove existing directory on --force
-        if flagForce {
-            os.RemoveAll(dest)
-        }
+		if flagForce {
+			_ = os.RemoveAll(dest)
+		}
 
-        if err := os.MkdirAll(cloudDir, 0o755); err != nil {
-            return err
-        }
+		if err := os.MkdirAll(dest, 0o755); err != nil {
+			return err
+		}
+		// Fix ownership of the image dir immediately
+		_ = os.Chown(dest, targetUid, targetGid)
 
-        // Download if URL
-        localFile := upstream
-        if util.IsURL(upstream) {
-            if flagVerbose { fmt.Println("→ downloading upstream…") }
-            var err error
-            localFile, err = util.DownloadToTmp(upstream)
-            if err != nil { return err }
-        }
+		// ---------------------------------------------------------------------
+		// Acquire LOCK for this image
+		// ---------------------------------------------------------------------
+		lockPath := filepath.Join(dest, ".mkimage.lock")
+		lk, err := util.CreateLock(lockPath)
+		if err != nil {
+			return err
+		}
+		defer lk.Remove()
 
-        // QCOW2 → mount → extract kernel/initrd/rootfs
-        if flagVerbose { fmt.Println("→ attaching qcow2 via qemu-nbd…") }
-        nbd, err := qcow.Attach(localFile)
-        if err != nil { return err }
-        defer qcow.Detach(nbd)
+		if err := os.MkdirAll(cloudDir, 0o755); err != nil {
+			return err
+		}
 
-        part, err := qcow.FindRootPartition(nbd)
-        if err != nil { return err }
+		// ---------------------------------------------------------------------
+		// Download or copy upstream image into cloud/
+		// ---------------------------------------------------------------------
+		var localPath string
 
-        mnt, err := qcow.MountPartition(part)
-        if err != nil { return err }
-        defer qcow.Unmount(mnt)
+		if util.IsURL(upstream) {
+			step("Downloading upstream image…")
+			name := deriveUpstreamFilename(upstream)
+			target := filepath.Join(cloudDir, name)
+			if err := util.DownloadToFile(upstream, target); err != nil {
+				return fmt.Errorf("download failed: %w", err)
+			}
+			localPath = target
+			done("Download complete")
+		} else {
+			step("Copying upstream image into cloud/…")
+			name := deriveUpstreamFilename(upstream)
+			target := filepath.Join(cloudDir, name)
+			if err := util.CopyFile(upstream, target); err != nil {
+				return fmt.Errorf("copy upstream image: %w", err)
+			}
+			localPath = target
+			done("Local upstream image copied")
+		}
 
-        if flagVerbose {
-            fmt.Println("→ mounted at:", mnt)
-        }
+		// ---------------------------------------------------------------------
+		// Attach via qemu-nbd
+		// ---------------------------------------------------------------------
+		fmt.Printf("connecting /dev/nbd0 to %s\n", localPath)
+		nbd, err := qcow.Attach(localPath)
+		if err != nil {
+			return err
+		}
+		attached := true
+		
+		cleanup := func() {
+			if attached && nbd != "" {
+				fmt.Printf("disconnecting %s\n", nbd)
+				_ = qcow.Detach(nbd)
+			}
+		}
+		defer cleanup()
 
-        // Extract artifacts
-        kernel, initrd, err := qcow.ExtractKernelInitrd(mnt, cloudDir)
-        if err != nil { return err }
-        if flagVerbose {
-            fmt.Println("→ extracted kernel:", kernel)
-            fmt.Println("→ extracted initrd:", initrd)
-        }
+		// ---------------------------------------------------------------------
+		// Find and Extract Kernel/Initrd (Iterates partitions)
+		// ---------------------------------------------------------------------
+		step("Scanning for boot artifacts...")
+		_, _, err = qcow.FindAndExtractBootArtifacts(nbd, cloudDir)
+		if err != nil {
+			return fmt.Errorf("extraction failed: %w", err)
+		}
+		done("Artifacts extracted")
 
-        // Copy full qcow2 as rootfs
-        rootfsPath := filepath.Join(cloudDir, "rootfs.qcow2")
-        if flagVerbose { fmt.Println("→ copying rootfs:", rootfsPath) }
-        if err := util.CopyFile(localFile, rootfsPath); err != nil {
-            return err
-        }
+		// ---------------------------------------------------------------------
+		// Detach BEFORE conversion
+		// ---------------------------------------------------------------------
+		fmt.Printf("disconnecting %s\n", nbd)
+		if err := qcow.Detach(nbd); err != nil {
+			return fmt.Errorf("nbd detach failed: %w", err)
+		}
+		attached = false
+		done("Detached")
 
-        // Build image.yaml
-        meta := image.ImageYAML{}
-        meta.Image.Name = imgName
-        meta.Image.Description = "Generated by mkimage --convert"
-        meta.Sources = append(meta.Sources, image.Source{
-            Name:        "cloud",
-            Upstream:    upstream,
-            Format:      "qcow2",
-            RetrievedAt: time.Now().UTC().Format(time.RFC3339),
-        })
+		// ---------------------------------------------------------------------
+		// Convert full-disk image → raw
+		// ---------------------------------------------------------------------
+		rootfsRaw := filepath.Join(cloudDir, "rootfs.raw")
+		fmt.Printf("extracting rootfs.raw filesystem...\n")
+		if out, err := util.Run("qemu-img", "convert", "-O", "raw", localPath, rootfsRaw); err != nil {
+			return fmt.Errorf("qemu-img convert failed: %v\noutput:\n%s", err, out)
+		}
+		done("Raw disk written: " + rootfsRaw)
 
-        if flagVerbose { fmt.Println("→ writing image.yaml…") }
-        if err := image.WriteYAML(dest, &meta); err != nil {
-            return err
-        }
+		// ---------------------------------------------------------------------
+		// Write image.yaml
+		// ---------------------------------------------------------------------
+		step("Writing image.yaml…")
+		meta := image.ImageYAML{}
+		meta.Image.Name = imgName
+		meta.Image.Description = "Generated by mkimage --convert"
+		meta.Sources = append(meta.Sources, image.Source{
+			Name:        "cloud",
+			Upstream:    upstream,
+			Format:      "disk-image",
+			RetrievedAt: time.Now().UTC().Format(time.RFC3339),
+		})
 
-        // Validate with CUE
-        if flagVerbose { fmt.Println("→ validating image.yaml…") }
-        if err := image.ValidateFile(filepath.Join(dest, "image.yaml")); err != nil {
-            return fmt.Errorf("image.yaml invalid: %w", err)
-        }
+		if err := image.WriteYAML(dest, &meta); err != nil {
+			return err
+		}
+		done("image.yaml written")
 
-        fmt.Println("✓ Image created:", dest)
-        return nil
-    },
+		// ---------------------------------------------------------------------
+		// Validate YAML
+		// ---------------------------------------------------------------------
+		step("Validating image.yaml…")
+		if err := image.ValidateFile(filepath.Join(dest, "image.yaml")); err != nil {
+			return fmt.Errorf("image.yaml invalid: %w", err)
+		}
+		done("image.yaml validated")
+
+		// ---------------------------------------------------------------------
+		// Fix Ownership
+		// ---------------------------------------------------------------------
+		step(fmt.Sprintf("Changing ownership to %d:%d...", targetUid, targetGid))
+		if err := util.ChownR(dest, targetUid, targetGid); err != nil {
+			fmt.Printf("warning: failed to chown output files: %v\n", err)
+		}
+
+		fmt.Println("✓ Image created:", dest)
+		return nil
+	},
 }

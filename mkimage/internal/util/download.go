@@ -5,50 +5,56 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"strings"
 	"time"
 )
 
+// IsURL reports whether a string looks like an HTTP/HTTPS URL.
 func IsURL(s string) bool {
-	return strings.HasPrefix(s, "http://") ||
-		strings.HasPrefix(s, "https://")
+	return len(s) > 0 &&
+		(s[:7] == "http://" || s[:8] == "https://")
 }
 
-// DownloadToTmp downloads a URL to a temporary file with a progress indicator.
-func DownloadToTmp(url string) (string, error) {
+// DownloadToFile downloads a URL directly into dstPath with a progress indicator.
+// If an error occurs, dstPath is removed.
+func DownloadToFile(url string, dstPath string) error {
 
 	resp, err := http.Get(url)
 	if err != nil {
-		return "", err
+		return err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("download failed: %s", resp.Status)
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("download failed: %s", resp.Status)
 	}
 
-	// Create temp file
-	f, err := os.CreateTemp("", "mkimage-download-*")
+	// Create / truncate destination file
+	f, err := os.Create(dstPath)
 	if err != nil {
-		return "", err
+		return err
 	}
-	defer f.Close()
+	defer func() {
+		f.Close()
+		if err != nil {
+			// best-effort cleanup on error
+			_ = os.Remove(dstPath)
+		}
+	}()
 
 	total := resp.ContentLength
 	var downloaded int64 = 0
 
-	// Detect terminal
 	isTTY := isTerminal(os.Stdout.Fd())
-
 	buf := make([]byte, 32*1024)
 	lastUpdate := time.Now()
 
 	for {
-		n, err := resp.Body.Read(buf)
+		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
 			wn, werr := f.Write(buf[:n])
 			if werr != nil {
-				return "", werr
+				err = werr
+				return werr
 			}
 			downloaded += int64(wn)
 		}
@@ -58,11 +64,12 @@ func DownloadToTmp(url string) (string, error) {
 			lastUpdate = time.Now()
 		}
 
-		if err == io.EOF {
+		if rerr == io.EOF {
 			break
 		}
-		if err != nil {
-			return "", err
+		if rerr != nil {
+			err = rerr
+			return rerr
 		}
 	}
 
@@ -71,12 +78,27 @@ func DownloadToTmp(url string) (string, error) {
 		fmt.Print("\n")
 	}
 
-	return f.Name(), nil
+	return nil
+}
+
+// DownloadToTmp keeps the old behavior for any callers that still want a tmp file.
+func DownloadToTmp(url string) (string, error) {
+	f, err := os.CreateTemp("", "mkimage-download-*")
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	f.Close()
+
+	if err := DownloadToFile(url, name); err != nil {
+		_ = os.Remove(name)
+		return "", err
+	}
+	return name, nil
 }
 
 // Print progress like:
-//
-//	Downloading: 128.4 / 203.1 MiB (63%)
+//   Downloading: 128.4 / 203.1 MiB (63%)
 func printProgress(done, total int64) {
 	if total <= 0 {
 		fmt.Printf("\rDownloading: %6.1f MiB", float64(done)/1024/1024)
