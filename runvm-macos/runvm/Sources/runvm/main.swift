@@ -2,6 +2,12 @@ import Foundation
 import ArgumentParser
 import Virtualization
 
+// Expose the BSD setproctitle function to Swift
+#if os(macOS)
+@_silgen_name("setproctitle")
+func setproctitle(_ fmt: UnsafePointer<CChar>, _ args: CVarArg...)
+#endif
+
 var origStdinTerm : termios? = nil
 var origStdoutTerm : termios? = nil
 
@@ -65,7 +71,7 @@ func tryGracefulShutdown(timeout: Double) {
 
 func quit(_ code: Int32) -> Never {
     resetTty()
-    return exit(code)
+    exit(code)
 }
 
 func openDisk(path: String, readOnly: Bool) throws -> VZVirtioBlockDeviceConfiguration {
@@ -142,6 +148,9 @@ enum SizeSuffix: UInt64, ExpressibleByArgument {
 
 struct VMCLI: ParsableCommand {
 
+    @Option(name: .customLong("name"), help: "Instance name (process name)")
+    var name: String?
+
     @Option(name: .shortAndLong, help: "CPU count")
     var cpuCount: Int = 1
 
@@ -151,7 +160,6 @@ struct VMCLI: ParsableCommand {
     @Option(name: .long, help: "Memory Size Suffix")
     var memorySizeSuffix: SizeSuffix = .MiB
 
-    // NEW: crosvm-style disk flags
     @Option(name: [.customLong("disk")],
             help: "Read-only disk images (crosvm: --disk PATH)")
     var roDisks: [String] = []
@@ -160,19 +168,16 @@ struct VMCLI: ParsableCommand {
             help: "Writable disk images (crosvm: --rwdisk PATH)")
     var rwDisks: [String] = []
 
-    // Keep the legacy cdrom option for compatibility (not used by runctl)
     @Option(name: [ .customLong("cdrom") ], help: "CD-ROMs to use (legacy)")
     var cdroms: [String] = []
 
     @Option(name: [ .short, .customLong("folder")], help: "Folders to share")
     var folders: [String] = []
 
-    // Keep original network flag name, plus add crosvm alias "net"
-    @Option(name: [ .short, .customLong("network"), .customLong("net") ], help: """
-Networks to use. e.g. aa:bb:cc:dd:ee:ff@nat for a nat device, \
-or ...@en0 for bridging to en0. \
-Omit mac address for a generated address.
-""")
+    @Option(name: [.customLong("shared-dir")], help: "Folders to share (crosvm: --shared-dir)")
+    var sharedDirs: [String] = []
+
+    @Option(name: [ .short, .customLong("network"), .customLong("net") ], help: "Networks to use")
     var networks: [String] = [ "nat" ]
 
     @Option(help: "Enable / Disable Memory Ballooning")
@@ -181,7 +186,7 @@ Omit mac address for a generated address.
     @Option(name: .shortAndLong, help: "Bootloader to use")
     var bootloader: BootLoader = .linux
 
-    @Option(name: .shortAndLong, help: "EFI variable store location (EFI bootloader only)")
+    @Option(name: .customLong("efi-vars"), help: "EFI variable store location")
     var efiVars: String?
 
     @Option(name: .shortAndLong, help: "Kernel to use (Linux bootloader only)")
@@ -190,8 +195,8 @@ Omit mac address for a generated address.
     @Option(help: "Initrd to use (Linux bootloader only)")
     var initrd: String?
 
-    @Option(help: "Kernel cmdline to use (Linux bootloader only)")
-    var cmdline: String?
+    @Option(name: [.customLong("params"), .customShort("p")], help: "Kernel cmdline (crosvm: --params)")
+    var params: String?
 
     @Option(help: "Escape Sequence, when using a tty")
     var escapeSequence: String = "q"
@@ -199,7 +204,19 @@ Omit mac address for a generated address.
     @Option(help: "Timeout in seconds for graceful shutdown")
     var shutdownTimeout: Double = 120.0
 
+    // Legacy support
+    @Option(help: "Kernel cmdline to use (legacy)")
+    var cmdline: String?
+
     mutating func run() throws {
+        // Set process name if provided
+        if let name = name {
+            // This sets the UNIX-level process name
+            name.withCString { cstr in
+                setprogname(cstr)
+            }
+        }
+
 
         // CPU / memory
         vmCfg.cpuCount = cpuCount
@@ -219,8 +236,11 @@ Omit mac address for a generated address.
             if initrd != nil {
                 vmBootLoader.initialRamdiskURL = URL(fileURLWithPath: initrd!)
             }
-            if cmdline != nil {
-                vmBootLoader.commandLine = cmdline!
+            // Prefer --params, fallback to --cmdline
+            if let p = params {
+                vmBootLoader.commandLine = p
+            } else if let c = cmdline {
+                vmBootLoader.commandLine = c
             }
             vmCfg.bootLoader = vmBootLoader
 
@@ -229,7 +249,7 @@ Omit mac address for a generated address.
                 if efiVars == nil {
                     throw ValidationError("EFI variable store must be specified if using EFI bootloader")
                 }
-                if kernel != nil || initrd != nil || cmdline != nil {
+                if kernel != nil || initrd != nil || params != nil || cmdline != nil {
                     throw ValidationError("Kernel, initrd and cmdline options cannot be used with EFI bootloader")
                 }
                 let efiVarStoreURL = URL(fileURLWithPath: efiVars!)
@@ -275,24 +295,31 @@ Omit mac address for a generated address.
         }
 
         //
-        // Shared folders (unchanged)
+        // Shared folders
         //
         if #available(macOS 12, *) {
-            for folder in folders {
+            var allFolders = folders
+            // also parse --shared-dir host:tag:ro or host:tag
+            for sd in sharedDirs {
+                 allFolders.append(sd)
+            }
+            
+            for folder in allFolders {
                 let parts = folder.split(separator: ":")
-                if parts.count > 3 {
-                    throw ValidationError("Too many components in shared folder: \(folder)")
-                }
+                if parts.count == 0 { continue }
+                
                 let path = String(parts[0])
                 var tag = String(parts[0])
                 var readOnly = false
+                
                 if parts.count > 1 {
                     tag = String(parts[1])
                 }
-                if parts.count > 2 {
-                    readOnly = (parts[2] == "ro")
+                // Check for ro flag in 3rd position
+                if parts.count > 2 && parts[2] == "ro" {
+                    readOnly = true
                 }
-                puts("Adding shared folder '\(path)' with tag \(tag), but be warned, this might be unstable.")
+                
                 try vmCfg.directorySharingDevices.append(openFolder(path: path, tag: tag, readOnly: readOnly))
             }
         }
@@ -311,7 +338,7 @@ Omit mac address for a generated address.
         }
 
         //
-        // Networking: use existing API (no creativity)
+        // Networking
         //
         vmCfg.networkDevices = []
         for network in networks {
@@ -352,7 +379,13 @@ Omit mac address for a generated address.
 
         // set up piping.
         var fullEscapeSequence = Data([0x1b]) // escape sequence always starts with ESC
-        fullEscapeSequence.append(escapeSequence.data(using: .nonLossyASCII)!)
+        if let escData = escapeSequence.data(using: .nonLossyASCII) {
+            fullEscapeSequence.append(escData)
+        } else {
+             // Fallback if encoding fails
+             fullEscapeSequence.append(contentsOf: [0x71]) // 'q'
+        }
+
         let escapeSequenceCounter = OccurrenceCounter(fullEscapeSequence)
         FileHandle.standardInput.waitForDataInBackgroundAndNotify()
         NotificationCenter.default.addObserver(forName: NSNotification.Name.NSFileHandleDataAvailable, object: FileHandle.standardInput, queue: nil)
