@@ -69,9 +69,17 @@ func MountPartition(dev string) (string, error) {
 
 // Unmount unmounts the given directory and removes the mountpoint.
 func Unmount(dir string) error {
-	if err := exec.Command("umount", dir).Run(); err != nil {
-		return err
+	// Try a clean unmount
+	cmd := exec.Command("umount", dir)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("umount %s failed: %v (output: %s)", dir, err, strings.TrimSpace(string(out)))
 	}
-	// remove mount directory to avoid cruft in /tmp
-	return os.RemoveAll(dir)
+
+	// Remove the temporary directory
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("failed to remove mount dir %s: %w", dir, err)
+	}
+	fmt.Printf("umount succeeded %s\n", dir)
+	return nil
 }

@@ -2,16 +2,19 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"mkimage/internal/config"
-	"mkimage/internal/util"
 	"mkimage/internal/image"
+	"mkimage/internal/util"
+
 	"github.com/spf13/cobra"
 )
 
@@ -80,17 +83,15 @@ var convertCmd = &cobra.Command{
 		imgName := args[1]
 
 		// ---------------------------------------------------------------------
-		// Resolve image root and Ownership
+		// Resolve runtimes root → DIR/images/<name>
 		// ---------------------------------------------------------------------
-		// Ensure we resolve the absolute path of the target directory to find owner
-		absRoot, _ := filepath.Abs(flagRoot)
+		absRoot, _ := filepath.Abs(flagRoot)           // DIR
+		imagesRoot := filepath.Join(absRoot, "images") // DIR/images
+		dest := filepath.Join(imagesRoot, imgName)     // DIR/images/<name>
+		cloudDir := filepath.Join(dest, "cloud")       // DIR/images/<name>/cloud
 
-		// Check who owns the parent directory so we can chown files to them later
-		// (since we are running as root)
-		targetUid, targetGid, _ := util.GetFileOwnership(filepath.Dir(absRoot))
-
-		dest := filepath.Join(flagRoot, imgName)
-		cloudDir := filepath.Join(dest, "cloud")
+		// determine filesystem owner
+		targetUid, targetGid, _ := util.GetFileOwnership(absRoot)
 
 		if flagVerbose {
 			fmt.Println("→ mkimage convert")
@@ -105,15 +106,19 @@ var convertCmd = &cobra.Command{
 		if _, err := os.Stat(dest); err == nil && !flagForce {
 			return fmt.Errorf("destination %s exists; use --force to overwrite", dest)
 		}
-
 		if flagForce {
 			_ = os.RemoveAll(dest)
 		}
 
+		// create images root and destination
+		if err := os.MkdirAll(imagesRoot, 0o755); err != nil {
+			return err
+		}
 		if err := os.MkdirAll(dest, 0o755); err != nil {
 			return err
 		}
-		// Fix ownership of the image dir immediately
+
+		// Fix ownership early
 		_ = os.Chown(dest, targetUid, targetGid)
 
 		// ---------------------------------------------------------------------
@@ -126,19 +131,22 @@ var convertCmd = &cobra.Command{
 		}
 		defer lk.Remove()
 
+		// cloud directory
 		if err := os.MkdirAll(cloudDir, 0o755); err != nil {
 			return err
 		}
 
 		// ---------------------------------------------------------------------
-		// Download or copy upstream image into cloud/
+		// Download or copy upstream source
 		// ---------------------------------------------------------------------
 		var localPath string
+		step("Processing upstream source…")
+
+		name := deriveUpstreamFilename(upstream)
+		target := filepath.Join(cloudDir, name)
 
 		if util.IsURL(upstream) {
 			step("Downloading upstream image…")
-			name := deriveUpstreamFilename(upstream)
-			target := filepath.Join(cloudDir, name)
 			if err := util.DownloadToFile(upstream, target); err != nil {
 				return fmt.Errorf("download failed: %w", err)
 			}
@@ -146,8 +154,6 @@ var convertCmd = &cobra.Command{
 			done("Download complete")
 		} else {
 			step("Copying upstream image into cloud/…")
-			name := deriveUpstreamFilename(upstream)
-			target := filepath.Join(cloudDir, name)
 			if err := util.CopyFile(upstream, target); err != nil {
 				return fmt.Errorf("copy upstream image: %w", err)
 			}
@@ -174,7 +180,7 @@ var convertCmd = &cobra.Command{
 		defer cleanup()
 
 		// ---------------------------------------------------------------------
-		// Find and Extract Kernel/Initrd (Iterates partitions)
+		// Find and Extract Kernel/Initrd from partitions
 		// ---------------------------------------------------------------------
 		step("Scanning for boot artifacts...")
 		_, _, err = image.FindAndExtractBootArtifacts(nbd, cloudDir)
@@ -184,7 +190,63 @@ var convertCmd = &cobra.Command{
 		done("Artifacts extracted")
 
 		// ---------------------------------------------------------------------
-		// Detach BEFORE conversion
+		// Select root filesystem partition
+		// ---------------------------------------------------------------------
+		step("Selecting root filesystem partition…")
+		rootPart, err := image.FindRootPartition(nbd)
+		if err != nil {
+			return fmt.Errorf("root partition detection failed: %w", err)
+		}
+		done("Root partition: " + rootPart)
+
+		// ---------------------------------------------------------------------
+		// Determine size of root partition
+		// ---------------------------------------------------------------------
+		sizeOut, err := util.Run("blockdev", "--getsize64", rootPart)
+		if err != nil {
+			return fmt.Errorf("failed to get size of %s: %v\noutput:\n%s",
+				rootPart, err, sizeOut)
+		}
+		sizeOut = strings.TrimSpace(sizeOut)
+		sizeBytes, err := strconv.ParseInt(sizeOut, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid size returned for %s: %w", rootPart, err)
+		}
+
+		// ---------------------------------------------------------------------
+		// Extract root filesystem (byte-for-byte copy)
+		// ---------------------------------------------------------------------
+		rootfsRaw := filepath.Join(cloudDir, "rootfs.raw")
+		fmt.Printf("extracting %d bytes from %s → %s…\n",
+			sizeBytes, rootPart, rootfsRaw)
+
+		src, err := os.Open(rootPart)
+		if err != nil {
+			return fmt.Errorf("failed to open %s: %w", rootPart, err)
+		}
+		defer src.Close()
+
+		dst, err := os.Create(rootfsRaw)
+		if err != nil {
+			return fmt.Errorf("failed to create %s: %w", rootfsRaw, err)
+		}
+		defer dst.Close()
+
+		written, err := io.CopyN(dst, src, sizeBytes)
+		if err != nil && err != io.EOF {
+			return fmt.Errorf("copying root partition failed: %w", err)
+		}
+
+		fmt.Printf("copied %d bytes\n", written)
+		done("Root filesystem written: " + rootfsRaw)
+
+		// Mark rootfs.raw as read-only to reflect that it must not be modified.
+		if err := os.Chmod(rootfsRaw, 0o444); err != nil {
+			fmt.Printf("warning: failed to mark %s read-only: %v\n", rootfsRaw, err)
+		}
+
+		// ---------------------------------------------------------------------
+		// Detach AFTER rootfs extraction
 		// ---------------------------------------------------------------------
 		fmt.Printf("disconnecting %s\n", nbd)
 		if err := image.Detach(nbd); err != nil {
@@ -194,19 +256,10 @@ var convertCmd = &cobra.Command{
 		done("Detached")
 
 		// ---------------------------------------------------------------------
-		// Convert full-disk image → raw
-		// ---------------------------------------------------------------------
-		rootfsRaw := filepath.Join(cloudDir, "rootfs.raw")
-		fmt.Printf("extracting rootfs.raw filesystem...\n")
-		if out, err := util.Run("qemu-img", "convert", "-O", "raw", localPath, rootfsRaw); err != nil {
-			return fmt.Errorf("qemu-img convert failed: %v\noutput:\n%s", err, out)
-		}
-		done("Raw disk written: " + rootfsRaw)
-
-		// ---------------------------------------------------------------------
-		// Write image.yaml
+		// Write + Validate image.yaml
 		// ---------------------------------------------------------------------
 		step("Writing image.yaml…")
+
 		meta := config.ImageYAML{}
 		meta.Image.Name = imgName
 		meta.Image.Description = "Generated by mkimage --convert"
@@ -222,9 +275,6 @@ var convertCmd = &cobra.Command{
 		}
 		done("image.yaml written")
 
-		// ---------------------------------------------------------------------
-		// Validate YAML
-		// ---------------------------------------------------------------------
 		step("Validating image.yaml…")
 		if err := config.ValidateFile(filepath.Join(dest, "image.yaml")); err != nil {
 			return fmt.Errorf("image.yaml invalid: %w", err)
@@ -232,9 +282,9 @@ var convertCmd = &cobra.Command{
 		done("image.yaml validated")
 
 		// ---------------------------------------------------------------------
-		// Fix Ownership
+		// Fix ownership (chown everything)
 		// ---------------------------------------------------------------------
-		step(fmt.Sprintf("Changing ownership to %d:%d...", targetUid, targetGid))
+		step(fmt.Sprintf("Changing ownership to %d:%d…", targetUid, targetGid))
 		if err := util.ChownR(dest, targetUid, targetGid); err != nil {
 			fmt.Printf("warning: failed to chown output files: %v\n", err)
 		}

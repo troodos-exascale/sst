@@ -17,7 +17,7 @@ clean:
 	rm -rf build .build runvm/.build
 
 install: all
-	install -m 755 build/runvm $(PREFIX)/bin/runvm
+	sudo install -m 755 build/runvm $(PREFIX)/bin/runvm
 
 build/vm: build
 	mkdir -p build/vm

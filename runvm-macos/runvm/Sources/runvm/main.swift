@@ -2,19 +2,6 @@ import Foundation
 import ArgumentParser
 import Virtualization
 
-enum BootLoader: String, ExpressibleByArgument {
-    case linux
-    @available(macOS 13, *)
-    case efi
-}
-
-enum SizeSuffix: UInt64, ExpressibleByArgument {
-    case none = 1,
-         KB = 1000, KiB = 0x400,
-         MB = 1000000, MiB = 0x100000,
-         GB = 1000000000, GiB = 0x40000000
-}
-
 var origStdinTerm : termios? = nil
 var origStdoutTerm : termios? = nil
 
@@ -138,10 +125,23 @@ class VMCLIDelegate: NSObject, VZVirtualMachineDelegate {
 }
 
 let delegate = VMCLIDelegate()
-
 let vmCfg = VZVirtualMachineConfiguration()
 
+enum BootLoader: String, ExpressibleByArgument {
+    case linux
+    @available(macOS 13, *)
+    case efi
+}
+
+enum SizeSuffix: UInt64, ExpressibleByArgument {
+    case none = 1,
+         KB = 1000, KiB = 0x400,
+         MB = 1000000, MiB = 0x100000,
+         GB = 1000000000, GiB = 0x40000000
+}
+
 struct VMCLI: ParsableCommand {
+
     @Option(name: .shortAndLong, help: "CPU count")
     var cpuCount: Int = 1
 
@@ -149,18 +149,26 @@ struct VMCLI: ParsableCommand {
     var memorySize: UInt64 = 512 // 512 MiB default
 
     @Option(name: .long, help: "Memory Size Suffix")
-    var memorySizeSuffix: SizeSuffix = SizeSuffix.MiB
+    var memorySizeSuffix: SizeSuffix = .MiB
 
-    @Option(name: [ .short, .customLong("disk") ], help: "Disks to use")
-    var disks: [String] = []
+    // NEW: crosvm-style disk flags
+    @Option(name: [.customLong("disk")],
+            help: "Read-only disk images (crosvm: --disk PATH)")
+    var roDisks: [String] = []
 
-    @Option(name: [ .customLong("cdrom") ], help: "CD-ROMs to use")
+    @Option(name: [.customLong("rwdisk")],
+            help: "Writable disk images (crosvm: --rwdisk PATH)")
+    var rwDisks: [String] = []
+
+    // Keep the legacy cdrom option for compatibility (not used by runctl)
+    @Option(name: [ .customLong("cdrom") ], help: "CD-ROMs to use (legacy)")
     var cdroms: [String] = []
 
     @Option(name: [ .short, .customLong("folder")], help: "Folders to share")
     var folders: [String] = []
 
-    @Option(name: [ .short, .customLong("network") ], help: """
+    // Keep original network flag name, plus add crosvm alias "net"
+    @Option(name: [ .short, .customLong("network"), .customLong("net") ], help: """
 Networks to use. e.g. aa:bb:cc:dd:ee:ff@nat for a nat device, \
 or ...@en0 for bridging to en0. \
 Omit mac address for a generated address.
@@ -171,7 +179,7 @@ Omit mac address for a generated address.
     var balloon: Bool = true
 
     @Option(name: .shortAndLong, help: "Bootloader to use")
-    var bootloader: BootLoader = BootLoader.linux
+    var bootloader: BootLoader = .linux
 
     @Option(name: .shortAndLong, help: "EFI variable store location (EFI bootloader only)")
     var efiVars: String?
@@ -192,12 +200,14 @@ Omit mac address for a generated address.
     var shutdownTimeout: Double = 120.0
 
     mutating func run() throws {
+
+        // CPU / memory
         vmCfg.cpuCount = cpuCount
         vmCfg.memorySize = memorySize * memorySizeSuffix.rawValue
 
-        // set up bootloader
+        // bootloader
         switch bootloader {
-        case BootLoader.linux:
+        case .linux:
             if kernel == nil {
                 throw ValidationError("Kernel not specified")
             }
@@ -213,7 +223,8 @@ Omit mac address for a generated address.
                 vmBootLoader.commandLine = cmdline!
             }
             vmCfg.bootLoader = vmBootLoader
-        case BootLoader.efi:
+
+        case .efi:
             if #available(macOS 13, *) {
                 if efiVars == nil {
                     throw ValidationError("EFI variable store must be specified if using EFI bootloader")
@@ -222,7 +233,7 @@ Omit mac address for a generated address.
                     throw ValidationError("Kernel, initrd and cmdline options cannot be used with EFI bootloader")
                 }
                 let efiVarStoreURL = URL(fileURLWithPath: efiVars!)
-                var efiVarStore: VZEFIVariableStore
+                let efiVarStore: VZEFIVariableStore
                 if FileManager.default.fileExists(atPath: efiVars!) {
                     efiVarStore = VZEFIVariableStore(url: efiVarStoreURL)
                 } else {
@@ -236,7 +247,7 @@ Omit mac address for a generated address.
             }
         }
 
-        // set up tty
+        // set up tty console
         let vmSerialIn = Pipe()
         let vmSerialOut = Pipe()
 
@@ -248,16 +259,24 @@ Omit mac address for a generated address.
         vmConsoleCfg.attachment = vmSerialPort
         vmCfg.serialPorts = [ vmConsoleCfg ]
 
-        // set up storage
-        // TODO: better error handling
+        //
+        // STORAGE: use rwDisks for RW, roDisks (and cdroms) for RO
+        //
         vmCfg.storageDevices = []
-        for disk in disks {
-            try vmCfg.storageDevices.append(openDisk(path: disk, readOnly: false))
+
+        for path in rwDisks {
+            try vmCfg.storageDevices.append(openDisk(path: path, readOnly: false))
         }
-        for cdrom in cdroms {
-            try vmCfg.storageDevices.append(openDisk(path: cdrom, readOnly: true))
+        for path in roDisks {
+            try vmCfg.storageDevices.append(openDisk(path: path, readOnly: true))
+        }
+        for path in cdroms {
+            try vmCfg.storageDevices.append(openDisk(path: path, readOnly: true))
         }
 
+        //
+        // Shared folders (unchanged)
+        //
         if #available(macOS 12, *) {
             for folder in folders {
                 let parts = folder.split(separator: ":")
@@ -290,8 +309,10 @@ Omit mac address for a generated address.
                 // Rosetta is unavailable.
             }
         }
-        // set up networking
-        // TODO: better error handling
+
+        //
+        // Networking: use existing API (no creativity)
+        //
         vmCfg.networkDevices = []
         for network in networks {
             let netCfg = VZVirtioNetworkDeviceConfiguration()
@@ -318,7 +339,7 @@ Omit mac address for a generated address.
             vmCfg.networkDevices.append(netCfg)
         }
 
-        // set up memory balloon
+        // memory balloon
         let balloonCfg = VZVirtioTraditionalMemoryBalloonDeviceConfiguration()
         vmCfg.memoryBalloonDevices = [ balloonCfg ]
 
@@ -347,37 +368,26 @@ Omit mac address for a generated address.
             }
         }
 
-        vmSerialOut.fileHandleForReading.waitForDataInBackgroundAndNotify()
-        NotificationCenter.default.addObserver(forName: NSNotification.Name.NSFileHandleDataAvailable, object: vmSerialOut.fileHandleForReading, queue: nil)
-        {_ in
-            let data = vmSerialOut.fileHandleForReading.availableData
-            FileHandle.standardOutput.write(data)
-            if data.count > 0 {
-                vmSerialOut.fileHandleForReading.waitForDataInBackgroundAndNotify()
-            }
-        }
-
-        sigSrcs[SIGTERM]!.setEventHandler { [shutdownTimeout] in
-            tryGracefulShutdown(timeout: shutdownTimeout)
-        }
-        sigSrcs[SIGINT]!.setEventHandler { [shutdownTimeout] in
-            tryGracefulShutdown(timeout: shutdownTimeout)
-        }
-
-        // start VM
+        // Create and run VM
         vm = VZVirtualMachine(configuration: vmCfg)
         vm!.delegate = delegate
-
-        vm!.start(completionHandler: { (result: Result<Void, Error>) -> Void in
+        vm!.start { result in
             switch result {
             case .success:
-                return
+                break
             case .failure(let error):
-                FileHandle.standardError.write(error.localizedDescription.data(using: .utf8)!)
-                FileHandle.standardError.write("\n".data(using: .utf8)!)
+                FileHandle.standardError.write("Failed to start VM: \(error)\r\n".data(using: .utf8)!)
                 quit(1)
             }
-        })
+        }
+
+        let outHandle = vmSerialOut.fileHandleForReading
+        outHandle.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.count > 0 {
+                FileHandle.standardOutput.write(data)
+            }
+        }
 
         RunLoop.main.run()
     }
