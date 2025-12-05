@@ -2,22 +2,21 @@ package main
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"gopkg.in/yaml.v3"
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"os/signal"
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
 )
-
-//
-// ------------------------------------------------------------
-// Global flags
-// ------------------------------------------------------------
-//
 
 var (
 	debug bool
@@ -26,15 +25,13 @@ var (
 
 func logDebug(format string, args ...interface{}) {
 	if debug {
-		fmt.Printf("[runctl] "+format+"\n", args...)
+		fmt.Fprintf(os.Stderr, "[runctl] "+format+"\n", args...)
 	}
 }
 
-//
-// ------------------------------------------------------------
-// Types
-// ------------------------------------------------------------
-//
+// -----------------------------------------------------------------------------
+// Types (runtime.yaml)
+// -----------------------------------------------------------------------------
 
 type Share struct {
 	Host  string `yaml:"host"`
@@ -68,11 +65,9 @@ type RuntimeConfig struct {
 	Shares    []Share         `yaml:"shares"`
 }
 
-//
-// ------------------------------------------------------------
-// Runtime paths
-// ------------------------------------------------------------
-//
+// -----------------------------------------------------------------------------
+// Paths
+// -----------------------------------------------------------------------------
 
 func home() string {
 	u, err := user.Current()
@@ -90,6 +85,14 @@ func imageRoot() string {
 	return filepath.Join(home(), ".runtimes", "images")
 }
 
+func instanceDir(name string) string {
+	return filepath.Join(instanceRoot(), name)
+}
+
+func lockFilePath(name string) string {
+	return filepath.Join(instanceDir(name), "lockfile")
+}
+
 func loadConfig(instDir string) (*RuntimeConfig, error) {
 	path := filepath.Join(instDir, "runtime.yaml")
 	logDebug("Loading runtime config: %s", path)
@@ -105,11 +108,9 @@ func loadConfig(instDir string) (*RuntimeConfig, error) {
 	return &cfg, nil
 }
 
-//
-// ------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // MAC utilities
-// ------------------------------------------------------------
-//
+// -----------------------------------------------------------------------------
 
 func generateMAC() (string, error) {
 	buf := make([]byte, 6)
@@ -117,7 +118,6 @@ func generateMAC() (string, error) {
 		return "", err
 	}
 
-	// QEMU/crosvm-friendly MAC: 52:54:xx:xx:xx:xx (locally administered)
 	buf[0] = 0x52
 	buf[1] = 0x54
 	buf[2] = (buf[2] & 0x7F) | 0x80
@@ -128,11 +128,9 @@ func generateMAC() (string, error) {
 	return mac, nil
 }
 
-//
-// ------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // Cloud-init ISO builder
-// ------------------------------------------------------------
-//
+// -----------------------------------------------------------------------------
 
 func makeCIDATISO(cidataDir, isoPath string) error {
 	logDebug("Building CIDATA ISO from %s → %s", cidataDir, isoPath)
@@ -143,7 +141,7 @@ func makeCIDATISO(cidataDir, isoPath string) error {
 			"hdiutil", "makehybrid",
 			"-o", isoPath,
 			cidataDir,
-			"-hfs", "-joliet", "-iso",
+			"-iso", "-joliet", 
 			"-default-volume-name", "CIDATA",
 		)
 		cmd.Stdout = os.Stdout
@@ -163,14 +161,126 @@ func makeCIDATISO(cidataDir, isoPath string) error {
 	return cmd.Run()
 }
 
-//
-// ------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Lockfile handling
+// -----------------------------------------------------------------------------
+
+type BusyError struct {
+	Instance string
+	Pid      int
+}
+
+func (e *BusyError) Error() string {
+	return fmt.Sprintf("instance %q is busy (pid %d active)", e.Instance, e.Pid)
+}
+
+type LockInfo struct {
+	Name string
+	Pid  int
+}
+
+func readLock(path string) (*LockInfo, error) {
+	data, err := ioutil.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	lines := strings.Split(string(data), "\n")
+	info := &LockInfo{}
+	for _, ln := range lines {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		parts := strings.SplitN(ln, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		k := strings.TrimSpace(parts[0])
+		v := strings.TrimSpace(parts[1])
+		switch k {
+		case "name":
+			info.Name = v
+		case "pid":
+			pid, _ := strconv.Atoi(v)
+			info.Pid = pid
+		}
+	}
+	if info.Pid == 0 {
+		return nil, errors.New("invalid lockfile (no pid)")
+	}
+	return info, nil
+}
+
+func writeLock(path, name string, pid int) error {
+	content := fmt.Sprintf("name=%s\npid=%d\ncreated_at=%s\n",
+		name, pid, time.Now().UTC().Format(time.RFC3339))
+	return ioutil.WriteFile(path, []byte(content), 0o644)
+}
+
+// isPidAlive uses `ps` to check both existence and name match.
+func isPidAlive(pid int, wantName string) bool {
+	if pid <= 0 {
+		return false
+	}
+	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "comm=")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return false
+	}
+	comm := strings.TrimSpace(string(out))
+	if comm == "" {
+		return false
+	}
+	if wantName == "" {
+		return true
+	}
+	return comm == wantName
+}
+
+// ensureInstanceNotBusy enforces lock semantics.
+// - If no lock → OK.
+// - If lock with live PID → BusyError.
+// - If lock with dead PID → remove stale lock, continue.
+func ensureInstanceNotBusy(name string) error {
+	lp := lockFilePath(name)
+	_, err := os.Stat(lp)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	info, err := readLock(lp)
+	if err != nil {
+		return fmt.Errorf("cannot parse lockfile %s: %w", lp, err)
+	}
+
+	if isPidAlive(info.Pid, info.Name) {
+		fmt.Fprintf(os.Stderr,
+			"runctl: instance %q appears to be busy (pid %d is active)\n", name, info.Pid)
+		fmt.Fprintf(os.Stderr,
+			"refusing to proceed to avoid filesystem corruption (EBUSY)\n")
+		return &BusyError{Instance: name, Pid: info.Pid}
+	}
+
+	fmt.Fprintf(os.Stderr,
+		"runctl: stale lockfile for instance %q (pid %d not running) — removing and continuing\n",
+		name, info.Pid)
+	_ = os.Remove(lp)
+	return nil
+}
+
+// -----------------------------------------------------------------------------
 // createInstance
-// ------------------------------------------------------------
-//
+// -----------------------------------------------------------------------------
 
 func createInstance(name, image string) error {
-	instDir := filepath.Join(instanceRoot(), name)
+	if err := ensureInstanceNotBusy(name); err != nil {
+		return err
+	}
+
+	instDir := instanceDir(name)
 
 	// Handle existing instance dir with --force (preserve cidata/)
 	if st, err := os.Stat(instDir); err == nil && st.IsDir() {
@@ -196,7 +306,7 @@ func createInstance(name, image string) error {
 		return err
 	}
 
-	if err := os.MkdirAll(instDir, 0755); err != nil {
+	if err := os.MkdirAll(instDir, 0o755); err != nil {
 		return err
 	}
 	logDebug("Instance directory: %s", instDir)
@@ -227,7 +337,7 @@ func createInstance(name, image string) error {
 		}
 
 		logDebug("Truncating overlay to 1 GiB: %s", overlay)
-		if err := os.Truncate(overlay, 1<<30); err != nil { // 1 GiB
+		if err := os.Truncate(overlay, 1<<30); err != nil {
 			return fmt.Errorf("failed to truncate overlay file %s to 1 GiB: %w", overlay, err)
 		}
 	} else if err != nil {
@@ -237,7 +347,7 @@ func createInstance(name, image string) error {
 	// Cloud-init directory
 	cidataDir := filepath.Join(instDir, "cidata")
 	logDebug("Ensuring cidata directory: %s", cidataDir)
-	if err := os.MkdirAll(cidataDir, 0755); err != nil {
+	if err := os.MkdirAll(cidataDir, 0o755); err != nil {
 		return err
 	}
 
@@ -247,11 +357,11 @@ func createInstance(name, image string) error {
 	// Default user-data/meta-data, if missing
 	if _, err := os.Stat(userDataPath); os.IsNotExist(err) {
 		logDebug("Writing default user-data: %s", userDataPath)
-		_ = ioutil.WriteFile(userDataPath, []byte("#cloud-config\n"), 0644)
+		_ = ioutil.WriteFile(userDataPath, []byte("#cloud-config\n"), 0o644)
 	}
 	if _, err := os.Stat(metaDataPath); os.IsNotExist(err) {
 		logDebug("Writing default meta-data: %s", metaDataPath)
-		_ = ioutil.WriteFile(metaDataPath, []byte{}, 0644)
+		_ = ioutil.WriteFile(metaDataPath, []byte{}, 0o644)
 	}
 
 	isoPath := filepath.Join(instDir, "cidata.iso")
@@ -271,8 +381,7 @@ func createInstance(name, image string) error {
 		Kernel: kernel,
 		Initrd: initrd,
 		Root: RootConfig{
-			Base:    base,
-			Overlay: overlay,
+			Base: filepath.Join(instDir, "rootfs.raw"),
 		},
 		Network: NetworkConfig{
 			MAC:  mac,
@@ -293,7 +402,7 @@ func createInstance(name, image string) error {
 
 	runtimePath := filepath.Join(instDir, "runtime.yaml")
 	logDebug("Writing runtime.yaml: %s", runtimePath)
-	if err := ioutil.WriteFile(runtimePath, data, 0644); err != nil {
+	if err := ioutil.WriteFile(runtimePath, data, 0o644); err != nil {
 		return err
 	}
 
@@ -301,14 +410,16 @@ func createInstance(name, image string) error {
 	return nil
 }
 
-//
-// ------------------------------------------------------------
-// startInstance
-// ------------------------------------------------------------
-//
+// -----------------------------------------------------------------------------
+// startInstance with name + lock + signals
+// -----------------------------------------------------------------------------
 
 func startInstance(name string) error {
-	instDir := filepath.Join(instanceRoot(), name)
+	if err := ensureInstanceNotBusy(name); err != nil {
+		return err
+	}
+
+	instDir := instanceDir(name)
 	logDebug("Starting instance: %s (dir: %s)", name, instDir)
 
 	cfg, err := loadConfig(instDir)
@@ -326,74 +437,225 @@ func startInstance(name string) error {
 	netArg := fmt.Sprintf("%s@%s", cfg.Network.MAC, cfg.Network.Mode)
 	logDebug("Network argument: %s", netArg)
 
-	// crosvm-style: --disk = RO, --rwdisk = RW
+	// Arguments to runvm (or future crosvm on Linux)
 	args := []string{
 		"--name", cfg.Name,
 		"--kernel", cfg.Kernel,
 		"--initrd", cfg.Initrd,
-
-		"--disk", cfg.Root.Base, // RO base image
-		"--rwdisk", cfg.Root.Overlay, // RW overlay
-		"--disk", cfg.CloudInit.CIDATA, // RO CIDATA
-
+		"--rwdisk", cfg.Root.Base,
+		//		"--rwdisk", cfg.Root.Overlay,
+		"--disk", cfg.CloudInit.CIDATA,
 		"--net", netArg,
-		"--params", "console=hvc0 root=/dev/vda rootfstype=ext4 rootwait",
+		"--params", "console=hvc0 root=/dev/vda rootfstype=ext4 rw rootwait",
 	}
 
 	for _, s := range cfg.Shares {
 		arg := fmt.Sprintf("%s:%s", s.Host, s.Guest)
-		logDebug("Adding shared-dir: %s", arg)
-		args = append(args, "--shared-dir", arg)
+		logDebug("Adding shared-dir (folder): %s", arg)
+		args = append(args, "--folder", arg)
 	}
 
-	logDebug("Executing: runvm %s", strings.Join(args, " "))
+	instDirAbs, err := filepath.Abs(instDir)
+	if err != nil {
+		return err
+	}
 
-	cmd := exec.Command("runvm", args...)
+	// Symlink for process name semantics
+	targetBin := "/usr/local/bin/runvm"
+	if runtime.GOOS != "darwin" {
+		// placeholder for future crosvm; for now, still runvm if present
+		targetBin = "/usr/local/bin/runvm"
+	}
+
+	exeName := cfg.Name
+	exePath := filepath.Join(instDirAbs, exeName)
+
+	_ = os.Remove(exePath)
+	if err := os.Symlink(targetBin, exePath); err != nil {
+		return fmt.Errorf("failed to symlink %s → %s: %w", exePath, targetBin, err)
+	}
+
+	cmd := exec.Command("./"+exeName, args...)
+	cmd.Dir = instDirAbs
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+
+	logDebug("Executing in %s: ./%s %s", instDirAbs, exeName, strings.Join(args, " "))
 
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	fmt.Printf("Started %s (pid %d)\n", cfg.Name, cmd.Process.Pid)
+	childPid := cmd.Process.Pid
+	fmt.Printf("Started %s (pid %d)\n", cfg.Name, childPid)
+
+	// Write lockfile with VM PID
+	lp := lockFilePath(name)
+	if err := writeLock(lp, cfg.Name, childPid); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to write lockfile: %v\n", err)
+	}
+
+	// Nanny: handle signals and wait for child
+	err = nannyWait(cmd, lp, childPid)
+	return err
+}
+
+func nannyWait(cmd *exec.Cmd, lockPath string, childPid int) error {
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- cmd.Wait()
+	}()
+
+	sigCh := make(chan os.Signal, 8)
+	signal.Notify(sigCh,
+		syscall.SIGINT,
+		syscall.SIGTERM,
+		syscall.SIGHUP,
+		syscall.SIGTSTP,
+		syscall.SIGCONT,
+	)
+
+	for {
+		select {
+		case err := <-waitCh:
+			_ = os.Remove(lockPath)
+			if err != nil {
+				if exitErr, ok := err.(*exec.ExitError); ok {
+					if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
+						if status.Signaled() {
+							return fmt.Errorf("vm exited on signal %s", status.Signal())
+						}
+						return fmt.Errorf("vm exited with status %d", status.ExitStatus())
+					}
+				}
+				return err
+			}
+			return nil
+
+		case s := <-sigCh:
+			logDebug("Received signal: %s", s.String())
+			switch s {
+			case syscall.SIGINT, syscall.SIGTERM:
+				_ = syscall.Kill(childPid, s.(syscall.Signal))
+			case syscall.SIGHUP:
+				_ = syscall.Kill(childPid, syscall.SIGSTOP)
+			case syscall.SIGTSTP:
+				_ = syscall.Kill(childPid, syscall.SIGSTOP)
+				_ = syscall.Kill(os.Getpid(), syscall.SIGSTOP)
+			case syscall.SIGCONT:
+				_ = syscall.Kill(childPid, syscall.SIGCONT)
+			}
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Stop / Pause / Resume / List
+// -----------------------------------------------------------------------------
+
+func stopInstance(name string) error {
+	lp := lockFilePath(name)
+	info, err := readLock(lp)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Println("Instance", name, "not running (no lockfile)")
+			return nil
+		}
+		fmt.Fprintf(os.Stderr, "warning: cannot read lockfile: %v\n", err)
+		return nil
+	}
+
+	if isPidAlive(info.Pid, info.Name) {
+		logDebug("Stopping instance %s (pid %d)", name, info.Pid)
+		return syscall.Kill(info.Pid, syscall.SIGTERM)
+	}
+
+	fmt.Printf("Instance %s not running (stale lockfile); removing lock\n", name)
+	_ = os.Remove(lp)
 	return nil
 }
 
-//
-// ------------------------------------------------------------
-// Stop / Pause / Resume
-// ------------------------------------------------------------
-//
-
-func stopInstance(name string) error {
-	logDebug("Stopping instance: %s", name)
-	cmd := exec.Command("killall", name)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
-
 func pauseInstance(name string) error {
-	logDebug("Pausing instance: %s", name)
-	cmd := exec.Command("killall", "-STOP", name)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	lp := lockFilePath(name)
+	info, err := readLock(lp)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Println("Instance", name, "not running (no lockfile)")
+			return nil
+		}
+		return err
+	}
+
+	if isPidAlive(info.Pid, info.Name) {
+		logDebug("Pausing instance %s (pid %d)", name, info.Pid)
+		return syscall.Kill(info.Pid, syscall.SIGSTOP)
+	}
+
+	fmt.Printf("Instance %s not running (stale lockfile); removing lock\n", name)
+	_ = os.Remove(lp)
+	return nil
 }
 
 func resumeInstance(name string) error {
-	logDebug("Resuming instance: %s", name)
-	cmd := exec.Command("killall", "-CONT", name)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	lp := lockFilePath(name)
+	info, err := readLock(lp)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Println("Instance", name, "not running (no lockfile)")
+			return nil
+		}
+		return err
+	}
+
+	if isPidAlive(info.Pid, info.Name) {
+		logDebug("Resuming instance %s (pid %d)", name, info.Pid)
+		return syscall.Kill(info.Pid, syscall.SIGCONT)
+	}
+
+	fmt.Printf("Instance %s not running (stale lockfile); removing lock\n", name)
+	_ = os.Remove(lp)
+	return nil
 }
 
-//
-// ------------------------------------------------------------
-// CLI entrypoint
-// ------------------------------------------------------------
-//
+func listInstances() error {
+	root := instanceRoot()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			fmt.Println("No instances.")
+			return nil
+		}
+		return err
+	}
+
+	fmt.Printf("%-20s %-10s %-8s\n", "NAME", "STATE", "PID")
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		lp := lockFilePath(name)
+		info, err := readLock(lp)
+		if err != nil {
+			if os.IsNotExist(err) {
+				fmt.Printf("%-20s %-10s %-8s\n", name, "stopped", "-")
+				continue
+			}
+			fmt.Printf("%-20s %-10s %-8s\n", name, "error", "-")
+			continue
+		}
+		if isPidAlive(info.Pid, info.Name) {
+			fmt.Printf("%-20s %-10s %-8d\n", name, "running", info.Pid)
+		} else {
+			fmt.Printf("%-20s %-10s %-8s\n", name, "stopped", "-")
+		}
+	}
+	return nil
+}
+
+// -----------------------------------------------------------------------------
+// CLI
+// -----------------------------------------------------------------------------
 
 func usage() {
 	fmt.Println("usage:")
@@ -402,6 +664,7 @@ func usage() {
 	fmt.Println("  runctl [--debug]          stop   <instance>")
 	fmt.Println("  runctl [--debug]          pause  <instance>")
 	fmt.Println("  runctl [--debug]          resume <instance>")
+	fmt.Println("  runctl [--debug]          list")
 }
 
 func main() {
@@ -410,7 +673,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Global options: --debug, --force
 	args := os.Args[1:]
 	for len(args) > 0 && strings.HasPrefix(args[0], "-") {
 		switch args[0] {
@@ -426,55 +688,83 @@ func main() {
 		args = args[1:]
 	}
 
-	if len(args) < 2 {
+	if len(args) < 1 {
 		usage()
 		os.Exit(1)
 	}
 
 	cmd := args[0]
-	name := args[1]
-	args = args[2:]
+	args = args[1:]
+
+	var err error
 
 	switch cmd {
 	case "create":
-		if len(args) < 2 || args[0] != "--image" {
+		if len(args) < 3 {
+			fmt.Println("missing arguments for create")
+			usage()
+			os.Exit(1)
+		}
+		name := args[0]
+		if args[1] != "--image" {
 			fmt.Println("missing --image for create")
 			usage()
 			os.Exit(1)
 		}
-		image := args[1]
-		if err := createInstance(name, image); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
-			os.Exit(1)
-		}
+		image := args[2]
+		err = createInstance(name, image)
 
 	case "start":
-		if err := startInstance(name); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
+		if len(args) < 1 {
+			fmt.Println("missing instance for start")
+			usage()
 			os.Exit(1)
 		}
+		name := args[0]
+		err = startInstance(name)
 
 	case "stop":
-		if err := stopInstance(name); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
+		if len(args) < 1 {
+			fmt.Println("missing instance for stop")
+			usage()
 			os.Exit(1)
 		}
+		name := args[0]
+		err = stopInstance(name)
 
 	case "pause":
-		if err := pauseInstance(name); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
+		if len(args) < 1 {
+			fmt.Println("missing instance for pause")
+			usage()
 			os.Exit(1)
 		}
+		name := args[0]
+		err = pauseInstance(name)
 
 	case "resume":
-		if err := resumeInstance(name); err != nil {
-			fmt.Fprintln(os.Stderr, "error:", err)
+		if len(args) < 1 {
+			fmt.Println("missing instance for resume")
+			usage()
 			os.Exit(1)
 		}
+		name := args[0]
+		err = resumeInstance(name)
+
+	case "list":
+		err = listInstances()
 
 	default:
 		fmt.Println("unknown command:", cmd)
 		usage()
+		os.Exit(1)
+	}
+
+	if err != nil {
+		if be, ok := err.(*BusyError); ok {
+			fmt.Fprintln(os.Stderr, "error:", be.Error())
+			os.Exit(16) // EBUSY
+		}
+		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
