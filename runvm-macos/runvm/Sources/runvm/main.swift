@@ -121,7 +121,7 @@ class OccurrenceCounter {
     }
 }
 
-class VMCLIDelegate: NSObject, VZVirtualMachineDelegate {
+class RunVMDelegate: NSObject, VZVirtualMachineDelegate {
     func guestDidStop(_ virtualMachine: VZVirtualMachine) {
         quit(0)
     }
@@ -130,7 +130,7 @@ class VMCLIDelegate: NSObject, VZVirtualMachineDelegate {
     }
 }
 
-let delegate = VMCLIDelegate()
+let delegate = RunVMDelegate()
 let vmCfg = VZVirtualMachineConfiguration()
 
 enum BootLoader: String, ExpressibleByArgument {
@@ -146,7 +146,7 @@ enum SizeSuffix: UInt64, ExpressibleByArgument {
          GB = 1000000000, GiB = 0x40000000
 }
 
-struct VMCLI: ParsableCommand {
+struct RunVM: ParsableCommand {
 
     @Option(name: .customLong("name"), help: "Instance name (process name)")
     var name: String?
@@ -249,8 +249,8 @@ struct VMCLI: ParsableCommand {
                 if efiVars == nil {
                     throw ValidationError("EFI variable store must be specified if using EFI bootloader")
                 }
-                if kernel != nil || initrd != nil || params != nil || cmdline != nil {
-                    throw ValidationError("Kernel, initrd and cmdline options cannot be used with EFI bootloader")
+                if kernel != nil || initrd != nil  {
+                    throw ValidationError("Kernel, initrd options cannot be used with EFI bootloader")
                 }
                 let efiVarStoreURL = URL(fileURLWithPath: efiVars!)
                 let efiVarStore: VZEFIVariableStore
@@ -426,4 +426,4 @@ struct VMCLI: ParsableCommand {
     }
 }
 
-VMCLI.main()
+RunVM.main()
