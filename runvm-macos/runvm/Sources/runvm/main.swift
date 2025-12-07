@@ -1,16 +1,12 @@
 import Foundation
+import AppKit // Required for NSWorkspace (Sleep/Wake notifications)
 import ArgumentParser
 import Virtualization
-
-// Expose the BSD setproctitle function to Swift
-#if os(macOS)
-@_silgen_name("setproctitle")
-func setproctitle(_ fmt: UnsafePointer<CChar>, _ args: CVarArg...)
-#endif
 
 var origStdinTerm : termios? = nil
 var origStdoutTerm : termios? = nil
 
+// The global VM instance
 var vm : VZVirtualMachine? = nil
 
 // mask TERM signals so we can perform clean up
@@ -121,6 +117,37 @@ class OccurrenceCounter {
     }
 }
 
+// MARK: - Sleep/Wake Observer
+class VMAppStateObserver: NSObject {
+    func startObserving() {
+        let center = NSWorkspace.shared.notificationCenter
+        center.addObserver(self, selector: #selector(willSleep(_:)), name: NSWorkspace.willSleepNotification, object: nil)
+        center.addObserver(self, selector: #selector(didWake(_:)), name: NSWorkspace.didWakeNotification, object: nil)
+    }
+
+    @objc func willSleep(_ notification: Notification) {
+        // Pause the VM to prevent guest kernel watchdog panic due to time jump
+        if let v = vm, v.state == .running {
+            v.pause { result in
+                if case .failure(let error) = result {
+                    FileHandle.standardError.write("Failed to pause VM on sleep: \(error)\r\n".data(using: .utf8)!)
+                }
+            }
+        }
+    }
+
+    @objc func didWake(_ notification: Notification) {
+        // Resume execution
+        if let v = vm, v.state == .paused {
+            v.resume { result in
+                if case .failure(let error) = result {
+                    FileHandle.standardError.write("Failed to resume VM on wake: \(error)\r\n".data(using: .utf8)!)
+                }
+            }
+        }
+    }
+}
+
 class RunVMDelegate: NSObject, VZVirtualMachineDelegate {
     func guestDidStop(_ virtualMachine: VZVirtualMachine) {
         quit(0)
@@ -132,6 +159,10 @@ class RunVMDelegate: NSObject, VZVirtualMachineDelegate {
 
 let delegate = RunVMDelegate()
 let vmCfg = VZVirtualMachineConfiguration()
+let platform = VZGenericPlatformConfiguration()
+platform.machineIdentifier = VZGenericMachineIdentifier()
+vmCfg.platform = platform
+
 
 enum BootLoader: String, ExpressibleByArgument {
     case linux
@@ -209,19 +240,10 @@ struct RunVM: ParsableCommand {
     var cmdline: String?
 
     mutating func run() throws {
-        // Set process name if provided
-        if let name = name {
-            // This sets the UNIX-level process name
-            name.withCString { cstr in
-                setprogname(cstr)
-            }
-        }
-
-
         // CPU / memory
         vmCfg.cpuCount = cpuCount
         vmCfg.memorySize = memorySize * memorySizeSuffix.rawValue
-
+        
         // bootloader
         switch bootloader {
         case .linux:
@@ -421,6 +443,11 @@ struct RunVM: ParsableCommand {
                 FileHandle.standardOutput.write(data)
             }
         }
+        
+        // --- NEW: Observe Sleep/Wake ---
+        let sleepObserver = VMAppStateObserver()
+        sleepObserver.startObserving()
+        // -------------------------------
 
         RunLoop.main.run()
     }

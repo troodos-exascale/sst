@@ -16,7 +16,7 @@ if #available(macOS 12, *) {
 let package = Package(
     name: "dealer",
     platforms: [
-        .macOS(.v12),
+        .macOS(.v13),
     ],
     products: [
         .executable(name: "runvm", targets: ["runvm"]),

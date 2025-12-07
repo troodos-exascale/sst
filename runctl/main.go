@@ -228,18 +228,16 @@ func instanceIP(cfg *RuntimeConfig) (string, error) {
     return "", fmt.Errorf("no IP found for MAC %s", cfg.Network.MAC)
 }
 
-func isPidAlive(pid int, wantName string) bool {
+
+func isPidAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "comm=")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return false
-	}
-	comm := strings.TrimSpace(string(out))
-	return comm == wantName
+	// Send signal 0 → check existence without affecting the process.
+	err := syscall.Kill(pid, 0)
+	return err == nil
 }
+
 
 func ensureInstanceNotBusy(name string) error {
 	lp := lockFilePath(name)
@@ -256,7 +254,7 @@ func ensureInstanceNotBusy(name string) error {
 		return fmt.Errorf("cannot parse lockfile %s: %w", lp, err)
 	}
 
-	if isPidAlive(info.Pid, info.Name) {
+	if isPidAlive(info.Pid) {
 		return &BusyError{Instance: name, Pid: info.Pid}
 	}
 
@@ -724,7 +722,7 @@ func stopInstance(name string) error {
 		fmt.Printf("Instance %s not running\n", name)
 		return nil
 	}
-	if isPidAlive(info.Pid, info.Name) {
+	if isPidAlive(info.Pid) {
 		return syscall.Kill(info.Pid, syscall.SIGTERM)
 	}
 	_ = os.Remove(lp)
@@ -739,7 +737,7 @@ func pauseInstance(name string) error {
 		fmt.Printf("Instance %s not running\n", name)
 		return nil
 	}
-	if isPidAlive(info.Pid, info.Name) {
+	if isPidAlive(info.Pid) {
 		return syscall.Kill(info.Pid, syscall.SIGSTOP)
 	}
 	_ = os.Remove(lp)
@@ -754,7 +752,7 @@ func resumeInstance(name string) error {
 		fmt.Printf("Instance %s not running\n", name)
 		return nil
 	}
-	if isPidAlive(info.Pid, info.Name) {
+	if isPidAlive(info.Pid) {
 		return syscall.Kill(info.Pid, syscall.SIGCONT)
 	}
 	_ = os.Remove(lp)
@@ -783,7 +781,7 @@ func listInstances() error {
 			continue
 		}
 		state := "stopped"
-		if isPidAlive(info.Pid, info.Name) {
+		if isPidAlive(info.Pid) {
 			state = "running"
 		}
 		cfg, _ := loadConfig(instanceDir(name))
