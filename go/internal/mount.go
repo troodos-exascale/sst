@@ -1,8 +1,7 @@
-package image
+package internal
 
 import (
 	"fmt"
-	"mkimage/internal/util"
 	"os"
 	"os/exec"
 	"os/user"
@@ -33,7 +32,7 @@ func MountPartition(dev string) (string, error) {
 	}
 
 	// ensure ext4 module is present (best effort)
-	if out, err := util.Run("modprobe", "ext4"); err != nil && !strings.Contains(out, "not found") {
+	if out, err := Run("modprobe", "ext4"); err != nil && !strings.Contains(out, "not found") {
 		// if ext4 really fails, report it; otherwise ignore missing modprobe
 		// on non-modular kernels
 		return "", fmt.Errorf(

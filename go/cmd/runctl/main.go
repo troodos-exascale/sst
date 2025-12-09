@@ -1,22 +1,18 @@
 package main
 
 import (
-	"crypto/rand"
-	"errors"
 	"fmt"
 	"gopkg.in/yaml.v3"
-	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"os/signal"
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"runtime-smart/internal"
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 )
 
 var (
@@ -24,264 +20,73 @@ var (
 	force bool
 )
 
-// -----------------------------------------------------------------------------
-// Logging
-// -----------------------------------------------------------------------------
 
-func logDebug(format string, args ...interface{}) {
-	if debug {
-		fmt.Fprintf(os.Stderr, "[runctl] "+format+"\n", args...)
-	}
-}
 
 // -----------------------------------------------------------------------------
 // Types (runtime.yaml)
 // -----------------------------------------------------------------------------
 
-type Share struct {
-	Host  string `yaml:"host"`
-	Guest string `yaml:"guest"`
-}
-
-type RootConfig struct {
-	Base string `yaml:"base"`
-}
-
-type DataDisk struct {
-    Path string `yaml:"path"`
-    Mode string `yaml:"mode"` // "rw" or "ro"
-}
-
-type RuntimeConfig struct {
-    Name        string     `yaml:"name"`
-    Boot        string     `yaml:"boot"` // "efi" or "kernel"`
-
-	Kernel string `yaml:"kernel,omitempty"`
-	Initrd string `yaml:"initrd,omitempty"`
-
-    SystemDisk  string     `yaml:"system_disk"`  // must be --rwdisk
-    CIDataDisk  string     `yaml:"cidata_disk"`  // must be --disk
-    DataDisks   []DataDisk `yaml:"data_disks"`  // array of mixed rw/ro
-
-    EFIVars     string     `yaml:"efi_vars"`
-    Params      string     `yaml:"params"`
-    CPUCount    int        `yaml:"cpu_count"`
-    MemorySize  string     `yaml:"memory_size"` //friendly: 4G, 4096=4096M
-
-    Shares      []Share    `yaml:"shares"`
-
-    Network struct {
-        MAC  string `yaml:"mac"`
-        Mode string `yaml:"mode"`
-		HostName string `yaml:"hostname"`
-    } `yaml:"network"`
-}
 
 
-// -----------------------------------------------------------------------------
-// Paths
-// -----------------------------------------------------------------------------
+func instanceIP(cfg *internal.RuntimeConfig) (string, error) {
+	mac := strings.ToLower(cfg.Network.MAC)
 
-func home() string {
-	u, err := user.Current()
-	if err != nil {
-		panic(err)
-	}
-	return u.HomeDir
-}
-
-func instanceRoot() string           { return filepath.Join(home(), ".runtimes", "instances") }
-func instanceDir(name string) string { return filepath.Join(instanceRoot(), name) }
-func lockFilePath(name string) string {
-	return filepath.Join(instanceDir(name), "lockfile")
-}
-
-// -----------------------------------------------------------------------------
-// Sparse file helper
-// -----------------------------------------------------------------------------
-
-func createSparse(path string, size int64) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	if err := f.Truncate(size); err != nil {
-		f.Close()
-		return err
-	}
-	return f.Close()
-}
-
-// -----------------------------------------------------------------------------
-// Lockfile handling
-// -----------------------------------------------------------------------------
-
-type BusyError struct {
-	Instance string
-	Pid      int
-}
-
-func (e *BusyError) Error() string {
-	return fmt.Sprintf("instance %q is busy (pid %d active)", e.Instance, e.Pid)
-}
-
-type LockInfo struct {
-	Name string
-	Pid  int
-}
-
-func readLock(path string) (*LockInfo, error) {
-	data, err := ioutil.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	lines := strings.Split(string(data), "\n")
-	info := &LockInfo{}
-	for _, ln := range lines {
-		ln = strings.TrimSpace(ln)
-		if ln == "" {
-			continue
-		}
-		parts := strings.SplitN(ln, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		switch strings.TrimSpace(parts[0]) {
-		case "name":
-			info.Name = strings.TrimSpace(parts[1])
-		case "pid":
-			p, _ := strconv.Atoi(strings.TrimSpace(parts[1]))
-			info.Pid = p
+	// First try ARP (IPv4)
+	out, err := exec.Command("arp", "-a").CombinedOutput()
+	if err == nil {
+		lines := strings.Split(string(out), "\n")
+		for _, ln := range lines {
+			low := strings.ToLower(ln)
+			if strings.Contains(low, mac) {
+				// extract "(IP)" portion
+				start := strings.Index(ln, "(")
+				end := strings.Index(ln, ")")
+				if start > -1 && end > start {
+					return ln[start+1 : end], nil
+				}
+			}
 		}
 	}
-	if info.Pid == 0 {
-		return nil, errors.New("invalid lockfile (no pid)")
+
+	// Try IPv6 neighbor table (ndp for macOS, ip -6 neigh for Linux)
+	// macOS: ndp -a
+	out6, err6 := exec.Command("ndp", "-a").CombinedOutput()
+	if err6 == nil {
+		lines := strings.Split(string(out6), "\n")
+		for _, ln := range lines {
+			low := strings.ToLower(ln)
+			if strings.Contains(low, mac) {
+				fields := strings.Fields(ln)
+				if len(fields) > 0 {
+					return fields[0], nil // first field is IPv6 address
+				}
+			}
+		}
 	}
-	return info, nil
+
+	// Linux fallback: ip neigh
+	out6b, err6b := exec.Command("ip", "neigh").CombinedOutput()
+	if err6b == nil {
+		lines := strings.Split(string(out6b), "\n")
+		for _, ln := range lines {
+			low := strings.ToLower(ln)
+			if strings.Contains(low, mac) {
+				fields := strings.Fields(ln)
+				if len(fields) > 0 {
+					return fields[0], nil // first field is IP
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("no IP found for MAC %s", cfg.Network.MAC)
 }
 
-func writeLock(path, name string, pid int) error {
-	content := fmt.Sprintf("name=%s\npid=%d\ncreated_at=%s\n",
-		name, pid, time.Now().UTC().Format(time.RFC3339))
-	return ioutil.WriteFile(path, []byte(content), 0644)
-}
-
-// -----------------------------------------------------------------------------
-// Process helpers
-// -----------------------------------------------------------------------------
-
-// -----------------------------------------------------------------------------
-// instanceIP - discover VM IP by matching ARP/NDP MAC entries to runtime config
-// -----------------------------------------------------------------------------
-
-func instanceIP(cfg *RuntimeConfig) (string, error) {
-    mac := strings.ToLower(cfg.Network.MAC)
-
-    // First try ARP (IPv4)
-    out, err := exec.Command("arp", "-a").CombinedOutput()
-    if err == nil {
-        lines := strings.Split(string(out), "\n")
-        for _, ln := range lines {
-            low := strings.ToLower(ln)
-            if strings.Contains(low, mac) {
-                // extract "(IP)" portion
-                start := strings.Index(ln, "(")
-                end := strings.Index(ln, ")")
-                if start > -1 && end > start {
-                    return ln[start+1 : end], nil
-                }
-            }
-        }
-    }
-
-    // Try IPv6 neighbor table (ndp for macOS, ip -6 neigh for Linux)
-    // macOS: ndp -a
-    out6, err6 := exec.Command("ndp", "-a").CombinedOutput()
-    if err6 == nil {
-        lines := strings.Split(string(out6), "\n")
-        for _, ln := range lines {
-            low := strings.ToLower(ln)
-            if strings.Contains(low, mac) {
-                fields := strings.Fields(ln)
-                if len(fields) > 0 {
-                    return fields[0], nil // first field is IPv6 address
-                }
-            }
-        }
-    }
-
-    // Linux fallback: ip neigh
-    out6b, err6b := exec.Command("ip", "neigh").CombinedOutput()
-    if err6b == nil {
-        lines := strings.Split(string(out6b), "\n")
-        for _, ln := range lines {
-            low := strings.ToLower(ln)
-            if strings.Contains(low, mac) {
-                fields := strings.Fields(ln)
-                if len(fields) > 0 {
-                    return fields[0], nil // first field is IP
-                }
-            }
-        }
-    }
-
-    return "", fmt.Errorf("no IP found for MAC %s", cfg.Network.MAC)
-}
-
-
-func isPidAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	// Send signal 0 → check existence without affecting the process.
-	err := syscall.Kill(pid, 0)
-	return err == nil
-}
-
-
-func ensureInstanceNotBusy(name string) error {
-	lp := lockFilePath(name)
-	_, err := os.Stat(lp)
-	if os.IsNotExist(err) {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-
-	info, err := readLock(lp)
-	if err != nil {
-		return fmt.Errorf("cannot parse lockfile %s: %w", lp, err)
-	}
-
-	if isPidAlive(info.Pid) {
-		return &BusyError{Instance: name, Pid: info.Pid}
-	}
-
-	_ = os.Remove(lp)
-	return nil
-}
-
-// -----------------------------------------------------------------------------
-// MAC address
-// -----------------------------------------------------------------------------
-
-func generateMAC() (string, error) {
-	buf := make([]byte, 6)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	buf[0] = 0x52
-	buf[1] = 0x54
-	buf[2] = (buf[2] & 0x7F) | 0x80
-	return fmt.Sprintf("%02x:%02x:%02x:%02x:%02x:%02x",
-		buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]), nil
-}
 
 // -----------------------------------------------------------------------------
 // writeCIData - create cidata/{user-data,meta-data} for cloud-init NoCloud
 // -----------------------------------------------------------------------------
-func writeCIData(instDir string, cfg *RuntimeConfig) error {
+func writeCIData(instDir string, cfg *internal.RuntimeConfig) error {
 
 	cidataDir := filepath.Join(instDir, "cidata")
 	if err := os.MkdirAll(cidataDir, 0755); err != nil {
@@ -341,14 +146,14 @@ runcmd:
   - mkdir -p /Users/%s
   - chown %s:%s /Users/%s
 `,
-		cfg.Network.HostName,     // hostname
-		username,     // user
-		gecos,        // gecos
-		pubKey,       // ssh key
-		username,     // /Users/<user>
-		username,     // owner
-		username,     // group
-		username,     // /Users/<user>
+		cfg.Network.HostName, // hostname
+		username,             // user
+		gecos,                // gecos
+		pubKey,               // ssh key
+		username,             // /Users/<user>
+		username,             // owner
+		username,             // group
+		username,             // /Users/<user>
 	)
 
 	if err := os.WriteFile(filepath.Join(cidataDir, "user-data"),
@@ -372,12 +177,12 @@ runcmd:
 // load/save runtime config
 // -----------------------------------------------------------------------------
 
-func loadConfig(instDir string) (*RuntimeConfig, error) {
-	data, err := ioutil.ReadFile(filepath.Join(instDir, "runtime.yaml"))
+func loadConfig(instDir string) (*internal.RuntimeConfig, error) {
+	data, err := os.ReadFile(filepath.Join(instDir, "runtime.yaml"))
 	if err != nil {
 		return nil, err
 	}
-	var cfg RuntimeConfig
+	var cfg internal.RuntimeConfig
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, err
 	}
@@ -394,7 +199,7 @@ func parseMemorySizeMiB(s string) (uint64, error) {
 		// Default: 4G
 		return 4096, nil
 	}
-	
+
 	orig := s
 	s = strings.ToUpper(s)
 
@@ -430,76 +235,12 @@ func parseMemorySizeMiB(s string) (uint64, error) {
 	}
 }
 
-// -----------------------------------------------------------------------------
-// Image handling helpers
-// -----------------------------------------------------------------------------
-
-func isQCOW2(path string) bool {
-	l := strings.ToLower(path)
-	return strings.HasSuffix(l, ".qcow2") || strings.HasSuffix(l, ".qcow")
-}
-
-// sparseCopyRaw copies a raw image in a sparse way (simple zero-block detection).
-func sparseCopyRaw(srcPath, dstPath string) error {
-	src, err := os.Open(srcPath)
-	if err != nil {
-		return err
-	}
-	defer src.Close()
-
-	dst, err := os.Create(dstPath)
-	if err != nil {
-		return err
-	}
-	defer dst.Close()
-
-	buf := make([]byte, 1024*1024) // 1 MiB blocks
-
-	for {
-		n, readErr := src.Read(buf)
-		if n > 0 {
-			block := buf[:n]
-			allZero := true
-			for _, b := range block {
-				if b != 0 {
-					allZero = false
-					break
-				}
-			}
-			if allZero {
-				if _, err := dst.Seek(int64(n), io.SeekCurrent); err != nil {
-					return err
-				}
-			} else {
-				if _, err := dst.Write(block); err != nil {
-					return err
-				}
-			}
-		}
-
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			return readErr
-		}
-	}
-
-	return nil
-}
-
-
-
-// -----------------------------------------------------------------------------
-// start (EFI or kernel)
-// -----------------------------------------------------------------------------
-
 func startInstance(name string) error {
-	if err := ensureInstanceNotBusy(name); err != nil {
+	if err := internal.EnsureInstanceNotBusy(name); err != nil {
 		return err
 	}
 
-	instDir, _ := filepath.Abs(instanceDir(name))
+	instDir, _ := filepath.Abs(internal.InstanceDir(name))
 	cfg, err := loadConfig(instDir)
 	if err != nil {
 		return err
@@ -521,12 +262,12 @@ func startInstance(name string) error {
 	cidataISO := filepath.Join(instDir, "cidata.iso")
 
 	if st, err := os.Stat(cidataDir); err == nil && st.IsDir() {
-		logDebug("Rebuilding cidata.iso from %s", cidataDir)
-		logDebug("cmd: hdiutil makehybrid -ov -iso -joliet -default-volume-name cidata -o %s %s", cidataISO, cidataDir)
+		internal.LogDebug(debug, "Rebuilding cidata.iso from %s", cidataDir)
+		internal.LogDebug(debug, "cmd: hdiutil makehybrid -ov -iso -joliet -default-volume-name cidata -o %s %s", cidataISO, cidataDir)
 
 		cmd := exec.Command(
 			"hdiutil", "makehybrid", "-ov",
-			"-iso", "-joliet", 
+			"-iso", "-joliet",
 			"-default-volume-name", "cidata",
 			"-o", cidataISO, cidataDir,
 		)
@@ -559,9 +300,8 @@ func startInstance(name string) error {
 	if cfg.Boot == "efi" {
 		// SYSTEM DISK (must be RW)
 		args = append(args, "--bootloader", "efi")
-		args = append(args,"--efi-vars", filepath.Join(instDir,"efi-vars"))
+		args = append(args, "--efi-vars", filepath.Join(instDir, "efi-vars"))
 		args = append(args, "--rwdisk", cfg.SystemDisk)
-		
 
 		// DATA DISKS (array, mixed RW/RO)
 		for _, d := range cfg.DataDisks {
@@ -594,7 +334,7 @@ func startInstance(name string) error {
 		for _, d := range cfg.DataDisks {
 			if d.Mode == "rw" {
 				args = append(args, "--rwdisk", d.Path)
-			}  else {
+			} else {
 				args = append(args, "--disk", d.Path)
 			}
 		}
@@ -636,8 +376,8 @@ func startInstance(name string) error {
 	child := cmd.Process.Pid
 	fmt.Printf("Started %s (pid %d)\n", name, child)
 
-	lp := lockFilePath(name)
-	_ = writeLock(lp, cfg.Name, child)
+	lp := internal.LockFilePath(name)
+	_ = internal.WriteLock(lp, cfg.Name, child)
 
 	return nannyWait(cmd, lp, child)
 }
@@ -670,7 +410,7 @@ func nannyWait(cmd *exec.Cmd, lock string, pid int) error {
 				_ = exec.Command("reset").Run()
 			case syscall.SIGHUP, syscall.SIGTSTP:
 				_ = syscall.Kill(pid, syscall.SIGSTOP)
-				_ =exec.Command("reset").Run()
+				_ = exec.Command("reset").Run()
 			case syscall.SIGCONT:
 				_ = syscall.Kill(pid, syscall.SIGCONT)
 			}
@@ -683,7 +423,7 @@ func nannyWait(cmd *exec.Cmd, lock string, pid int) error {
 // -----------------------------------------------------------------------------
 
 func sshToInstance(name string) error {
-	instDir := instanceDir(name)
+	instDir := internal.InstanceDir(name)
 
 	cfg, err := loadConfig(instDir)
 	if err != nil {
@@ -716,13 +456,13 @@ func sshToInstance(name string) error {
 }
 
 func stopInstance(name string) error {
-	lp := lockFilePath(name)
-	info, err := readLock(lp)
+	lp := internal.LockFilePath(name)
+	info, err := internal.ReadLock(lp)
 	if err != nil {
 		fmt.Printf("Instance %s not running\n", name)
 		return nil
 	}
-	if isPidAlive(info.Pid) {
+	if internal.IsPidAlive(info.Pid) {
 		return syscall.Kill(info.Pid, syscall.SIGTERM)
 	}
 	_ = os.Remove(lp)
@@ -731,13 +471,13 @@ func stopInstance(name string) error {
 }
 
 func pauseInstance(name string) error {
-	lp := lockFilePath(name)
-	info, err := readLock(lp)
+	lp := internal.LockFilePath(name)
+	info, err := internal.ReadLock(lp)
 	if err != nil {
 		fmt.Printf("Instance %s not running\n", name)
 		return nil
 	}
-	if isPidAlive(info.Pid) {
+	if internal.IsPidAlive(info.Pid) {
 		return syscall.Kill(info.Pid, syscall.SIGSTOP)
 	}
 	_ = os.Remove(lp)
@@ -746,13 +486,13 @@ func pauseInstance(name string) error {
 }
 
 func resumeInstance(name string) error {
-	lp := lockFilePath(name)
-	info, err := readLock(lp)
+	lp := internal.LockFilePath(name)
+	info, err := internal.ReadLock(lp)
 	if err != nil {
 		fmt.Printf("Instance %s not running\n", name)
 		return nil
 	}
-	if isPidAlive(info.Pid) {
+	if internal.IsPidAlive(info.Pid) {
 		return syscall.Kill(info.Pid, syscall.SIGCONT)
 	}
 	_ = os.Remove(lp)
@@ -761,7 +501,7 @@ func resumeInstance(name string) error {
 }
 
 func listInstances() error {
-	root := instanceRoot()
+	root := internal.InstanceRoot()
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -774,17 +514,17 @@ func listInstances() error {
 			continue
 		}
 		name := e.Name()
-		lp := lockFilePath(name)
-		info, err := readLock(lp)
+		lp := internal.LockFilePath(name)
+		info, err := internal.ReadLock(lp)
 		if err != nil {
 			fmt.Printf("%s\tstopped (no lock)\n", name)
 			continue
 		}
 		state := "stopped"
-		if isPidAlive(info.Pid) {
+		if internal.IsPidAlive(info.Pid) {
 			state = "running"
 		}
-		cfg, _ := loadConfig(instanceDir(name))
+		cfg, _ := loadConfig(internal.InstanceDir(name))
 		ip := ""
 		if cfg != nil {
 			if v, err := instanceIP(cfg); err == nil {

@@ -1,4 +1,4 @@
-package util
+package internal
 
 import (
 	"fmt"
@@ -98,7 +98,8 @@ func DownloadToTmp(url string) (string, error) {
 }
 
 // Print progress like:
-//   Downloading: 128.4 / 203.1 MiB (63%)
+//
+//	Downloading: 128.4 / 203.1 MiB (63%)
 func printProgress(done, total int64) {
 	if total <= 0 {
 		fmt.Printf("\rDownloading: %6.1f MiB", float64(done)/1024/1024)

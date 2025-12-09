@@ -1,4 +1,4 @@
-module mkimage
+module runtime-smart
 
 go 1.25
 

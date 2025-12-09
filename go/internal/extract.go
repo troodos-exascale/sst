@@ -1,12 +1,10 @@
-package image
+package internal
 
 import (
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
-
-	"mkimage/internal/util"
 )
 
 // FindAndExtractBootArtifacts scans partitions on the NBD device and
@@ -131,7 +129,7 @@ func copyArtifacts(srcKernel, srcInitrd, destDir string) (string, string, error)
 	}
 
 	// 2. copy initrd exactly as-is
-	if err := util.CopyFile(srcInitrd, fullInitrd); err != nil {
+	if err := CopyFile(srcInitrd, fullInitrd); err != nil {
 		return "", "", fmt.Errorf("failed to copy initrd: %w", err)
 	}
 

@@ -1,10 +1,8 @@
-package image
+package internal
 
 import (
 	"encoding/json"
 	"fmt"
-
-	"mkimage/internal/util"
 )
 
 // Structures to parse `lsblk -J -b -o NAME,TYPE,SIZE` output.
@@ -26,7 +24,7 @@ type lsblkDevice struct {
 //
 // Example call: FindRootPartition("/dev/nbd0") → "/dev/nbd0p3".
 func FindRootPartition(nbdDev string) (string, error) {
-	out, err := util.Run("lsblk", "-J", "-b", "-o", "NAME,TYPE,SIZE", nbdDev)
+	out, err := Run("lsblk", "-J", "-b", "-o", "NAME,TYPE,SIZE", nbdDev)
 	if err != nil {
 		return "", fmt.Errorf("lsblk failed for %s: %v\noutput:\n%s", nbdDev, err, out)
 	}

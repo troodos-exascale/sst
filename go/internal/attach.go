@@ -1,10 +1,8 @@
-package image
+package internal
 
 import (
 	"fmt"
 	"time"
-
-	"mkimage/internal/util"
 )
 
 // Attach connects a QCOW2 file to /dev/nbd0 using the minimal sequence
@@ -12,13 +10,13 @@ import (
 func Attach(path string) (string, error) {
 
 	// Ensure stale device is detached
-	util.Run("qemu-nbd", "-d", "/dev/nbd0")
+	Run("qemu-nbd", "-d", "/dev/nbd0")
 
 	// Load NBD module with partition support
-	util.Run("modprobe", "nbd", "max_part=16")
+	Run("modprobe", "nbd", "max_part=16")
 
 	// Connect qcow2 to nbd0
-	out, err := util.Run("qemu-nbd", "--connect=/dev/nbd0", path)
+	out, err := Run("qemu-nbd", "--connect=/dev/nbd0", path)
 	if err != nil {
 		return "", fmt.Errorf("qemu-nbd attach failed: %s", out)
 	}
@@ -27,12 +25,12 @@ func Attach(path string) (string, error) {
 	time.Sleep(1 * time.Second)
 
 	// Ask udev to settle (create nodes)
-	util.Run("udevadm", "settle")
+	Run("udevadm", "settle")
 
 	return "/dev/nbd0", nil
 }
 
 func Detach(dev string) error {
-	util.Run("qemu-nbd", "-d", dev)
+	Run("qemu-nbd", "-d", dev)
 	return nil
 }
