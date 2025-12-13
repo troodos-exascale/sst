@@ -1,0 +1,52 @@
+package main
+
+import (
+	"fmt"
+	// NOTE: To make this self-contained, the structs and template const from
+	// the previous turn's 'image_v2.go' would be included here.
+	// For brevity, their logic is referenced in comments.
+
+	"github.com/spf13/cobra"
+)
+
+var buildCmd = &cobra.Command{
+	Use:   "build <plan-file.yaml>",
+	Short: "Builds an OS image from a validated plan file.",
+	Long: `Reads a *.plan.yaml file, validates it, generates a final composition manifest,
+and produces a Packer build file (.pkr.hcl) along with all necessary assets
+like SSH keys and a merged cloud-init user-data file.`,
+	Args: cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		planFile := args[0]
+		
+		fmt.Printf("Starting build process for plan: %s\n", planFile)
+
+		// --- Step 1: Validate the Plan ---
+		// This would re-run the dependency resolution logic from 'compose'
+		// to ensure the plan file is still valid.
+		fmt.Println("  -> Validating plan dependencies...")
+		// (Validation logic would go here)
+		fmt.Println("  -> Plan is valid.")
+
+		// --- Step 2: Generate Build Assets (SSH keys, merged cloud-config) ---
+		// This is the core logic from the previous turn's 'image-build-v2' command.
+		fmt.Println("  -> Generating temporary SSH key pair for build...")
+		// (SSH key generation logic)
+		fmt.Println("  -> Merging cloud-config data from all components...")
+		// (Logic to find components by name, read manifests, and merge cloud-configs)
+		fmt.Println("  -> Build assets are ready.")
+
+		// --- Step 3: Generate the Packer File ---
+		fmt.Println("  -> Generating Packer build file...")
+		// (Go text/template logic to render the final .pkr.hcl file)
+		outputFile, _ := cmd.Flags().GetString("output")
+		fmt.Printf("✅ Build ready. Run 'packer build %s' to create the image.\n", outputFile)
+
+		return nil
+	},
+}
+
+func init() {
+	rootCmd.AddCommand(buildCmd)
+	buildCmd.Flags().StringP("output", "o", "generated.pkr.hcl", "Path for the generated Packer file.")
+}

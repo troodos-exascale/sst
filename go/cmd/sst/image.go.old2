@@ -1,0 +1,383 @@
+// File: cmd/sst/image.go
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/spf13/cobra"
+	"github.com/swiss-software-tool/sst/pkg/sst" 
+)
+
+// --- Flags --- (Define flags used by subcommands)
+var (
+	// build flags (defined globally for now, maybe move to buildCmd struct)
+	buildFormatFlags []string
+	buildArchFlag    string
+	buildDebugFlag   bool
+	buildAllFlag     bool
+
+	// list flags
+	imageListAllFlag     bool
+	imageListBuiltFlag   bool
+	imageListUnbuiltFlag bool
+	imageListScriptsFlag bool
+
+	// run flags
+	runInstanceID int
+	runMounts     []string
+)
+
+// --- Main 'image' command group ---
+var imageCmd = &cobra.Command{
+	Use:   "image",
+	Short: "Build and manage SST artifacts (packages, runtimes).",
+	// PersistentPreRunE to ensure builder is initialized for all subcommands
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		// Ensure core is initialized (might happen in rootCmd PersistentPreRunE)
+		if core == nil {
+			var err error
+			core, err = sst.New()
+			if err != nil { return err }
+		}
+		// Initialize the image builder which loads artifacts.yaml
+		// Pass the debug flag status down
+		debugFlagValue, _ := cmd.Flags().GetBool("debug") // Check the global debug flag
+		return sstintpkg.InitImageBuilder(core, debugFlagValue)
+	},
+}
+
+// --- 'image build' subcommand ---
+var imageBuildCmd = &cobra.Command{
+	Use:   "build [<artifact-id> [<format> [<arch>]]]",
+	Short: "Builds SST package or runtime artifacts.",
+	Long: `Builds artifacts defined in images/artifacts.yaml using a dependency graph.
+
+- If --all is used, builds the default format for all artifacts.
+- If <artifact-id> is given, builds that artifact.
+- If <format> is omitted, builds the default format ('container' for runtimes, 'deb' for packages).
+- If <arch> is omitted, builds for the host architecture.`,
+	Args: cobra.MaximumNArgs(3),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		log := core.Logx().Subsystem("image-build")
+		ctx := context.Background() // Or context from signal handling
+
+		// --- Argument Validation ---
+		if len(args) == 0 && !buildAllFlag {
+			return fmt.Errorf("either specify an <artifact-id> or use --all")
+		}
+		if len(args) > 0 && buildAllFlag {
+			return fmt.Errorf("cannot specify an artifact ID when using --all")
+		}
+
+		var targetsToBuild []sstintpkg.BuildTarget
+
+		if buildAllFlag {
+			log.Info(ctx, "Planning build for default format of ALL artifacts...")
+			allPossibleTargets := sstintpkg.GenerateAllPossibleTargets() // Use helper
+			plannedArtifacts := make(map[string]bool) // Track artifacts planned via default
+
+			for _, targetID := range allPossibleTargets {
+				artifactID, format, arch, err := sstintpkg.GetTargetFromID(targetID)
+				if err != nil { continue } // Should not happen with generated IDs
+
+				// Only plan the default format for each artifact/arch combo
+				artifactDef := sstintpkg.artifactsData.Artifacts[artifactID]
+				defaultFormat := sstintpkg.getDefaultFormat(artifactDef.Kind)
+				mapkey := fmt.Sprintf("%s-%s", artifactID, arch)
+
+				if format == defaultFormat && !plannedArtifacts[mapkey] {
+					targetsToBuild = append(targetsToBuild, sstintpkg.BuildTarget{
+						ArtifactID: artifactID,
+						Format:     format,
+						Arch:       arch,
+					})
+					plannedArtifacts[mapkey] = true
+				}
+			}
+			if len(targetsToBuild) == 0 {
+				log.Warn(ctx, "No artifacts found matching default criteria for --all.")
+				return nil
+			}
+
+		} else {
+			artifactID := args[0]
+			artifactDef, ok := sstintpkg.artifactsData.Artifacts[artifactID]
+			if !ok { return fmt.Errorf("artifact '%s' not found in artifacts.yaml", artifactID) }
+
+			targetFormat := sstintpkg.getDefaultFormat(artifactDef.Kind)
+			if len(buildFormatFlags) > 0 {
+				// Use user-provided formats if --format is used
+				// Validate formats against artifactDef.Formats first? Yes.
+				for _, f := range buildFormatFlags {
+					if !sstintpkg.isFormatSupported(artifactDef, f) {
+						// Also check if it's an implicit intermediate that *can* be built
+						if !(f == sstintpkg.ImplicitDockerFormat && sstintpkg.artifactCanProduce(artifactDef, "container")) {
+						 return fmt.Errorf("artifact '%s' does not support requested format '%s'", artifactID, f)
+						}
+						// If it's an implicit format, allow building it directly
+						fmt.Printf("[INFO] Building implicit intermediate format: %s\n", f)
+                    }
+					// Okay, format is valid, proceed
+				}
+				targetFormat = "" // Clear default, handled below
+			} else if len(args) > 1 {
+				targetFormat = args[1] // Use positional format if provided and no --format
+				if !sstintpkg.isFormatSupported(artifactDef, targetFormat) {
+					 if !(targetFormat == sstintpkg.ImplicitDockerFormat && sstintpkg.artifactCanProduce(artifactDef, "container")) {
+					 	return fmt.Errorf("artifact '%s' does not support specified format '%s'", artifactID, targetFormat)
+					 }
+					 fmt.Printf("[INFO] Building implicit intermediate format: %s\n", targetFormat)
+                }
+			}
+
+
+			targetArch := buildArchFlag // Check flag first
+			if targetArch == "" && len(args) > 2 {
+				targetArch = args[2] // Use positional arch if provided and no --arch
+			}
+			if targetArch == "" {
+				var err error
+				targetArch, err = sstintpkg.getHostArch(); if err != nil { return err } // Default to host
+			}
+
+			if !sstintpkg.isArchSupported(artifactDef, targetArch) {
+				return fmt.Errorf("artifact '%s' does not support architecture '%s'", artifactID, targetArch)
+			}
+
+
+			// Handle multiple formats from --format flag
+			if len(buildFormatFlags) > 0 {
+				for _, f := range buildFormatFlags {
+					targetsToBuild = append(targetsToBuild, sstintpkg.BuildTarget{
+						ArtifactID: artifactID,
+						Format:     f,
+						Arch:       targetArch,
+					})
+				}
+			} else {
+				// Single target from positional args or defaults
+				targetsToBuild = append(targetsToBuild, sstintpkg.BuildTarget{
+					ArtifactID: artifactID,
+					Format:     targetFormat,
+					Arch:       targetArch,
+				})
+			}
+		}
+
+		// --- Plan and Execute ---
+		rootNode, err := sstintpkg.PlanBuild(ctx, targetsToBuild)
+		if err != nil {
+			return err // Error already logged during planning
+		}
+
+		err = sstintpkg.ExecutePlan(ctx, rootNode)
+		if err != nil {
+			log.Error(ctx, "Build execution failed")
+			return err
+		}
+
+		log.Info(ctx, "Build execution completed successfully.")
+		log.Info(ctx, "Final artifacts requested:")
+		for _, t := range targetsToBuild { log.Info(ctx,"- "+t.ID())}
+		return nil
+	},
+}
+
+// --- 'image list' subcommand ---
+var imageListCmd = &cobra.Command{
+	Use:   "list [--all] [--built] [--unbuilt] [--scripts]",
+	Short: "List build artifacts based on status or components.",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx := context.Background() // Use background context for listing
+		log := core.Logx().Subsystem("image-list")
+
+		listModeCount := 0
+		if imageListAllFlag { listModeCount++ }
+		if imageListBuiltFlag { listModeCount++ }
+		if imageListUnbuiltFlag { listModeCount++ }
+		if imageListScriptsFlag { listModeCount++ }
+
+		if listModeCount == 0 {
+			log.Info(ctx,"No list mode specified, defaulting to --all.")
+			imageListAllFlag = true
+		} else if listModeCount > 1 {
+			return fmt.Errorf("please use only one of --all, --built, --unbuilt, or --scripts")
+		}
+
+		// InitImageBuilder should have been called by PersistentPreRunE
+
+		if imageListAllFlag { return listAllTargets(ctx) }
+		if imageListBuiltFlag { return listBuiltTargets(ctx) }
+		if imageListUnbuiltFlag { return listUnbuiltTargets(ctx) }
+		if imageListScriptsFlag { return listScripts(ctx) }
+
+		return nil // Should not be reached
+	},
+}
+
+// --- List Command Implementations (using sstintpkg global state) ---
+
+func listAllTargets(ctx context.Context) error {
+	fmt.Println("--- All Potential Build Targets ---")
+	targets := sstintpkg.GenerateAllPossibleTargets()
+	for _, t := range targets {
+		fmt.Println(t)
+	}
+	fmt.Printf("Total: %d\n", len(targets))
+	return nil
+}
+
+func listBuiltTargets(ctx context.Context) error {
+	fmt.Println("--- Built / Up-to-Date Targets ---")
+	targets := sstintpkg.GenerateAllPossibleTargets()
+	count := 0
+	imagesDir := filepath.Join(core.Files().Root(), "images") // Get images dir again
+	for _, targetID := range targets {
+		sentinelFile := filepath.Join(imagesDir, sstintpkg.SentinelDir, targetID)
+		if _, err := os.Stat(sentinelFile); err == nil {
+			fmt.Println(targetID)
+			count++
+		}
+	}
+	fmt.Printf("Total Built/Up-to-Date (based on sentinel): %d\n", count)
+	return nil
+}
+
+func listUnbuiltTargets(ctx context.Context) error {
+	fmt.Println("--- Unbuilt / Potentially Outdated Targets ---")
+	targets := sstintpkg.GenerateAllPossibleTargets()
+	count := 0
+	imagesDir := filepath.Join(core.Files().Root(), "images")
+	log := core.Logx().Subsystem("list-unbuilt")
+
+	for _, targetID := range targets {
+		sentinelFile := filepath.Join(imagesDir, sstintpkg.SentinelDir, targetID)
+		targetStat, err := os.Stat(sentinelFile)
+
+		needsBuild := false
+		reason := ""
+
+		if os.IsNotExist(err) {
+			needsBuild = true
+			reason = "(Missing Sentinel)"
+		} else if err != nil {
+			needsBuild = true
+			reason = "(Error Stating Sentinel)"
+			log.Warn(ctx, "Error stating sentinel", "file", sentinelFile, "error", err)
+		} else {
+			// Sentinel exists, perform isUpToDate check
+			// Need artifactDef, rule, and deps for accurate check. This is complex here.
+			// Let's just rely on the sentinel for list-unbuilt for now.
+			// A more accurate check would require running part of the planner.
+			// Revisit this if needed. For now, list-unbuilt == not in list-built.
+			continue // If sentinel exists and no error, assume built for this list
+		}
+
+		if needsBuild {
+			fmt.Println(targetID, reason)
+			count++
+		}
+	}
+	// Calculate unbuilt simply by subtracting built count? Simpler.
+	totalCount := len(targets)
+	builtCount := 0
+	for _, targetID := range targets {
+		sentinelFile := filepath.Join(imagesDir, sstintpkg.SentinelDir, targetID)
+		if _, err := os.Stat(sentinelFile); err == nil {
+			builtCount++
+		}
+	}
+	unbuiltCount := totalCount - builtCount
+	fmt.Println("--- Unbuilt / Missing Targets (based on sentinel) ---")
+	printedCount := 0
+	for _, targetID := range targets {
+		sentinelFile := filepath.Join(imagesDir, sstintpkg.SentinelDir, targetID)
+		if _, err := os.Stat(sentinelFile); os.IsNotExist(err) {
+			 fmt.Println(targetID)
+			 printedCount++
+		} else if err != nil {
+             fmt.Println(targetID, "(Error checking)")
+             printedCount++
+        }
+	}
+
+
+	fmt.Printf("Total Unbuilt/Missing: %d\n", printedCount)
+	return nil
+}
+
+
+func listScripts(ctx context.Context) error {
+	fmt.Println("--- Scripts Used in Build Rules & Meta Dependencies ---")
+	scripts := make(map[string]bool)
+	imagesDir := filepath.Join(core.Files().Root(), "images")
+
+	for _, rule := range sstintpkg.artifactsData.BuildRules {
+		if rule.Script != "" {
+			// Store path relative to imagesDir
+			scripts[rule.Script] = true
+		}
+		for _, seqScript := range rule.BuildSequence {
+             if seqScript != "" { scripts[seqScript] = true }
+        }
+	}
+	for _, meta := range sstintpkg.artifactsData.MetaDeps {
+		if meta.CheckScript != "" {
+			scripts[meta.CheckScript] = true
+		}
+	}
+
+	var sortedScripts []string
+	for script := range scripts {
+		sortedScripts = append(sortedScripts, script)
+	}
+	sort.Strings(sortedScripts)
+
+	foundCount := 0
+	notFoundCount := 0
+	for _, scriptRelPath := range sortedScripts {
+		scriptAbsPath := filepath.Join(imagesDir, scriptRelPath)
+		status := "✅ Found"
+		if _, err := os.Stat(scriptAbsPath); os.IsNotExist(err) {
+			status = "❌ Not Found"
+			notFoundCount++
+		} else {
+			foundCount++
+		}
+		// Print path relative to images/ for clarity
+		fmt.Printf("  %s [%s]\n", scriptRelPath, status)
+	}
+	fmt.Printf("Total Unique Scripts: %d (Found: %d, Not Found: %d)\n", len(sortedScripts), foundCount, notFoundCount)
+	if notFoundCount > 0 {
+		return fmt.Errorf("%d scripts listed in artifacts.yaml were not found on disk", notFoundCount)
+	}
+	return nil
+}
+
+
+// --- Add Commands to Root ---
+func init() {
+	// Build Command Flags
+	imageBuildCmd.Flags().StringSliceVarP(&buildFormatFlags, "format", "f", []string{}, "Output format(s) (e.g., container, qcow2)")
+	imageBuildCmd.Flags().StringVarP(&buildArchFlag, "arch", "a", "", "Target architecture (amd64, arm64, default: host)")
+	imageBuildCmd.Flags().BoolVarP(&buildDebugFlag, "debug", "d", false, "Enable debug tracing in build scripts")
+	imageBuildCmd.Flags().BoolVar(&buildAllFlag, "all", false, "Build default format for all defined artifacts")
+
+	// List Command Flags
+	imageListCmd.Flags().BoolVar(&imageListAllFlag, "all", false, "List all possible build targets.")
+	imageListCmd.Flags().BoolVar(&imageListBuiltFlag, "built", false, "List targets that appear up-to-date (sentinel exists).")
+	imageListCmd.Flags().BoolVar(&imageListUnbuiltFlag, "unbuilt", false, "List targets that need building (no sentinel or check failed).")
+	imageListCmd.Flags().BoolVar(&imageListScriptsFlag, "scripts", false, "List all unique scripts used by build rules and meta deps.")
+
+	// Add subcommands to the image command group
+	imageCmd.AddCommand(imageBuildCmd)
+	imageCmd.AddCommand(imageListCmd)
+
+	// Add the image command group to the main root command (assumed to be defined in root.go)
+	rootCmd.AddCommand(imageCmd)
+}

@@ -1,0 +1,239 @@
+// File: cmd/sst/image.go
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/spf13/cobra"
+	"github.com/swiss-software-tool/sst/pkg/sstintpkg" // For InitImageBuilder, PlanBuild
+	"github.com/swiss-software-tool/sst/pkg/sst"
+)
+
+// --- Flags ---
+var (
+	imageListAllFlag     bool
+	imageListBuiltFlag   bool
+	imageListUnbuiltFlag bool
+	imageListScriptsFlag bool
+)
+
+func init() {
+	// --- Main 'image' command ---
+	imageCmd := &cobra.Command{Use: "image", Short: "Manage SST build artifacts (packages, runtimes)"}
+
+	// --- 'image build' subcommand ---
+	// Flags defined globally in sstintpkg for now, attach here
+	imageBuildCmd.Flags().StringSliceVarP(&buildFormatFlags, "format", "f", []string{}, "Output format(s) (e.g., container, qcow2)")
+	imageBuildCmd.Flags().StringVarP(&buildArchFlag, "arch", "a", "", "Target architecture (amd64, arm64, default: host)")
+	imageBuildCmd.Flags().BoolVarP(&buildDebugFlag, "debug", "d", false, "Enable debug tracing in build scripts")
+	imageBuildCmd.Flags().BoolVar(&buildAllFlag, "all", false, "Build default format for all defined artifacts")
+	imageCmd.AddCommand(imageBuildCmd)
+
+	// --- 'image list' subcommand ---
+	imageListCmd := &cobra.Command{
+		Use:   "list",
+		Short: "List build artifacts based on status or components.",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			// Need exclusive flags or default behavior
+			listModeCount := 0
+			if imageListAllFlag { listModeCount++ }
+			if imageListBuiltFlag { listModeCount++ }
+			if imageListUnbuiltFlag { listModeCount++ }
+			if imageListScriptsFlag { listModeCount++ }
+
+			if listModeCount == 0 {
+				fmt.Println("Defaulting to --all...")
+				imageListAllFlag = true
+			} else if listModeCount > 1 {
+				return fmt.Errorf("use only one of --all, --built, --unbuilt, or --scripts")
+			}
+
+			// Load manifest (common for all list modes)
+			// Assume core and imagesDir are available (via PersistentPreRun?)
+			err := sstintpkg.InitImageBuilder(core, false) // Init builder to load manifest
+			if err != nil { return err }
+
+			if imageListAllFlag { return listAllTargets() }
+			if imageListBuiltFlag { return listBuiltTargets() }
+			if imageListUnbuiltFlag { return listUnbuiltTargets() }
+			if imageListScriptsFlag { return listScripts() }
+
+			return nil // Should not be reached
+		},
+	}
+	imageListCmd.Flags().BoolVar(&imageListAllFlag, "all", false, "List all possible build targets.")
+	imageListCmd.Flags().BoolVar(&imageListBuiltFlag, "built", false, "List targets that appear up-to-date (sentinel exists).")
+	imageListCmd.Flags().BoolVar(&imageListUnbuiltFlag, "unbuilt", false, "List targets that need building (no sentinel or outdated).")
+	imageListCmd.Flags().BoolVar(&imageListScriptsFlag, "scripts", false, "List all unique scripts used by build rules.")
+	imageCmd.AddCommand(imageListCmd)
+
+
+	// Add the 'image' command group to the root command
+	rootCmd.AddCommand(imageCmd)
+}
+
+
+// --- List Command Implementations ---
+
+func listAllTargets() error {
+	fmt.Println("--- All Potential Build Targets ---")
+	targets := generateAllPossibleTargets()
+	for _, t := range targets {
+		fmt.Println(t)
+	}
+	fmt.Printf("Total: %d\n", len(targets))
+	return nil
+}
+
+func listBuiltTargets() error {
+	fmt.Println("--- Built / Up-to-Date Targets ---")
+	targets := generateAllPossibleTargets()
+	count := 0
+	imagesDir := filepath.Join(core.Files().Root(), "images") // Get images dir again
+	for _, targetID := range targets {
+		sentinelFile := filepath.Join(imagesDir, ".ts", targetID)
+		if _, err := os.Stat(sentinelFile); err == nil {
+			fmt.Println(targetID)
+			count++
+		}
+	}
+	fmt.Printf("Total Built: %d\n", count)
+	return nil
+}
+
+func listUnbuiltTargets() error {
+	fmt.Println("--- Unbuilt / Outdated Targets ---")
+	targets := generateAllPossibleTargets()
+	count := 0
+	imagesDir := filepath.Join(core.Files().Root(), "images") // Get images dir again
+
+	// Need a dummy context for isUpToDate
+	ctx := context.Background()
+	// Need to initialize buildPlan map for isUpToDate's dependency check
+	sstintpkg.buildPlan = make(map[string]*sstintpkg.Context)
+
+	for _, targetID := range targets {
+		sentinelFile := filepath.Join(imagesDir, ".ts", targetID)
+		if _, err := os.Stat(sentinelFile); os.IsNotExist(err) {
+			fmt.Println(targetID, "(Missing)")
+			count++
+		} else if err == nil {
+            // Sentinel exists, need full check - requires parsing targetID back
+            parts := strings.SplitN(targetID, ".", 3) // Assumes dot separator
+            if len(parts) == 3 {
+                artifactID, format, arch := parts[0], parts[1], parts[2]
+                artifactDef := sstintpkg.artifactsData.Artifacts[artifactID] // Access global data
+                ruleName := sstintpkg.getRuleForFormat(format, artifactDef)
+                rule := sstintpkg.artifactsData.BuildRules[ruleName]
+
+                // Simplified check - doesn't build full dependency graph here
+                // just calls the check function directly. This won't be fully accurate
+                // without the dependency node info, but gives an approximation.
+                if !sstintpkg.isUpToDate(ctx, targetID, artifactDef, rule, nil) { // Pass nil dependencies
+                    fmt.Println(targetID, "(Outdated)")
+                    count++
+                }
+            } else {
+                 fmt.Println(targetID, "(Malformed ID?)") // Should not happen
+                 count++
+            }
+		} else {
+            // Error stating sentinel
+             fmt.Println(targetID, "(Error checking)")
+             count++
+        }
+	}
+	fmt.Printf("Total Unbuilt/Outdated: %d\n", count)
+	return nil
+}
+
+
+func listScripts() error {
+	fmt.Println("--- Scripts Used in Build Rules ---")
+	scripts := make(map[string]bool)
+	for _, rule := range sstintpkg.artifactsData.BuildRules { // Access global data
+		if rule.Script != "" {
+			scripts[rule.Script] = true
+		}
+		// Also include scripts from build_sequence if used? Assumed covered by rule.Script for now.
+	}
+	for _, meta := range sstintpkg.artifactsData.MetaDeps { // Access global data
+		if meta.CheckScript != "" {
+			scripts[meta.CheckScript] = true
+		}
+	}
+
+	var sortedScripts []string
+	for script := range scripts {
+		sortedScripts = append(sortedScripts, script)
+	}
+	sort.Strings(sortedScripts)
+	for _, script := range sortedScripts {
+		// Print relative to images/ directory for clarity
+		fmt.Println(script)
+	}
+	fmt.Printf("Total Unique Scripts: %d\n", len(sortedScripts))
+	return nil
+}
+
+// Helper to generate all possible target IDs from the manifest
+func generateAllPossibleTargets() []string {
+	var targets []string
+	// Need host arch for default/fallback cases
+	hostArch, _ := sstintpkg.getHostArch() // Ignore error for listing
+
+	for id, artifact := range sstintpkg.artifactsData.Artifacts { // Access global data
+		arches := artifact.Arch
+		if len(arches) == 0 { // If no arch specified, assume host arch
+			arches = []string{hostArch}
+		}
+		for _, arch := range arches {
+			formats := artifact.Formats
+			// If formats list is empty (e.g., for packages using build_steps), derive from steps
+			if len(formats) == 0 && len(artifact.BuildSteps) > 0 {
+				lastStep := artifact.BuildSteps[len(artifact.BuildSteps)-1]
+				for _, out := range lastStep.Outputs {
+					if out.Format != "" { formats = append(formats, out.Format)}
+				}
+			} else if len(formats) == 0 {
+                 // Fallback if still no formats (e.g. utility with only source_image)
+                 formats = []string{sstintpkg.getDefaultFormat(artifact.Kind)}
+            }
+
+			// Generate targets for all explicitly listed formats
+			for _, format := range formats {
+				targets = append(targets, sstintpkg.GetNodeID(id, format, arch))
+			}
+			// Add implicit intermediate targets needed for listed formats
+			neededIntermediates := make(map[string]bool)
+			for _, finalFormat := range formats {
+				f := finalFormat
+				for {
+					f = sstintpkg.getRequiredBaseFormat(f)
+					if f == "" { break }
+					neededIntermediates[f] = true
+				}
+			}
+			for f := range neededIntermediates {
+                 // Only add if not already in explicit formats list
+                 alreadyListed := false
+                 for _, explicitFmt := range formats { if explicitFmt == f { alreadyListed = true; break }}
+                 if !alreadyListed {
+				    targets = append(targets, sstintpkg.GetNodeID(id, f, arch))
+                 }
+			}
+		}
+	}
+	// Deduplicate and sort
+	uniqueTargetsMap := make(map[string]bool)
+	for _, t := range targets { uniqueTargetsMap[t] = true }
+	var uniqueTargets []string
+	for t := range uniqueTargetsMap { uniqueTargets = append(uniqueTargets, t)}
+	sort.Strings(uniqueTargets)
+	return uniqueTargets
+}

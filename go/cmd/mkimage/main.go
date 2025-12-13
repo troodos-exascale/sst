@@ -1,30 +1,28 @@
 package main
 
 import (
-    "fmt"
-    "os"
-	"path/filepath"
-    "github.com/spf13/cobra"
-    "io"
-    "net/url"
-    "path"
-    "strconv"
-    "strings"
-    "time"
-    "runtime-smart/internal"
+	"fmt"
+	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
+	"net/url"
+	"os"
 	"os/exec"
 	"os/user"
-	"gopkg.in/yaml.v3"
-	)
+	"path"
+	"path/filepath"
+	rtsst "github.com/swiss-software-tool/runtime-smart/go/internal/rtsst"
+	"strings"
+	"time"
+)
 
 var (
 	flagRoot    string
 	flagForce   bool
 	flagVerbose bool
 	rootCmd     = &cobra.Command{
-		Use:   "mkimage",
-		Short: "Create SST VM image directories from upstream sources",
-		Long:  "mkimage pulls, pushes, builds runtime images and instances",
+		Use:           "mkimage",
+		Short:         "Create SST VM image directories from upstream sources",
+		Long:          "mkimage pulls, pushes, builds runtime images and instances",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
@@ -39,7 +37,7 @@ func init() {
 		"Runtime root directory (e.g. /Users/you/.runtimes)")
 	rootCmd.PersistentFlags().BoolVarP(&flagVerbose, "verbose", "v", false,
 		"Verbose logging")
-	rootCmd.Flags().BoolVarP(&flagForce, "force", "f", false,
+	rootCmd.PersistentFlags().BoolVarP(&flagForce, "force", "f", false,
 		"Overwrite existing image directory if it exists")
 }
 
@@ -59,100 +57,103 @@ var instanceCmd = &cobra.Command{
 		imageFile := args[0]
 		name := args[1]
 
-	instDir := internal.InstanceDir(name)
-	if st, err := os.Stat(instDir); err == nil && st.IsDir() {
-		if !flagForce {
-			return fmt.Errorf("instance %s exists (use --force)", name)
+		instDir := rtsst.InstanceDir(name)
+		if st, err := os.Stat(instDir); err == nil && st.IsDir() {
+			if !flagForce {
+				return fmt.Errorf("instance %s exists (use --force)", name)
+			}
+			_ = os.RemoveAll(instDir)
 		}
-		_ = os.RemoveAll(instDir)
-	}
-	if err := os.MkdirAll(instDir, 0755); err != nil {
-		return err
-	}
-
-	// 1) Create disk.raw from source image
-	dstDisk := filepath.Join(instDir, "disk.raw")
-
-	if internal.IsQCOW2(imageFile) {
-		internal.LogDebug(flagVerbose, "detected qcow2; running qemu-img convert")
-		cmd := exec.Command("qemu-img", "convert", "-O", "raw", imageFile, dstDisk)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("qemu-img convert failed: %w", err)
+		if err := os.MkdirAll(instDir, 0755); err != nil {
+			return err
 		}
-	} else {
-		internal.LogDebug(flagVerbose, "assuming raw image; performing sparse copy")
-		if err := internal.CopySparse(imageFile, dstDisk); err != nil {
-			return fmt.Errorf("sparse copy failed: %w", err)
+
+		// 1) Create disk.raw from source image
+		dstDisk := filepath.Join(instDir, "disk.raw")
+
+		if rtsst.IsQCOW2(imageFile) {
+			rtsst.LogDebug(flagVerbose, "detected qcow2; running qemu-img convert")
+			cmd := exec.Command("qemu-img", "convert", "-O", "raw", imageFile, dstDisk)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				return fmt.Errorf("qemu-img convert failed: %w", err)
+			}
+		} else {
+			rtsst.LogDebug(flagVerbose, "assuming raw image; performing sparse copy")
+			if err := rtsst.CopySparse(imageFile, dstDisk); err != nil {
+				return fmt.Errorf("sparse copy failed: %w", err)
+			}
 		}
-	}
 
-	// 2) Create empty EFI vars
-	efiVars := filepath.Join(instDir, "efi-vars")
-	if err := os.WriteFile(efiVars, []byte{}, 0644); err != nil {
-		return fmt.Errorf("writing efi-vars: %w", err)
-	}
-
-	// 3) Create 30GB sparse data disk (default)
-	dataImg := filepath.Join(instDir, "data.img")
-	if _, err := os.Stat(dataImg); os.IsNotExist(err) {
-		if err := internal.CreateSparse(dataImg, 30*1024*1024*1024); err != nil {
-			return fmt.Errorf("creating data.img: %w", err)
+		// 2
+		err := rtsst.WriteCIData(instDir, name)
+		if err != nil {
+			return fmt.Errorf("Failed to write cidata: %w", err)
 		}
-	} else if err != nil {
-		return fmt.Errorf("stat data.img: %w", err)
-	}
+		if err := rtsst.UpdateCIDATAISO(instDir); err != nil {
+			return fmt.Errorf("Failed to update cidata.iso")
+		}
+		
+		// 3) Create 30GB sparse data disk (default)
+		dataImg := filepath.Join(instDir, "data.img")
+		if _, err := os.Stat(dataImg); os.IsNotExist(err) {
+			if err := rtsst.CreateSparse(dataImg, 30*1024*1024*1024); err != nil {
+				return fmt.Errorf("creating data.img: %w", err)
+			}
+		} else if err != nil {
+			return fmt.Errorf("stat data.img: %w", err)
+		}
 
-	// 4) Add share /Users/$USER -> /Users/$USER
-	u, _ := user.Current()
-	hostShare := filepath.Join("/Users", u.Username)
-	guestShare := filepath.Join("/Users", u.Username)
+		// 4) Add share /Users/$USER -> /Users/$USER
+		u, _ := user.Current()
+		hostShare := filepath.Join("/Users", u.Username)
+		guestShare := filepath.Join("/Users", u.Username)
 
-	// 5) Verbose kernel params (still stored even if EFI mode)
-	params := "console=hvc0 root_device=dev/hda1 systemd.log_target=console"
+		// 5) Verbose kernel params (still stored even if EFI mode)
+		params := "console=hvc0 systemd.log_target=console"
 
-	// 6) Defaults for CPU and memory
-	defaultCPU := 4
-	defaultMem := "4G"
+		// 6) Defaults for CPU and memory
+		defaultCPU := 4
+		defaultMem := "8G"
 
-	cfg := internal.RuntimeConfig{
-		Name:       name,
-		Boot:       "efi",
-		SystemDisk: dstDisk,
-		EFIVars:    efiVars,
-		Params:     params,
-		CPUCount:   defaultCPU,
-		MemorySize: defaultMem,
-		DataDisks: []internal.DataDisk{{ Path: filepath.Base(dataImg), Mode: "rw" }},
-		Shares: []internal.Share{
-			{Host: hostShare, Guest: guestShare},
-		},
-	}
-	mac, err := internal.GenerateMAC()
-	if err != nil {
-		return err
-	}
-	cfg.Network.MAC = mac
-	cfg.Network.Mode = "nat"
+		cfg := rtsst.RuntimeConfig{
+			Name:       name,
+			Boot:       "efi",
+			SystemDisk: dstDisk,
+			CIDataDisk: "cidata.iso",
+			EFIVars:    "efi-vars.fd",
+			Params:     params,
+			CPUCount:   defaultCPU,
+			MemorySize: defaultMem,
+			DataDisks:  []rtsst.DataDisk{{Path: filepath.Base(dataImg), Mode: "rw"}},
+			Shares: []rtsst.Share{
+				{Host: hostShare, Guest: guestShare},
+			},
+		}
+		mac, err := rtsst.GenerateMAC()
+		if err != nil {
+			return err
+		}
+		cfg.Network.MAC = mac
+		cfg.Network.Mode = "nat"
 
-	data, err := yaml.Marshal(&cfg)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(instDir, "runtime.yaml"), data, 0o644)
-},
+		data, err := yaml.Marshal(&cfg)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(instDir, "rtsst.yaml"), data, 0o644)
+	},
 }
 
 // Logging helpers
 
 func requireRoot() error {
-    if os.Geteuid() != 0 {
-        return fmt.Errorf("mkimage must be run as root")
-    }
-    return nil
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("mkimage must be run as root")
+	}
+	return nil
 }
-
 
 func step(msg string) {
 	if flagVerbose {
@@ -169,7 +170,7 @@ func done(msg string) {
 func deriveUpstreamFilename(upstream string) string {
 	var base string
 
-	if internal.IsURL(upstream) {
+	if rtsst.IsURL(upstream) {
 		u, err := url.Parse(upstream)
 		if err == nil {
 			base = path.Base(u.Path)
@@ -189,9 +190,7 @@ func deriveUpstreamFilename(upstream string) string {
 	if ext == "" {
 		ext = ".img"
 	}
-
-	ts := time.Now().Format("20060102-150405")
-	return fmt.Sprintf("%s-%s%s", name, ts, ext)
+	return fmt.Sprintf("%s%s", name, ext)
 }
 
 // Cobra convert command
@@ -207,19 +206,17 @@ var pullvmCmd = &cobra.Command{
 		variant := args[2]
 		upstream := args[3]
 
-
 		// Resolve runtimes root → DIR/images/<name>
 
 		absRoot, _ := filepath.Abs(flagRoot)           // DIR
 		imagesRoot := filepath.Join(absRoot, "images") // DIR/images
-		distroDir := filepath.Join(imagesRoot, distro + "-" + version)
+		distroDir := filepath.Join(imagesRoot, distro+"-"+version)
 		variantDir := filepath.Join(distroDir, variant)
-		upstreamDir := filepath.Join(distroDir,"upstream")
 
 		// determine filesystem owner
-		targetUid, targetGid, _ := internal.GetFileOwnership(absRoot)
+		targetUid, targetGid, _ := rtsst.GetFileOwnership(absRoot)
 
-		requireRoot()
+		// XXX not needed anymore  requireRoot()
 		if flagVerbose {
 			fmt.Println("-> mkimage pullvm")
 			fmt.Println("  upstream:", upstream)
@@ -228,35 +225,29 @@ var pullvmCmd = &cobra.Command{
 		}
 
 		// Enforce directory existence rules
-		_, err := os.Stat(variantDir);
-		if err != nil  {
-			return fmt.Errorf("destination %s exists; use --force to overwrite", variantDir)
-		}
-		if flagForce {
+		_, err := os.Stat(variantDir)
+		if err == nil {
+			// directory exists
+			if !flagForce {
+				return fmt.Errorf("destination %s exists; use --force to overwrite", variantDir)
+			}
 			_ = os.RemoveAll(variantDir)
 		}
 
 		// create images root and destination
-		if _, err := os.Stat(upstreamDir); os.IsNotExist(err) {
-			if err := os.MkdirAll(upstreamDir, 0o755); err != nil {
-				return err
-			}
-		}
 		if _, err := os.Stat(variantDir); os.IsNotExist(err) {
 			if err := os.MkdirAll(variantDir, 0o755); err != nil {
 				return err
 			}
 		}
 
-
 		// Fix ownership early
 		_ = os.Chown(distroDir, targetUid, targetGid)
-		_ = os.Chown(upstreamDir, targetUid, targetGid)
 		_ = os.Chown(variantDir, targetUid, targetGid)
 
 		// Acquire LOCK for this image
 		lockPath := filepath.Join(distroDir, ".mkimage.lock")
-		lk, err := internal.CreateLock(lockPath)
+		lk, err := rtsst.CreateLock(lockPath)
 		if err != nil {
 			return err
 		}
@@ -264,137 +255,48 @@ var pullvmCmd = &cobra.Command{
 
 		// Download or copy upstream source
 
-		var localPath string
 		step("Processing upstream source…")
-
 		name := deriveUpstreamFilename(upstream)
-		target := filepath.Join(upstreamDir, name)
+		target := filepath.Join(variantDir, name)
 
-		if internal.IsURL(upstream) {
+		if rtsst.IsURL(upstream) {
 			step("Downloading upstream image…")
-			if err := internal.DownloadToFile(upstream, target); err != nil {
+			if err := rtsst.DownloadToFile(upstream, target); err != nil {
 				return fmt.Errorf("download failed: %w", err)
 			}
-			localPath = target
 			done("Download complete")
 		} else {
 			step("Copying upstream image into upstream dir")
-			if err := internal.CopyFile(upstream, target); err != nil {
+			if err := rtsst.CopyFile(upstream, target); err != nil {
 				return fmt.Errorf("copy upstream image: %w", err)
 			}
-			localPath = target
 			done("Local upstream image copied")
 		}
-
-
-		// Attach via qemu-nbd
-
-		fmt.Printf("connecting /dev/nbd0 to %s\n", localPath)
-		nbd, err := internal.Attach(localPath)
-		if err != nil {
-			return err
-		}
-		attached := true
-
-		cleanup := func() {
-			if attached && nbd != "" {
-				fmt.Printf("disconnecting %s\n", nbd)
-				_ = internal.Detach(nbd)
-			}
-		}
-		defer cleanup()
-
-		// Find and Extract Kernel/Initrd from partitions
-
-		step("Scanning for boot artifacts...")
-		_, _, err = internal.FindAndExtractBootArtifacts(nbd, variantDir)
-		if err != nil {
-			return fmt.Errorf("extraction failed: %w", err)
-		}
-		done("Artifacts extracted")
-
-
-		// Select root filesystem partition
-
-		step("Selecting root filesystem partition…")
-		rootPart, err := internal.FindRootPartition(nbd)
-		if err != nil {
-			return fmt.Errorf("root partition detection failed: %w", err)
-		}
-		done("Root partition: " + rootPart)
-
-		// ---------------------------------------------------------------------
-		// Determine size of root partition
-		// ---------------------------------------------------------------------
-		sizeOut, err := internal.Run("blockdev", "--getsize64", rootPart)
-		if err != nil {
-			return fmt.Errorf("failed to get size of %s: %v\noutput:\n%s",
-				rootPart, err, sizeOut)
-		}
-		sizeOut = strings.TrimSpace(sizeOut)
-		sizeBytes, err := strconv.ParseInt(sizeOut, 10, 64)
-		if err != nil {
-			return fmt.Errorf("invalid size returned for %s: %w", rootPart, err)
-		}
-
-
-		// Extract root filesystem (byte-for-byte copy)
-
-		rootfsRaw := filepath.Join(variantDir, "rootfs.raw")
-		fmt.Printf("extracting %d bytes from %s → %s…\n",
-			sizeBytes, rootPart, rootfsRaw)
-
-		err = internal.CopySparse(rootPart, rootfsRaw)
-		if err != nil && err != io.EOF {
-			return fmt.Errorf("copying root partition failed: %w", err)
-		}
-		done("Root filesystem written: " + rootfsRaw)
-		if err := os.Chmod(rootfsRaw, 0o444); err != nil {
-			fmt.Printf("warning: failed to mark %s read-only: %v\n", rootfsRaw, err)
-		}
-
-		// Detach AFTER rootfs extraction
-
-		fmt.Printf("disconnecting %s\n", nbd)
-		if err := internal.Detach(nbd); err != nil {
-			return fmt.Errorf("nbd detach failed: %w", err)
-		}
-		attached = false
-		done("Detached")
-
 
 		// Write + Validate image.yaml
 
 		step("Writing image.yaml…")
 
-		meta := internal.ImageYAML{}
+		meta := rtsst.ImageYAML{}
 		meta.Image.Name = name
 		meta.Image.Description = "Generated by mkimage pullvm"
-		meta.Sources = append(meta.Sources, internal.Source{
-			Name:        "cloud",
+		meta.Sources = append(meta.Sources, rtsst.Source{
+			Name:        variant,
 			Upstream:    upstream,
 			Format:      "disk-image",
 			RetrievedAt: time.Now().UTC().Format(time.RFC3339),
 		})
 
-		if err := internal.WriteYAML(variantDir, &meta); err != nil {
+		if err := rtsst.WriteYAML(variantDir, &meta); err != nil {
 			return err
 		}
 		done("image.yaml written")
 
 		step("Validating image.yaml…")
-		if err := internal.ValidateFile(filepath.Join(variantDir, "image.yaml")); err != nil {
+		if err := rtsst.ValidateFile(filepath.Join(variantDir, "image.yaml")); err != nil {
 			return fmt.Errorf("image.yaml invalid: %w", err)
 		}
 		done("image.yaml validated")
-
-
-		// Fix ownership (chown everything)
-
-		step(fmt.Sprintf("Changing ownership to %d:%d…", targetUid, targetGid))
-		if err := internal.ChownR(variantDir, targetUid, targetGid); err != nil {
-			fmt.Printf("warning: failed to chown output files: %v\n", err)
-		}
 
 		fmt.Println("-> Image created:", variantDir)
 		return nil

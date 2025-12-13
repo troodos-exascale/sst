@@ -1,19 +1,24 @@
-BINS := mkimage runctl
+BINS := mkimage runctl sst hetzner-plugin
+ARCH := $(shell go env GOARCH)
+
 
 .PHONY: all build install clean
 
 all: build
 
 build:
+	go generate ./...
 	go mod tidy
 	for b in $(BINS); do \
-		go build -o bin/$$b ./cmd/$$b ; \
+		go build -o build/${ARCH}/$$b ./cmd/$$b ; \
 	done
 
-install:
+install: build
 	for b in $(BINS); do \
-		sudo install -m 755 bin/$$b /usr/local/bin/$$b ; \
+		sudo install -m 755 build/${ARCH}/$$b /usr/local/bin/$$b ; \
 	done
 
 clean:
-	rm -rf bin
+	rm -rf build
+	find . -name '*.pb.go' -delete
+	find . -name '*_grpc.pb.go' -delete

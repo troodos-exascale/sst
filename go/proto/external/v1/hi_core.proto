@@ -1,0 +1,42 @@
+syntax = "proto3";
+package s2.hi.v1;
+option go_package = "github.com/swiss-software-tool/sst-templates/go/proto/v1;v1";
+
+// SstHiCoreService defines the standard gRPC service that all HI plugins MUST implement.
+// It provides the core functionality required for the sst tool to orchestrate provisioning.
+service SstHiCoreService {
+  // Executes the hardware discovery process on a remote machine.
+  // Returns a handle that can be used to retrieve the normalized data.
+  rpc Probe(ProbeRequest) returns (ProbeResponse);
+
+  // Takes the handle from a completed probe and returns the normalized
+  // HardwareProbe manifest content.
+  rpc NormalizeProbeData(NormalizeRequest) returns (NormalizeResponse);
+
+  // Future required RPCs can be added here, e.g.:
+  // rpc InstallHostOS(InstallRequest) returns (InstallResponse);
+  // rpc QueryModels(QueryModelsRequest) returns (QueryModelsResponse);
+}
+
+message ProbeRequest {
+  // The content of the order.yaml file. The plugin is responsible for parsing it.
+  bytes order_yaml_content = 1;
+  // The raw private SSH key bytes for connecting to the host.
+  bytes ssh_private_key = 2;
+}
+
+message ProbeResponse {
+  // A unique identifier for this probe operation, used to retrieve the data later.
+  // This will be the path to a temporary directory holding the raw output.
+  string probe_session_id = 1;
+}
+
+message NormalizeRequest {
+  // The session ID (temporary directory path) returned from a successful Probe call.
+  string probe_session_id = 1;
+}
+
+message NormalizeResponse {
+  // The final, normalized HardwareProbe YAML content, ready to be written to a file by sst.
+  bytes normalized_yaml_content = 1;
+}

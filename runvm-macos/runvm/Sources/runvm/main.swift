@@ -177,10 +177,34 @@ enum SizeSuffix: UInt64, ExpressibleByArgument {
          GB = 1000000000, GiB = 0x40000000
 }
 
+import Cocoa
+
+class VMWindowController {
+    var window: NSWindow?
+    let vmView = VZVirtualMachineView()
+
+    init(vm: VZVirtualMachine) {
+        vmView.virtualMachine = vm
+        let w = NSWindow(
+            contentRect: NSRect(x: 100, y: 100, width: 1024, height: 768),
+            styleMask: [.titled, .closable, .resizable, .miniaturizable],
+            backing: .buffered,
+            defer: false
+        )
+        w.title = "runvm – Console"
+        w.contentView = vmView
+        w.makeKeyAndOrderFront(nil)
+        self.window = w
+    }
+}
+
 struct RunVM: ParsableCommand {
 
     @Option(name: .customLong("name"), help: "Instance name (process name)")
     var name: String?
+
+    @Flag(help: "Show a GUI window with the VM display")
+    var gui: Bool = false
 
     @Option(name: .shortAndLong, help: "CPU count")
     var cpuCount: Int = 1
@@ -243,7 +267,7 @@ struct RunVM: ParsableCommand {
         // CPU / memory
         vmCfg.cpuCount = cpuCount
         vmCfg.memorySize = memorySize * memorySizeSuffix.rawValue
-        
+        let useGUI = self.gui   // capture flag so closure does NOT capture self
         // bootloader
         switch bootloader {
         case .linux:
@@ -429,7 +453,15 @@ struct RunVM: ParsableCommand {
         vm!.start { result in
             switch result {
             case .success:
-                break
+                if useGUI {
+                    // Start NSApplication if not already running
+                    if NSApp == nil {
+                        let _ = NSApplication.shared
+                        NSApp.setActivationPolicy(.regular)
+                    }
+                    _ = VMWindowController(vm: vm!)
+                    NSApp.activate(ignoringOtherApps: true)
+                }
             case .failure(let error):
                 FileHandle.standardError.write("Failed to start VM: \(error)\r\n".data(using: .utf8)!)
                 quit(1)

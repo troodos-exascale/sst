@@ -1,0 +1,718 @@
+// File: pkg/sstintpkg/imagebuilder.go
+package sst
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime" // Used for default arch detection
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/swiss-software-tool/sst/pkg/sst" // For core, logx, manifests
+	"gopkg.in/yaml.v3"
+)
+
+// Global state for build planning (consider encapsulating in a Builder struct later)
+var (
+	artifactsData sst.ArtifactsManifest // Parsed YAML data
+	repoRoot      string
+	imagesDir     string // Base dir for artifact paths (images/)
+	// scriptsDir implicitly derived from imagesDir + rule.Script
+	buildPlan  map[string]*Context // Map[nodeID]*tg.Context - The dependency graph (value is the WRAPPER node)
+	planMutex  sync.Mutex          // Protects buildPlan during concurrent planning (if needed later)
+	nodesBuilt map[string]bool     // Track completed nodes during execution
+	tgRunner   *Runner             // The tg executor
+	core       sst.Core
+	buildDebug bool // From CLI flag
+)
+
+// Constants for default formats and intermediates
+const (
+	DefaultPkgFormat      = "deb"
+	DefaultRuntimeFormat  = "container"
+	DefaultUtilityFormat  = "container"
+	ImplicitDockerFormat  = "dockerfile" // Intermediate format for containers
+	ImplicitQcow2Format   = "qcow2"      // Intermediate format for other VMs
+	ImplicitContainerFormat = "container"    // Most common dependency format
+	SentinelDir           = ".ts"        // Directory for timestamp/sentinel files relative to imagesDir
+)
+
+// BuildTarget holds the user's requested build parameters
+type BuildTarget struct {
+	ArtifactID string
+	Format     string
+	Arch       string
+}
+
+// ID returns the unique node ID for the build target.
+func (bt BuildTarget) ID() string { return GetNodeID(bt.ArtifactID, bt.Format, bt.Arch) }
+
+// --- Initialization ---
+
+// InitImageBuilder loads the manifest and prepares the builder state.
+// Should be called once by the command setup (e.g., PreRunE).
+func InitImageBuilder(c sst.Core, debug bool) error {
+	core = c
+	buildDebug = debug // Store debug flag
+	repoRoot = core.Files().Root()
+	imagesDir = filepath.Join(repoRoot, "images") // Base for paths in YAML
+
+	manifestPath := filepath.Join(imagesDir, "artifacts.yaml")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return fmt.Errorf("failed to read artifacts manifest %s: %w", manifestPath, err)
+	}
+	// Use yaml.Unmarshal Strict mode if desired later for stricter validation
+	err = yaml.Unmarshal(data, &artifactsData)
+	if err != nil {
+		return fmt.Errorf("failed to parse artifacts manifest %s: %w", manifestPath, err)
+	}
+
+	// Initialize state maps
+	buildPlan = make(map[string]*Context)
+	nodesBuilt = make(map[string]bool)
+	planMutex = sync.Mutex{} // Initialize mutex
+
+	// Initialize tgRunner
+	// Ensure log level respects buildDebug flag if needed
+	logLevel := "info"
+	if buildDebug {
+		logLevel = "debug"
+		// Set env var for logx if not already done by CLI flags
+		_ = os.Setenv("SST_LOG_LEVEL", "debug")
+		sst.ResetFromEnv()
+	}
+	tgRunner = &Runner{Log: core.Logx().Subsystem("image-build"), Debug: buildDebug}
+
+	// Create sentinel directory if it doesn't exist
+	sentinelPath := filepath.Join(imagesDir, SentinelDir)
+	if err := os.MkdirAll(sentinelPath, 0755); err != nil {
+		return fmt.Errorf("failed to create sentinel directory %s: %w", sentinelPath, err)
+	}
+
+	core.Logx().Debug(context.Background(), "Image builder initialized", "manifest_path", manifestPath)
+	return nil
+}
+
+// --- Public Planning Function ---
+
+// PlanBuild creates the root tg.Context node for building the specified targets.
+func PlanBuild(ctx context.Context, targets []BuildTarget) (*Context, error) {
+	log := core.Logx().Subsystem("build-planner")
+	var finalTargetNodes []*Context
+	var finalTargetIDs []string
+
+	if len(targets) == 0 {
+		return nil, fmt.Errorf("no build targets specified")
+	}
+
+	log.Info(ctx, "Starting build planning", "targets", targets)
+
+	// Reset planning state for this run
+	planMutex.Lock()
+	buildPlan = make(map[string]*Context) // Clear previous plan
+	planMutex.Unlock()
+
+	for _, target := range targets {
+		node, err := resolveAndPlanNode(ctx, target.ArtifactID, target.Format, target.Arch)
+		if err != nil {
+			log.Error(ctx, "Failed to plan build for target",
+				"artifact", target.ArtifactID,
+				"format", target.Format,
+				"arch", target.Arch,
+				"error", err)
+			return nil, fmt.Errorf("planning failed for %s: %w", target.ID(), err)
+		}
+		finalTargetNodes = append(finalTargetNodes, node)
+		finalTargetIDs = append(finalTargetIDs, target.ID())
+	}
+
+	// Create the root task that depends on all final targets
+	rootTask := &Context{
+		Description: fmt.Sprintf("Root build task for targets: %s", strings.Join(finalTargetIDs, ", ")),
+		Action: func(ctx context.Context) (interface{}, error) {
+			log.Info(ctx, "Executing build plan...")
+			nodesBuilt = make(map[string]bool) // Reset build status tracking
+			return nil, nil // No-op action
+		},
+		Interpret: func(result *Result) ([]*Context, error) {
+			if result.Error != nil { return nil, result.Error }
+			// The continuation is the list of final target nodes we need
+			return finalTargetNodes, nil
+		},
+	}
+
+	log.Debug(ctx, "Planning complete", "total_nodes_in_plan", len(buildPlan))
+	return rootTask, nil
+}
+
+// --- Core Recursive Planner ---
+
+// resolveAndPlanNode recursively builds the dependency graph stored in buildPlan.
+// Returns the *wrapper* node for the target. It's safe for concurrent calls if needed.
+func resolveAndPlanNode(ctx context.Context, artifactID, format, arch string) (*Context, error) {
+	nodeID := GetNodeID(artifactID, format, arch)
+	log := core.Logx().Subsystem("build-planner")
+
+	// --- Check Memoization ---
+	planMutex.Lock()
+	if node, exists := buildPlan[nodeID]; exists {
+		planMutex.Unlock()
+		log.Debug(ctx, "Node already planned, returning cached", "id", nodeID)
+		return node, nil // Return existing node
+	}
+	// Add placeholder to prevent infinite recursion in case of loops (though loops are errors)
+	buildPlan[nodeID] = &Context{Description: "Placeholder: " + nodeID}
+	planMutex.Unlock()
+
+	log.Debug(ctx, "Planning node", "id", nodeID)
+
+	// --- Find Artifact Definition & Validate ---
+	artifactDef, ok := artifactsData.Artifacts[artifactID]
+	if !ok { return nil, fmt.Errorf("artifact definition '%s' not found", artifactID) }
+	if !isArchSupported(artifactDef, arch) {
+		return nil, fmt.Errorf("artifact '%s' does not support architecture '%s'", artifactID, arch)
+	}
+	formatIsSupportedOrImplicit := isFormatSupported(artifactDef, format) ||
+								   (format == ImplicitDockerFormat && artifactCanProduce(artifactDef, "container")) ||
+								   (format == ImplicitQcow2Format && (artifactCanProduce(artifactDef, "raw") || artifactCanProduce(artifactDef, "vmdk") || artifactCanProduce(artifactDef, "vhdx")))
+
+	if !formatIsSupportedOrImplicit {
+		return nil, fmt.Errorf("artifact '%s' does not support requested or implicit format '%s'", artifactID, format)
+	}
+
+	// --- Determine Rule for *this* format ---
+	ruleName := getRuleForFormat(format, artifactDef)
+	rule, ok := artifactsData.BuildRules[ruleName]
+	if !ok { return nil, fmt.Errorf("build rule '%s' not found (needed for %s)", ruleName, nodeID) }
+
+	// --- Resolve Dependencies Recursively ---
+	var dependencyNodes []*Context
+	var err error
+
+	// 1. Implicit Format Dependency (e.g., container needs dockerfile)
+	requiredBaseFormat := getRequiredBaseFormat(format)
+	if requiredBaseFormat != "" {
+		var depNode *Context
+		depNode, err = resolveAndPlanNode(ctx, artifactID, requiredBaseFormat, arch) // Same artifact, different format
+		if err != nil { return nil, fmt.Errorf("failed resolving implicit format dep '%s' for %s: %w", requiredBaseFormat, nodeID, err)}
+		dependencyNodes = append(dependencyNodes, depNode)
+	}
+
+	// 2. 'from' Artifact Dependency
+	if artifactDef.Inputs.From != "" {
+		// Assume dependency is always on the 'container' format unless specified differently
+		fromFormat := ImplicitContainerFormat
+		var depNode *Context
+		depNode, err = resolveAndPlanNode(ctx, artifactDef.Inputs.From, fromFormat, arch) // Different artifact
+		if err != nil { return nil, fmt.Errorf("failed resolving 'from' dep '%s' (%s) for %s: %w", artifactDef.Inputs.From, fromFormat, nodeID, err)}
+		dependencyNodes = append(dependencyNodes, depNode)
+	}
+
+	// 3. 'requires_pkgs' Dependency
+	for _, pkgID := range artifactDef.Inputs.RequiresPkgs {
+		// Packages always produce 'deb' format (convention)
+		var depNode *Context
+		// Need to handle potential versioning in pkgID if required later
+		depNode, err = resolveAndPlanNode(ctx, pkgID, DefaultPkgFormat, arch)
+		if err != nil { return nil, fmt.Errorf("failed resolving 'requires_pkgs' dep '%s' (%s) for %s: %w", pkgID, DefaultPkgFormat, nodeID, err)}
+		dependencyNodes = append(dependencyNodes, depNode)
+	}
+
+	// 4. Meta Dependencies (Implicit Deps from Rule)
+	for _, metaDepName := range rule.ImplicitDeps {
+		metaDep, ok := artifactsData.MetaDeps[metaDepName]
+		if ok {
+			// It's a defined meta_dep (likely a service to check/start)
+			scriptPath := filepath.Join(imagesDir, metaDep.CheckScript) // Path relative to images/
+			depNode := &Context{
+				Description: fmt.Sprintf("Ensure Meta Dependency Ready: %s", metaDepName),
+				Action:      CmdAction(scriptPath, arch), // Pass arch for context
+			}
+			dependencyNodes = append(dependencyNodes, depNode)
+		} else {
+			// Assume it's an artifact dependency (e.g., implicit_deps: [base-factory-debian.container])
+			parts := strings.SplitN(metaDepName, ".", 2)
+			if len(parts) == 2 {
+				depArtifactID, depFormat := parts[0], parts[1]
+				var depNode *Context
+				depNode, err = resolveAndPlanNode(ctx, depArtifactID, depFormat, arch)
+				if err != nil { return nil, fmt.Errorf("failed resolving implicit rule dep '%s' for %s: %w", metaDepName, nodeID, err)}
+				dependencyNodes = append(dependencyNodes, depNode)
+			} else {
+				return nil, fmt.Errorf("invalid implicit_dep format '%s' in rule '%s'", metaDepName, ruleName)
+			}
+		}
+	}
+
+	// --- Create the Task Node for this specific step ---
+	scriptArgs := []string{artifactID, arch, format} // Basic args
+	// TODO: Add logic to extract specific args from artifactDef.Inputs.RuleArgs based on the ruleName
+	taskAction := CmdAction(filepath.Join(imagesDir, rule.Script), scriptArgs...) // Script path relative to images/
+
+	taskNode := &Context{
+		Description: fmt.Sprintf("Execute Rule '%s' for %s", ruleName, nodeID),
+		Action:      taskAction,
+		Interpret: func(result *Result) ([]*Context, error) {
+			if result.Error != nil { return nil, result.Error }
+			log.Info(ctx,"Successfully completed task", "node", nodeID)
+			nodesBuilt[nodeID] = true // Mark as built *after* successful execution
+			touchSentinelFile(nodeID) // Update timestamp *after* successful execution
+			return nil, nil // Task done
+		},
+	}
+
+	// --- Create Wrapper Node for Dependencies & Caching ---
+	wrapperNode := &Context{
+		Description: fmt.Sprintf("Build Target: %s", nodeID),
+		Action: func(ctx context.Context) (interface{}, error) {
+			// --- Caching Check ---
+			if isUpToDate(ctx, nodeID, artifactDef, rule, dependencyNodes) {
+				log.Info(ctx, "Target is up-to-date, skipping build", "node", nodeID)
+				nodesBuilt[nodeID] = true // Mark as built (skipped) - do this after Interpret skips!
+				return "SKIPPED", nil // Special value indicates skip
+			}
+			log.Debug(ctx, "Target requires build", "id", nodeID)
+			return "BUILD_NEEDED", nil
+		},
+		Interpret: func(result *Result) ([]*Context, error) {
+			if result.Error != nil { return nil, result.Error }
+			if result.Value == "SKIPPED" {
+				nodesBuilt[nodeID] = true // Mark skipped nodes as "built" conceptually
+				touchSentinelFile(nodeID) // Ensure sentinel is up-to-date even if skipped
+				return nil, nil // Skip dependencies and task
+			}
+			// If not skipped, return dependencies + task node
+			continuation := append([]*Context{}, dependencyNodes...)
+			continuation = append(continuation, taskNode)
+			return continuation, nil
+		},
+	}
+
+	// Store final wrapper node in the plan
+	planMutex.Lock()
+	buildPlan[nodeID] = wrapperNode
+	planMutex.Unlock()
+
+	return wrapperNode, nil
+}
+
+
+// --- TG Runner Execution ---
+
+// ExecutePlan runs the tg graph starting from the given root node.
+func ExecutePlan(ctx context.Context, rootNode *Context) error {
+	if tgRunner == nil {
+		return fmt.Errorf("internal error: tgRunner not initialized before ExecutePlan")
+	}
+	// Reset build status tracking for this execution run
+	nodesBuilt = make(map[string]bool)
+	err := tgRunner.Run(ctx, rootNode)
+	// Check if all nodes were processed (built or skipped) - basic validation
+	// This requires iterating through the buildPlan and checking nodesBuilt,
+	// potentially complex if graph traversal wasn't complete due to error.
+	// Logging within tgRunner/resolveAndPlanNode is the primary feedback for now.
+	return err
+}
+
+
+// --- Helper Implementations ---
+
+// GetNodeID generates a unique ID string for a build target.
+func GetNodeID(artifactID, format, arch string) string {
+	return fmt.Sprintf("%s.%s.%s", artifactID, format, arch) // Use dot separator
+}
+
+// GetTargetFromID parses a node ID back into its components.
+func GetTargetFromID(nodeID string) (artifactID, format, arch string, err error) {
+	parts := strings.SplitN(nodeID, ".", 3)
+	if len(parts) != 3 {
+		err = fmt.Errorf("malformed node ID: %s", nodeID)
+		return
+	}
+	artifactID, format, arch = parts[0], parts[1], parts[2]
+	return
+}
+
+func getHostArch() (string, error) {
+	// Use Go's runtime info for simplicity and portability
+	goarch := runtime.GOARCH
+	switch goarch {
+	case "amd64":
+		return "amd64", nil
+	case "arm64":
+		return "arm64", nil
+	default:
+		// Fallback to uname -m if Go arch isn't directly usable
+		cmdOut, err := exec.Command("uname", "-m").Output()
+		if err != nil { return "", fmt.Errorf("failed to get arch from runtime or uname: %w", err) }
+		unameArch := strings.TrimSpace(string(cmdOut))
+		switch unameArch {
+		case "x86_64": return "amd64", nil
+		case "aarch64": return "arm64", nil
+		default: return "", fmt.Errorf("unsupported host architecture: %s", unameArch)
+		}
+	}
+}
+
+func getDefaultFormat(kind string) string {
+	switch kind {
+	case "pkg": return DefaultPkgFormat
+	case "runtime": return DefaultRuntimeFormat
+	case "utility": return DefaultUtilityFormat
+	default:
+		core.Logx().Warn(context.Background(), "Unknown artifact kind, cannot determine default format", "kind", kind)
+		return ""
+	}
+}
+
+func isArchSupported(a sst.ArtifactDefinition, arch string) bool {
+	if len(a.Arch) == 0 { return true } // Assume supports all if list is empty
+	for _, supportedArch := range a.Arch {
+		if supportedArch == arch { return true }
+	}
+	return false
+}
+
+func isFormatSupported(a sst.ArtifactDefinition, format string) bool {
+	for _, supportedFormat := range a.Formats {
+		if supportedFormat == format { return true }
+	}
+	// Special check for packages if formats list is empty but build_steps define it
+	if len(a.Formats) == 0 && a.Kind == "pkg" && len(a.BuildSteps) > 0 {
+		lastStep := a.BuildSteps[len(a.BuildSteps)-1]
+		for _, out := range lastStep.Outputs {
+			if out.Format == format { return true }
+		}
+	}
+	return false
+}
+
+// artifactCanProduce checks if a format is listed or can be implicitly generated
+func artifactCanProduce(a sst.ArtifactDefinition, format string) bool {
+    if isFormatSupported(a, format) { return true }
+    // Check implicit chain only for runtime/utility types
+    if a.Kind != "runtime" && a.Kind != "utility" { return false }
+
+    switch format {
+    case ImplicitQcow2Format: return artifactCanProduce(a, ImplicitContainerFormat)
+    case "raw", "vmdk", "vhdx": return artifactCanProduce(a, ImplicitQcow2Format)
+    case ImplicitContainerFormat: return artifactCanProduce(a, ImplicitDockerFormat)
+    case ImplicitDockerFormat:
+         // Check if *any* container format is listed
+         for _, f := range a.Formats { if f == "container" { return true } }
+    }
+    return false
+}
+
+
+func getRuleForFormat(format string, a sst.ArtifactDefinition) string {
+	if a.BuildRule != "" { return a.BuildRule } // Explicit artifact override
+
+	// Handle implicit rule for dockerfile generation if needed
+	if format == ImplicitDockerFormat {
+		if _, exists := artifactsData.BuildRules["generate_dockerfile"]; exists {
+			return "generate_dockerfile"
+		}
+	}
+
+	// Default: rule name matches format name
+	if _, exists := artifactsData.BuildRules[format]; exists {
+		return format
+	}
+	// Fallback for raw/vmdk/vhdx sharing a rule
+	if format == "raw" || format == "vmdk" || format == "vhdx" {
+		if _, exists := artifactsData.BuildRules["convert_vm_format"]; exists {
+			return "convert_vm_format"
+		}
+	}
+	// If still not found, it's an error (handled by caller)
+	return format // Return format name, caller checks existence in BuildRules map
+}
+
+// getRequiredBaseFormat determines the immediate prerequisite format based on the target format.
+func getRequiredBaseFormat(format string) string {
+    switch format {
+    case ImplicitQcow2Format: return ImplicitContainerFormat
+    case "raw", "vmdk", "vhdx": return ImplicitQcow2Format
+    case ImplicitContainerFormat: return ImplicitDockerFormat
+    // Packages ('deb') and dockerfiles have dependencies defined differently
+    default: return ""
+    }
+}
+
+
+// isUpToDate implements the caching logic (Timestamp comparison for now)
+// Takes the WRAPPER node's dependencies as input for comparison.
+func isUpToDate(ctx context.Context, nodeID string, artifactDef sst.ArtifactDefinition, rule sst.BuildRule, dependencyNodes []*Context) bool {
+	log := core.Logx().Subsystem("cache-check")
+	sentinelFile := filepath.Join(imagesDir, SentinelDir, nodeID)
+
+	targetStat, err := os.Stat(sentinelFile)
+	if os.IsNotExist(err) {
+		log.Debug(ctx, "Cache miss: Sentinel file not found", "file", sentinelFile)
+		return false // Needs build if sentinel doesn't exist
+	}
+	if err != nil {
+		log.Warn(ctx, "Cache check: Error stating sentinel file, forcing rebuild", "file", sentinelFile, "error", err)
+		return false // Error reading sentinel, assume rebuild
+	}
+	targetMtime := targetStat.ModTime()
+
+	// --- Check source files defined directly for the artifact ---
+	// Need to check inputs relevant to the *specific rule* being run.
+	// For packages with build_steps, this requires finding the correct step.
+	// For runtimes, check artifactDef.Inputs.Files (used by generate_dockerfile).
+	// For rules like convert_qcow2, the relevant "files" are in the rule def.
+	filesToCheck := []string{}
+	if len(artifactDef.BuildSteps) > 0 {
+		// Find the step using this rule for this artifact
+		// For simplicity now, just check all files listed anywhere in build_steps inputs
+		for _, step := range artifactDef.BuildSteps {
+			filesToCheck = append(filesToCheck, step.Inputs.Files...)
+		}
+	} else {
+		filesToCheck = append(filesToCheck, artifactDef.Inputs.Files...)
+	}
+	// Also check files associated with the build rule itself
+	filesToCheck = append(filesToCheck, rule.BuildSequence...)
+
+	uniqueFiles := make(map[string]bool)
+	for _, fileRelPath := range filesToCheck {
+		if fileRelPath != "" { uniqueFiles[fileRelPath] = true }
+	}
+
+	for fileRelPath := range uniqueFiles {
+		filePath := filepath.Join(imagesDir, fileRelPath) // Paths relative to imagesDir
+		if isNewer(ctx, log, filePath, targetMtime, nodeID) { return false }
+	}
+
+	// --- Check dependency artifacts (compare sentinel file timestamps) ---
+	for _, depNode := range dependencyNodes {
+		// Extract the dependency node ID from its description (fragile, needs improvement)
+		// Assumes description is "Build Target: <depID>"
+		depID := strings.TrimPrefix(depNode.Description, "Build Target: ")
+		if depID == depNode.Description {
+			// Could be a meta dep script node, check its description?
+			if strings.HasPrefix(depNode.Description, "Ensure Meta Dependency Ready:") {
+				// Assume meta dep check scripts don't change often? Or check script mtime?
+				// Let's check the script mtime for now.
+				metaScriptName := "" // Need to extract from CmdAction? Hard.
+				// For now, let's assume meta deps don't invalidate cache based on script time.
+				continue
+			}
+			log.Warn(ctx, "Could not determine dependency ID from node description", "desc", depNode.Description)
+			continue // Skip if ID extraction fails
+		}
+
+		depSentinelFile := filepath.Join(imagesDir, SentinelDir, depID)
+		if isNewer(ctx, log, depSentinelFile, targetMtime, nodeID) { return false }
+	}
+
+	log.Debug(ctx, "Cache hit: Target is up-to-date", "node", nodeID)
+	return true // All checks passed
+}
+
+// isNewer checks if file 'a' is newer than time 'b'
+func isNewer(ctx context.Context, log sst.Logx, pathA string, timeB time.Time, targetNodeID string) bool {
+	// Ensure pathA is absolute for Stat
+	absPathA := pathA
+	if !filepath.IsAbs(pathA) {
+		// This might be wrong if pathA isn't relative to CWD. Assume relative to repoRoot?
+		// Let's assume paths passed here are already resolved correctly relative to imagesDir/repoRoot.
+		// If pathA is like ".ts/...", it's relative to imagesDir.
+		// If pathA is like "runtimes/scripts/...", it's relative to imagesDir.
+		if !strings.HasPrefix(pathA, "/") { // Simple check if it's already absolute
+             absPathA = filepath.Join(imagesDir, pathA) // Make absolute from imagesDir
+        }
+	}
+
+
+	statA, err := os.Stat(absPathA)
+	if os.IsNotExist(err) {
+		// If it's a sentinel file that's missing, the dependency needs building.
+		if strings.Contains(absPathA, SentinelDir) {
+			log.Debug(ctx, "Cache miss: Dependency sentinel file missing", "dependency_sentinel", absPathA, "target", targetNodeID)
+			return true // Dependency needs building first
+		}
+		// If it's a source file that's missing, that's a fatal error.
+		log.Error(ctx, "Dependency source file not found, forcing rebuild", "missing_file", absPathA, "target", targetNodeID)
+		return true // Treat missing source as needing rebuild (will likely fail later)
+	}
+	if err != nil {
+		log.Warn(ctx, "Error stating dependency file, forcing rebuild", "file", absPathA, "target", targetNodeID, "error", err)
+		return true // Error stating, assume rebuild
+	}
+	if statA.ModTime().After(timeB) {
+		log.Debug(ctx, "Cache miss: Dependency newer than target", "dependency", absPathA, "target", targetNodeID)
+		return true
+	}
+	return false
+}
+
+// touchSentinelFile creates or updates the modification time of the sentinel file
+func touchSentinelFile(nodeID string) {
+	sentinelFile := filepath.Join(imagesDir, SentinelDir, nodeID)
+	now := time.Now()
+	err := os.Chtimes(sentinelFile, now, now) // Try touching first
+	if os.IsNotExist(err) {
+		// Create parent dir if needed
+		if err := os.MkdirAll(filepath.Dir(sentinelFile), 0755); err != nil {
+			core.Logx().Warn(context.Background(),"Failed to create sentinel directory", "dir", filepath.Dir(sentinelFile), "error", err)
+			return
+		}
+		// Create the file
+		f, createErr := os.Create(sentinelFile)
+		if createErr != nil {
+			core.Logx().Warn(context.Background(),"Failed to create sentinel file", "file", sentinelFile, "error", createErr)
+			return
+		}
+		_ = f.Close() // Ignore close error on create
+	} else if err != nil {
+		core.Logx().Warn(context.Background(),"Failed to touch sentinel file", "file", sentinelFile, "error", err)
+	}
+}
+
+
+// CmdAction creates a tg.Action that runs a shell script
+func CmdAction(scriptPath string, args ...string) Action {
+	return func(ctx context.Context) (interface{}, error) {
+		// Ensure core and tgRunner are initialized before using them
+		if core == nil || tgRunner == nil {
+			return nil, fmt.Errorf("internal error: core or tgRunner not initialized in cmdAction")
+		}
+		log := core.Logx().Subsystem("cmdAction") // Use core logger
+
+		// Ensure script path is executable (simple check)
+		absScriptPath := scriptPath
+		if !filepath.IsAbs(scriptPath) {
+             absScriptPath = filepath.Join(imagesDir, scriptPath) // Assume relative to imagesDir
+        }
+		if _, err := os.Stat(absScriptPath); err != nil {
+             return nil, fmt.Errorf("build script not found or invalid: %s (%w)", absScriptPath, err)
+        }
+        // Could add execute permission check here too
+
+
+		cmd := exec.CommandContext(ctx, absScriptPath, args...)
+		cmd.Stdout = os.Stdout // Pipe directly for build output visibility
+		cmd.Stderr = os.Stderr
+		cmd.Dir = imagesDir // Run scripts from images/ directory
+
+		// Inject DEBUG_SCRIPTS=1 if the Go command's debug flag is set
+		env := os.Environ() // Get current environment
+		if buildDebug {
+			env = append(env, "DEBUG_SCRIPTS=1")
+		} else {
+			env = append(env, "DEBUG_SCRIPTS=0")
+		}
+		// Also pass common vars needed by scripts explicitly via Env
+		env = append(env, fmt.Sprintf("REPO_ROOT=%s", repoRoot))
+		env = append(env, fmt.Sprintf("IMAGES_DIR=%s", imagesDir))
+		// Pass ARCH, DEBARCH, LOCAL_REGISTRY etc. if scripts need them
+		env = append(env, fmt.Sprintf("ARCH=%s", os.Getenv("ARCH"))) // Assuming ARCH is set by env.sh sourcing upstream
+		env = append(env, fmt.Sprintf("DEBARCH=%s", os.Getenv("DEBARCH")))
+		env = append(env, fmt.Sprintf("LOCAL_REGISTRY=%s", os.Getenv("LOCAL_REGISTRY")))
+
+		cmd.Env = env
+
+
+		start := time.Now()
+		// Use relative path for logging clarity if possible
+		logRelPath, _ := filepath.Rel(imagesDir, absScriptPath)
+		if logRelPath == "" { logRelPath = filepath.Base(absScriptPath)}
+
+		log.Info(ctx, "Executing script", "script", logRelPath, "args", args)
+
+		err := cmd.Run()
+		duration := time.Since(start)
+
+		exitCode := 0
+		if err != nil {
+			if exitError, ok := err.(*exec.ExitError); ok {
+				exitCode = exitError.ExitCode()
+			} else {
+				exitCode = -1 // Non-exit error (e.g., script not found, caught above?)
+			}
+			log.Error(ctx, "Script finished with error", "script", logRelPath, "duration", duration, "exit_code", exitCode, "error", err)
+			return nil, fmt.Errorf("script %s failed (exit %d): %w", logRelPath, exitCode, err)
+		}
+
+		log.Info(ctx, "Script finished successfully", "script", logRelPath, "duration", duration)
+		return nil, nil // Return nil value on success, error is nil
+	}
+}
+
+// Helper needed by list commands
+func GenerateAllPossibleTargets() []string {
+	var targets []string
+	// Need host arch for default/fallback cases
+	hostArch, _ := getHostArch() // Ignore error for listing
+
+	for id, artifact := range artifactsData.Artifacts { // Access global data
+		arches := artifact.Arch
+		if len(arches) == 0 && artifact.Kind != "utility" { // Assume non-utility needs arch
+			arches = []string{hostArch} // Default to host if empty
+		} else if len(arches) == 0 && artifact.Kind == "utility" {
+             arches = []string{"any"} // Utilities might be arch-independent
+        }
+
+		for _, arch := range arches {
+			formats := artifact.Formats
+			// If formats list is empty (e.g., for packages using build_steps), derive from steps
+			if len(formats) == 0 && len(artifact.BuildSteps) > 0 {
+				lastStep := artifact.BuildSteps[len(artifact.BuildSteps)-1]
+				for _, out := range lastStep.Outputs {
+					if out.Format != "" { formats = append(formats, out.Format)}
+				}
+			} else if len(formats) == 0 && artifact.Kind == "utility" && artifact.SourceImage != "" {
+                 formats = []string{"container"} // Utility from source image is a container
+            } else if len(formats) == 0 {
+                 // Fallback if still no formats (e.g. pkg with only fetch?)
+                 formats = []string{getDefaultFormat(artifact.Kind)}
+            }
+
+
+			// Generate targets for all explicitly listed formats
+			for _, format := range formats {
+				targets = append(targets, GetNodeID(id, format, arch))
+			}
+			// Add implicit intermediate targets needed for listed formats
+			neededIntermediates := make(map[string]bool)
+			for _, finalFormat := range formats {
+				f := finalFormat
+				for {
+					f = getRequiredBaseFormat(f) // Get immediate prerequisite format
+					if f == "" { break }
+					// Check if this intermediate format *can* be produced by the artifact
+					// (e.g. don't add dockerfile if artifact only lists 'container')
+					if artifactCanProduce(artifact, f){
+                        neededIntermediates[f] = true
+                    } else {
+                        break // Stop going up the chain if intermediate isn't supported
+                    }
+				}
+			}
+			for f := range neededIntermediates {
+                 // Only add if not already in explicit formats list
+                 alreadyListed := false
+                 for _, explicitFmt := range formats { if explicitFmt == f { alreadyListed = true; break }}
+                 if !alreadyListed {
+				    targets = append(targets, GetNodeID(id, f, arch))
+                 }
+			}
+		}
+	}
+	// Deduplicate and sort
+	uniqueTargetsMap := make(map[string]bool)
+	for _, t := range targets { uniqueTargetsMap[t] = true }
+	var uniqueTargets []string
+	for t := range uniqueTargetsMap { uniqueTargets = append(uniqueTargets, t)}
+	sort.Strings(uniqueTargets)
+	return uniqueTargets
+}
