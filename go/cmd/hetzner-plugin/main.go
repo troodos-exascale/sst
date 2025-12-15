@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"net"
 
 	"google.golang.org/grpc"
@@ -15,11 +14,8 @@ import (
 const port = ":50051"
 
 func main() {
-	core, err := sst.New()
-	if err != nil {
-		panic(fmt.Sprintf("failed to initialize sst core package: %v", err))
-	}
-	log := core.Logx().Subsystem("plugind-main")
+	// Construct explicit root logger
+	log := sst.LogxRoot().Subsystem("plugin-main")
 	ctx := context.Background()
 
 	lis, err := net.Listen("tcp", port)
@@ -31,7 +27,8 @@ func main() {
 
 	s := grpc.NewServer()
 
-	server.RegisterService(s, core)
+	// Inject only what the server needs
+	server.RegisterService(s, log)
 
 	reflection.Register(s)
 

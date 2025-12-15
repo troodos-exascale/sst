@@ -4,7 +4,6 @@ go 1.25
 
 require (
 	cuelang.org/go v0.8.0
-	github.com/fatih/color v1.18.0
 	github.com/go-git/go-git/v5 v5.16.4
 	github.com/rekby/gpt v0.0.0-20200614112001-7da10aec5566
 	github.com/rs/zerolog v1.34.0

@@ -18,6 +18,23 @@ import (
 	"google.golang.org/grpc/metadata"
 )
 
+// Logx is the interface for the structured, traceable logger.
+type Logx interface {
+	With(kv ...any) Logx
+	WithError(err error) Logx
+	Debug(ctx context.Context, msg string, kv ...any)
+	Info(ctx context.Context, msg string, kv ...any)
+	Warn(ctx context.Context, msg string, kv ...any)
+	Error(ctx context.Context, msg string, kv ...any)
+	Subsystem(name string) Logx
+}
+
+// LogxRoot creates a root logger writing to stdout.
+// This is the canonical entry point for applications.
+func LogxRoot() Logx {
+	return NewWithWriter(os.Stdout)
+}
+
 // zl is the unexported implementation of the Logx interface.
 type zl struct {
 	base      zerolog.Logger

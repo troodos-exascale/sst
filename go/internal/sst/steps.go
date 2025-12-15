@@ -5,127 +5,173 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"time"
 )
 
-// State is a map used to pass data between steps.
-type stateInternal map[string]interface{}
+//
+// =========================
+// Exported Steps API (verbs)
+// =========================
+//
+// These are the ONLY exported entry points of the steps framework.
+// Anyone reading this file should immediately know what is available
+// and where to find it.
+//
 
-// StepFunc defines the signature for any function that can be a step.
-type stepFuncInternal func(state stateInternal) error
+// StepsInit initializes a new linear steps execution context.
+func StepsInit(name string) *StepsRunState {
+	return &StepsRunState{
+		Name:  name,
+		State: make(StepState),
+		logf:  func(string, ...any) {},
+	}
+}
 
-// Step represents a single, named unit of work in a workflow.
-type stepInternal struct {
+// StepsRun executes all registered steps in order.
+func StepsRun(r *StepsRunState) error {
+	return r.runAll()
+}
+
+// StepsResume resumes execution from persisted state.
+func StepsResume(r *StepsRunState) error {
+	r.persist = true
+	return r.runAll()
+}
+
+// StepsFinish finalizes a steps run (currently a no-op, reserved).
+func StepsFinish(r *StepsRunState) error {
+	return nil
+}
+
+//
+// =========================
+// Nouns: state & structure
+// =========================
+
+// StepState is application-owned, serializable state shared between steps.
+type StepState map[string]interface{}
+
+// Step represents a single linear unit of work.
+type Step struct {
 	Name string
-	F    stepFuncInternal
+	Run  StepFunc
 }
 
-// runner is the unexported implementation of the Steps interface.
-type runner struct {
-	Steps    []*stepInternal
-	ProgName string
-	state    stateInternal
-	stateDir string
+// StepFunc is the function executed for a step.
+type StepFunc func(ctx *StepsContext, state StepState) error
+
+// StepsContext carries framework-owned, per-step execution metadata.
+type StepsContext struct {
+	StepName string
+	StepIdx  int
 }
 
-// newSteps creates and initializes a new step runner.
-func newSteps(progName string) Steps {
-	return &runner{
-		ProgName: progName,
-		state:    make(stateInternal),
-		stateDir: filepath.Join(os.TempDir(), "steps"),
+// StepsRunState is the superblock / inode of a steps execution.
+type StepsRunState struct {
+	Name      string
+	Steps     []Step
+	State     StepState
+	persist   bool
+	statePath string
+	logf      func(format string, args ...any)
+}
+
+//
+// =========================
+// Public methods on state
+// =========================
+
+// StepsAdd registers a new step.
+func (r *StepsRunState) StepsAdd(name string, fn StepFunc) {
+	r.Steps = append(r.Steps, Step{
+		Name: name,
+		Run:  fn,
+	})
+}
+
+// StepsWithLogger attaches a logger to the run.
+func (r *StepsRunState) StepsWithLogger(logf func(format string, args ...any)) {
+	r.logf = logf
+}
+
+// StepsWithPersistence enables persistence to the given path.
+func (r *StepsRunState) StepsWithPersistence(path string) {
+	r.persist = true
+	r.statePath = path
+}
+
+//
+// =========================
+// Private execution logic
+// =========================
+
+func (r *StepsRunState) runAll() error {
+	if r.persist {
+		_ = r.loadState()
 	}
-}
 
-// AddStep adds a new step to the runner's workflow.
-func (r *runner) AddStep(name string, f func(state map[string]interface{}) error) {
-	// Adapt the function signature to the internal StepFunc type.
-	wrappedF := func(s stateInternal) error {
-		return f(s)
-	}
-	r.Steps = append(r.Steps, &stepInternal{Name: name, F: wrappedF})
-}
-
-// SetInitialState copies values from a provided map into the runner's internal state.
-func (r *runner) SetInitialState(initialState map[string]interface{}) {
-	for k, v := range initialState {
-		r.state[k] = v
-	}
-}
-
-// Run executes the defined steps according to the provided flags.
-func (r *runner) Run(startStep, untilStep, fromStep int) error {
-	if err := os.MkdirAll(r.stateDir, 0755); err != nil {
-		return fmt.Errorf("could not create state directory %s: %w", r.stateDir, err)
-	}
-
-	if fromStep > 0 {
-		if err := r.loadState(fromStep); err != nil {
-			return fmt.Errorf("failed to load state for step %d: %w", fromStep, err)
+	for i, step := range r.Steps {
+		ctx := &StepsContext{
+			StepName: step.Name,
+			StepIdx:  i + 1,
 		}
-		startStep = fromStep
-	}
 
-	startIndex := startStep - 1
-	if startIndex < 0 {
-		startIndex = 0
-	}
+		r.logf("STEP %02d %s", ctx.StepIdx, ctx.StepName)
 
-	endIndex := len(r.Steps)
-	if untilStep > 0 && untilStep <= len(r.Steps) {
-		endIndex = untilStep
-	}
-
-	var lastStepRun = -1
-	for i := startIndex; i < endIndex; i++ {
-		step := r.Steps[i]
-		fmt.Fprintf(os.Stderr, "[INFO] ==> Running Step %d: %s\n", i+1, step.Name)
-		if err := step.F(r.state); err != nil {
-			return fmt.Errorf("step %d '%s' failed: %w", i+1, step.Name, err)
+		if err := step.Run(ctx, r.State); err != nil {
+			r.logf("FAIL %02d %s: %v", ctx.StepIdx, ctx.StepName, err)
+			return err
 		}
-		lastStepRun = i
-	}
 
-	nextStepIndex := lastStepRun + 1
-	if untilStep > 0 && nextStepIndex < len(r.Steps) {
-		if err := r.saveState(nextStepIndex); err != nil {
-			return fmt.Errorf("failed to save state for next step: %w", err)
+		if r.persist {
+			if err := r.saveState(); err != nil {
+				return err
+			}
 		}
-		fmt.Fprintf(os.Stderr, "[INFO] Workflow paused. State saved for step %d.\n", nextStepIndex+1)
+
+		r.logf("OK   %02d %s", ctx.StepIdx, ctx.StepName)
 	}
 
 	return nil
 }
 
-func (r *runner) saveState(nextStepNum int) error {
-	stateFile := filepath.Join(r.stateDir, fmt.Sprintf("%s-step-args-%d", r.ProgName, nextStepNum))
-	data, err := json.MarshalIndent(r.state, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal state: %w", err)
-	}
-	return os.WriteFile(stateFile, data, 0644)
+//
+// =========================
+// Persistence (private)
+// =========================
+
+type persistedStepsState struct {
+	Updated time.Time
+	State   StepState
 }
 
-func (r *runner) loadState(fromStepNum int) error {
-	pattern := filepath.Join(r.stateDir, fmt.Sprintf("%s-step-args-%d*", r.ProgName, fromStepNum))
-	matches, err := filepath.Glob(pattern)
+func (r *StepsRunState) loadState() error {
+	data, err := os.ReadFile(r.statePath)
+	if err != nil {
+		return nil
+	}
+
+	var p persistedStepsState
+	if err := json.Unmarshal(data, &p); err != nil {
+		return fmt.Errorf("load steps state: %w", err)
+	}
+	r.State = p.State
+	return nil
+}
+
+func (r *StepsRunState) saveState() error {
+	p := persistedStepsState{
+		Updated: time.Now().UTC(),
+		State:   r.State,
+	}
+
+	data, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return err
 	}
-	if len(matches) == 0 {
-		return fmt.Errorf("no state file found matching pattern: %s", pattern)
-	}
-	sort.Strings(matches)
-	latestFile := matches[len(matches)-1]
 
-	fmt.Fprintf(os.Stderr, "[INFO] Resuming from state file: %s\n", latestFile)
-	data, err := os.ReadFile(latestFile)
-	if err != nil {
-		return fmt.Errorf("failed to read state file %s: %w", latestFile, err)
+	if err := os.MkdirAll(filepath.Dir(r.statePath), 0o755); err != nil {
+		return err
 	}
-	if err := json.Unmarshal(data, &r.state); err != nil {
-		return fmt.Errorf("failed to unmarshal state from %s: %w", latestFile, err)
-	}
-
-	return os.Remove(latestFile)
+	return os.WriteFile(r.statePath, data, 0o644)
 }

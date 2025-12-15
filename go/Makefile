@@ -2,11 +2,17 @@ BINS := mkimage runctl sst hetzner-plugin
 ARCH := $(shell go env GOARCH)
 
 
-.PHONY: all build install clean
+.PHONY: all build install clean generate tidy
 
 all: build
 
-build:
+tidy: generate
+	go mod tidy
+
+generate:
+	go generate ./...
+
+build: tidy
 	go generate ./...
 	go mod tidy
 	for b in $(BINS); do \

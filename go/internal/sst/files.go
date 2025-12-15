@@ -13,6 +13,11 @@ import (
 	"github.com/go-git/go-git/v5" // Import the go-git library
 )
 
+type Files interface {
+	Fence(p string) (string, error)
+	Root() string
+}
+
 // fencer is the unexported implementation of the Files interface.
 type fencer struct {
 	root string

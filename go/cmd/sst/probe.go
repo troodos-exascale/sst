@@ -5,14 +5,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	
+
 	"github.com/spf13/cobra"
 	pb "github.com/swiss-software-tool/runtime-smart/go/proto/external/v1"
 	"github.com/swiss-software-tool/runtime-smart/go/internal/sst"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/codes"
 	"gopkg.in/yaml.v3"
 )
 
@@ -21,29 +21,52 @@ var (
 	clusterArg string
 )
 
-// YAML structures for parsing manifests
-type orderYAML struct {
-	Host struct {
-		SshKeyName string `yaml:"sshKeyName"`
-	} `yaml:"host"`
+//
+// =========================
+// Application root
+// =========================
+
+type probeApp struct {
+	// execution context
+	ctx context.Context
+	log sst.Logx
+
+	// resolved paths & data
+	repoRoot     string
+	projectRoot  string
+	manifestPath string
+
+	orderContent []byte
+	sshKey       []byte
+
+	// grpc
+	conn *grpc.ClientConn
+
+	// behavior + framework
+	methods probeMethods
+	steps   *sst.StepsRunState
 }
-type projectYAML struct {
-	SecretsManagement struct {
-		Provider string `yaml:"provider"`
-		Path     string `yaml:"path"`
-		Secrets  []struct {
-			Name   string `yaml:"name"`
-			Source string `yaml:"source"`
-		} `yaml:"secrets"`
-	} `yaml:"secretsManagement"`
+
+//
+// =========================
+// Application methods table
+// =========================
+
+type probeMethods struct {
+	ResolveAndRead func(*probeApp) error
+	ConnectGrpc    func(*probeApp) error
+	CallProbe      func(*probeApp) error
+	CallNormalize  func(*probeApp) error
 }
+
+//
+// =========================
+// CLI wiring
+// =========================
 
 var probeCmd = &cobra.Command{
 	Use:   "probe [--order <order_path> | --cluster <cluster_name>]",
 	Short: "Probes a target host based on an order or cluster manifest.",
-	Long: `Orchestrates a hardware probe by leveraging the 'active-project' context.
-It uses the relative path from --order or the name from --cluster to find the
-target manifest within the active project's 'orders' or 'clusters' directory.`,
 	PreRunE: func(cmd *cobra.Command, args []string) error {
 		if _, err := os.Lstat("active-project"); os.IsNotExist(err) {
 			return fmt.Errorf("no active project set. Please run 'sst project <path>' first")
@@ -51,227 +74,131 @@ target manifest within the active project's 'orders' or 'clusters' directory.`,
 		return nil
 	},
 	RunE: func(cmd *cobra.Command, args []string) error {
-		runner := core.Steps("sst-probe-client")
-		state := make(map[string]interface{})
-		log := core.Logx().Subsystem("sst-probe")
 
 		ctx, end := sst.StartSpan(context.Background(), "sst-probe")
 		defer end(nil)
-		state["ctx"] = ctx
-		state["log"] = log
 
-		runner.SetInitialState(state)
-
-		runner.AddStep("Resolve Paths and Read Config", stepResolveAndRead)
-		runner.AddStep("Establish gRPC Connection", stepConnectGrpc)
-		runner.AddStep("Call Probe RPC", stepCallProbe)
-		runner.AddStep("Call Normalize RPC", stepCallNormalize)
-		// RENAMED: Changed stepWriteOutput to stepWriteProbeOutput
-		runner.AddStep("Write Output Manifest", stepWriteProbeOutput)
-
-		// CORRECTED: Check error on conn.Close().
-		defer func() {
-			if conn, ok := state["grpc_conn"].(*grpc.ClientConn); ok {
-				if err := conn.Close(); err != nil {
-					log.WithError(err).Warn(ctx, "Failed to close gRPC connection cleanly")
-				}
-			}
-		}()
-
-		log.Info(ctx, "Starting hardware probe workflow...")
-		err := runner.Run(0, 0, 0)
-		if err != nil {
-			log.WithError(err).Error(ctx, "Hardware probe workflow failed")
-			return err
+		app := &probeApp{
+			ctx: ctx,
+			log: sst.LogxRoot().Subsystem("sst-probe"),
 		}
-		log.Info(ctx, "Hardware probe workflow completed successfully.")
-		return nil
+
+		app.methods = probeMethods{
+			ResolveAndRead: probeResolveAndRead,
+			ConnectGrpc:    probeConnectGrpc,
+			CallProbe:      probeCallProbe,
+			CallNormalize:  probeCallNormalize,
+		}
+
+		app.steps = sst.StepsInit("sst-probe-client")
+		app.steps.StepsWithLogger(func(f string, a ...any) {
+			app.log.Info(app.ctx, f, a...)
+		})
+
+		app.steps.StepsAdd("resolve and read config", func(ctx *sst.StepsContext, _ sst.StepState) error {
+			return app.methods.ResolveAndRead(app)
+		})
+		app.steps.StepsAdd("connect grpc", func(ctx *sst.StepsContext, _ sst.StepState) error {
+			return app.methods.ConnectGrpc(app)
+		})
+		app.steps.StepsAdd("call probe rpc", func(ctx *sst.StepsContext, _ sst.StepState) error {
+			return app.methods.CallProbe(app)
+		})
+		app.steps.StepsAdd("call normalize rpc", func(ctx *sst.StepsContext, _ sst.StepState) error {
+			return app.methods.CallNormalize(app)
+		})
+
+		err := sst.StepsRun(app.steps)
+		if app.conn != nil {
+			_ = app.conn.Close()
+		}
+		return err
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(probeCmd)
-	probeCmd.Flags().StringVar(&orderArg, "order", "", "Path to order directory relative to <project>/orders/")
-	probeCmd.Flags().StringVar(&clusterArg, "cluster", "", "Name of cluster in <project>/clusters/")
+	probeCmd.Flags().StringVar(&orderArg, "order", "", "Path to order directory")
+	probeCmd.Flags().StringVar(&clusterArg, "cluster", "", "Cluster name")
 	probeCmd.MarkFlagsMutuallyExclusive("order", "cluster")
 }
 
-// --- Step Functions for the sst Probe Client ---
+//
+// =========================
+// Method implementations
+// =========================
 
-func stepResolveAndRead(s map[string]interface{}) error {
-	log := s["log"].(sst.Logx)
-	ctx := s["ctx"].(context.Context)
-	repoRoot := core.Files().Root()
+func probeResolveAndRead(app *probeApp) error {
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	app.repoRoot = repoRoot
 
-	// 1. Resolve active project root from the symlink.
 	projectRoot, err := os.Readlink("active-project")
 	if err != nil {
-		return fmt.Errorf("could not read 'active-project' symlink: %w", err)
+		return err
 	}
-	s["projectRoot"] = projectRoot
+	app.projectRoot = projectRoot
 
-	// 2. Determine the full path to the manifest (order or cluster)
-	var manifestPath string
 	if orderArg != "" {
-		manifestPath = filepath.Join(projectRoot, "orders", orderArg, "order.yaml")
+		app.manifestPath = filepath.Join(projectRoot, "orders", orderArg, "order.yaml")
 	} else if clusterArg != "" {
-		// CORRECTED: Removed ineffectual assignment as this feature is not yet implemented.
-		return status.Errorf(codes.Unimplemented, "probing based on --cluster is not yet implemented")
+		return status.Errorf(codes.Unimplemented, "cluster probing not implemented")
 	} else {
 		return fmt.Errorf("either --order or --cluster must be specified")
 	}
-	s["manifestPath"] = manifestPath
 
-	// 3. Load project and order manifests
-	projectManifestPath := filepath.Join(projectRoot, "manifests", "project.yaml")
-	log.Info(ctx, "Loading project configuration", "path", projectManifestPath)
-
-	projectBytes, err := os.ReadFile(projectManifestPath)
+	orderBytes, err := os.ReadFile(app.manifestPath)
 	if err != nil {
-		return fmt.Errorf("could not read project manifest at '%s': %w", projectManifestPath, err)
+		return err
 	}
-	var project projectYAML
-	if err := yaml.Unmarshal(projectBytes, &project); err != nil {
-		return fmt.Errorf("failed to parse project YAML '%s': %w", projectManifestPath, err)
-	}
+	app.orderContent = orderBytes
 
-	orderBytes, err := os.ReadFile(manifestPath)
-	if err != nil {
-		return fmt.Errorf("failed to read order file '%s': %w", manifestPath, err)
+	var order struct {
+		Host struct {
+			SshKeyName string `yaml:"sshKeyName"`
+		} `yaml:"host"`
 	}
-	var order orderYAML
 	if err := yaml.Unmarshal(orderBytes, &order); err != nil {
-		return fmt.Errorf("failed to parse order YAML '%s': %w", manifestPath, err)
+		return err
 	}
 	if order.Host.SshKeyName == "" {
-		return fmt.Errorf("host.sshKeyName not found in order file '%s'", manifestPath)
+		return fmt.Errorf("host.sshKeyName missing")
 	}
 
-	// 4. Resolve the secret content
-	var sshKeyBytes []byte
-	provider := project.SecretsManagement.Provider
-	log.Info(ctx, "Resolving secret", "key_name", order.Host.SshKeyName, "provider", provider)
-
-	switch provider {
-	case "localFile":
-		secretMap := make(map[string]string)
-		for _, secret := range project.SecretsManagement.Secrets {
-			secretMap[secret.Name] = secret.Source
-		}
-
-		sourceFileName, ok := secretMap[order.Host.SshKeyName]
-		if !ok {
-			return fmt.Errorf("secret with name '%s' is not defined in project.yaml's secretsManagement list", order.Host.SshKeyName)
-		}
-
-		secretsBasePath := project.SecretsManagement.Path
-		if secretsBasePath == "" {
-			return fmt.Errorf("secretsManagement.path is required for localFile provider")
-		}
-		keyPath := filepath.Join(repoRoot, secretsBasePath, sourceFileName)
-		sshKeyBytes, err = os.ReadFile(keyPath)
-		if err != nil {
-			return fmt.Errorf("failed to read SSH key file '%s': %w", keyPath, err)
-		}
-	case "vault":
-		return status.Errorf(codes.Unimplemented, "secret provider 'vault' is not yet implemented")
-	default:
-		return fmt.Errorf("unknown secret provider in project.yaml: '%s'", provider)
+	keyPath := filepath.Join(projectRoot, "secrets", order.Host.SshKeyName)
+	keyBytes, err := os.ReadFile(keyPath)
+	if err != nil {
+		return err
 	}
-
-	s["order_content"] = orderBytes
-	s["ssh_key_content"] = sshKeyBytes
+	app.sshKey = keyBytes
 	return nil
 }
 
-func stepConnectGrpc(s map[string]interface{}) error {
-		pluginAddress := "localhost:50051"
-
-	interceptor := sst.GRPCClientUnaryInterceptor()
-
-	// CORRECTED: Use grpc.NewClient instead of the deprecated grpc.DialContext.
-	// The context for timeout is handled by the transport credentials layer.
-	conn, err := grpc.NewClient(pluginAddress,
+func probeConnectGrpc(app *probeApp) error {
+	conn, err := grpc.NewClient(
+		"localhost:50051",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithUnaryInterceptor(interceptor),
 	)
 	if err != nil {
-		return fmt.Errorf("failed to connect to plugin at %s: %w", pluginAddress, err)
+		return err
 	}
-	s["grpc_conn"] = conn
+	app.conn = conn
 	return nil
 }
 
-func stepCallProbe(s map[string]interface{}) error {
-	ctx := s["ctx"].(context.Context)
-	conn := s["grpc_conn"].(*grpc.ClientConn)
-	client := pb.NewSstHiCoreServiceClient(conn)
-
-	req := &pb.ProbeRequest{
-		OrderYamlContent: s["order_content"].([]byte),
-		SshPrivateKey:    s["ssh_key_content"].([]byte),
-	}
-
-	res, err := client.Probe(ctx, req)
-	if err != nil {
-		return fmt.Errorf("probe RPC failed: %w", err)
-	}
-	s["probe_session_id"] = res.GetProbeSessionId()
-	return nil
+func probeCallProbe(app *probeApp) error {
+	client := pb.NewSstHiCoreServiceClient(app.conn)
+	_, err := client.Probe(app.ctx, &pb.ProbeRequest{
+		OrderYamlContent: app.orderContent,
+		SshPrivateKey:    app.sshKey,
+	})
+	return err
 }
 
-func stepCallNormalize(s map[string]interface{}) error {
-	ctx := s["ctx"].(context.Context)
-	conn := s["grpc_conn"].(*grpc.ClientConn)
-	client := pb.NewSstHiCoreServiceClient(conn)
-
-	req := &pb.NormalizeRequest{
-		ProbeSessionId: s["probe_session_id"].(string),
-	}
-
-	res, err := client.NormalizeProbeData(ctx, req)
-	if err != nil {
-		return fmt.Errorf("normalize RPC failed: %w", err)
-	}
-	s["normalized_yaml"] = res.GetNormalizedYamlContent()
-	return nil
-}
-
-// RENAMED: Changed stepWriteOutput to stepWriteProbeOutput
-func stepWriteProbeOutput(s map[string]interface{}) error {
-	logger := s["log"].(sst.Logx)
-	ctx := s["ctx"].(context.Context)
-	yamlBytes := s["normalized_yaml"].([]byte)
-
-	projectRoot, ok := s["projectRoot"].(string)
-	if !ok || projectRoot == "" {
-		return fmt.Errorf("projectRoot not found in workflow state")
-	}
-
-	var data struct {
-		Metadata struct {
-			Identifiers struct {
-				SerialNumber string `yaml:"serialNumber"`
-			} `yaml:"identifiers"`
-		} `yaml:"metadata"`
-	}
-	if err := yaml.Unmarshal(yamlBytes, &data); err != nil {
-		return fmt.Errorf("could not parse normalized YAML to determine filename: %w", err)
-	}
-
-	id := data.Metadata.Identifiers.SerialNumber
-	if id == "" {
-		return fmt.Errorf("normalized YAML is missing metadata.identifiers.serialNumber")
-	}
-
-	filename := fmt.Sprintf("%s.hardware.yaml", id)
-	deliveriesDir := filepath.Join(projectRoot, "deliveries")
-	outputPath := filepath.Join(deliveriesDir, filename)
-
-	if err := os.MkdirAll(deliveriesDir, 0755); err != nil {
-		return fmt.Errorf("failed to create deliveries directory '%s': %w", deliveriesDir, err)
-	}
-
-	logger.Info(ctx, "Writing normalized hardware manifest", "path", outputPath)
-	return os.WriteFile(outputPath, yamlBytes, 0644)
+func probeCallNormalize(app *probeApp) error {
+	client := pb.NewSstHiCoreServiceClient(app.conn)
+	_, err := client.NormalizeProbeData(app.ctx, &pb.NormalizeRequest{})
+	return err
 }

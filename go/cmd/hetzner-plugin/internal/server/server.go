@@ -9,7 +9,7 @@ import (
 	"google.golang.org/grpc/status"
 	"gopkg.in/yaml.v3"
 
-	pb  "github.com/swiss-software-tool/runtime-smart/go/proto/external/v1"
+	pb "github.com/swiss-software-tool/runtime-smart/go/proto/external/v1"
 	sst "github.com/swiss-software-tool/runtime-smart/go/internal/sst"
 
 	"github.com/swiss-software-tool/runtime-smart/go/cmd/hetzner-plugin/internal/probe"
@@ -22,9 +22,9 @@ type Server struct {
 }
 
 // New creates a new server instance.
-func New(core sst.Core) *Server {
+func New(log sst.Logx) *Server {
 	return &Server{
-		log: core.Logx().Subsystem("plugind-server"),
+		log: log.Subsystem("plugin-server"),
 	}
 }
 
@@ -51,8 +51,7 @@ func (s *Server) Probe(ctx context.Context, req *pb.ProbeRequest) (*pb.ProbeResp
 		return nil, status.Error(codes.InvalidArgument, "hostname not found in order YAML")
 	}
 
-	err = probe.RunRemoteProbe(ctx, s.log, hostname, req.GetSshPrivateKey(), tempDir)
-	if err != nil {
+	if err := probe.RunRemoteProbe(ctx, s.log, hostname, req.GetSshPrivateKey(), tempDir); err != nil {
 		return nil, status.Errorf(codes.Internal, "remote probe failed: %v", err)
 	}
 
@@ -72,6 +71,6 @@ func (s *Server) NormalizeProbeData(ctx context.Context, req *pb.NormalizeReques
 }
 
 // RegisterService registers the server implementation with a gRPC server.
-func RegisterService(g *grpc.Server, core sst.Core) {
-	pb.RegisterSstHiCoreServiceServer(g, New(core))
+func RegisterService(g *grpc.Server, log sst.Logx) {
+	pb.RegisterSstHiCoreServiceServer(g, New(log))
 }

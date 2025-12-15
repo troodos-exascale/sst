@@ -8,6 +8,10 @@ import (
 	"strings"
 )
 
+type Project interface {
+	Activate(path, containerPath string, force bool) error
+}
+
 // projectManager is the unexported implementation of the Project interface.
 type projectManager struct{}
 
