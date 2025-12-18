@@ -1,10 +1,12 @@
 package sst
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -39,9 +41,7 @@ func StepsResume(r *StepsRunState) error {
 }
 
 // StepsFinish finalizes a steps run (currently a no-op, reserved).
-func StepsFinish(r *StepsRunState) error {
-	return nil
-}
+func StepsFinish(r *StepsRunState) error { return nil }
 
 //
 // =========================
@@ -64,6 +64,10 @@ type StepFunc func(ctx *StepsContext, state StepState) error
 type StepsContext struct {
 	StepName string
 	StepIdx  int
+
+	// Ctx is a context for structured logging/tracing.
+	// Callers may ignore it; existing code remains valid.
+	Ctx context.Context
 }
 
 // StepsRunState is the superblock / inode of a steps execution.
@@ -73,7 +77,10 @@ type StepsRunState struct {
 	State     StepState
 	persist   bool
 	statePath string
-	logf      func(format string, args ...any)
+
+	// Legacy logger callback (kept for compatibility).
+	// New structured logging uses LogxRoot() internally.
+	logf func(format string, args ...any)
 }
 
 //
@@ -89,8 +96,13 @@ func (r *StepsRunState) StepsAdd(name string, fn StepFunc) {
 	})
 }
 
-// StepsWithLogger attaches a logger to the run.
+// StepsWithLogger attaches a legacy formatter logger to the run.
+// Kept for compatibility: structured logging is handled via LogxRoot().
 func (r *StepsRunState) StepsWithLogger(logf func(format string, args ...any)) {
+	if logf == nil {
+		r.logf = func(string, ...any) {}
+		return
+	}
 	r.logf = logf
 }
 
@@ -110,29 +122,123 @@ func (r *StepsRunState) runAll() error {
 		_ = r.loadState()
 	}
 
+	// Base logging context for this run.
+	runCtx := context.Background()
+	runSub := "steps." + sanitizeForNamespace(r.Name)
+	runLog := LogxRoot().Subsystem(runSub).With("run", r.Name)
+
+	// Establish a base call path for downstream processes.
+	// We do not assume logx consumes env yet; we only emit it.
+	baseCallPath := currentCallPath()
+	if baseCallPath == "" {
+		baseCallPath = runSub
+	} else {
+		baseCallPath = baseCallPath + "." + runSub
+	}
+
 	for i, step := range r.Steps {
+		stepName := step.Name
+		stepIdx := i + 1
+
+		stepSub := runSub + "." + sanitizeForNamespace(stepName)
+		stepLog := LogxRoot().Subsystem(stepSub).With("run", r.Name, "step", stepName, "step_idx", stepIdx)
+
+		// Set SST_CALL_PATH for the duration of this step.
+		prevCallPath, hadPrev := os.LookupEnv("SST_CALL_PATH")
+		_ = os.Setenv("SST_CALL_PATH", baseCallPath+"."+sanitizeForNamespace(stepName))
+
 		ctx := &StepsContext{
-			StepName: step.Name,
-			StepIdx:  i + 1,
+			StepName: stepName,
+			StepIdx:  stepIdx,
+			Ctx:      runCtx,
 		}
 
-		r.logf("STEP %02d %s", ctx.StepIdx, ctx.StepName)
+		// Step start (legacy + structured)
+		r.logf("STEP %02d %s", stepIdx, stepName)
+		stepLog.Info(runCtx, "step.start")
 
-		if err := step.Run(ctx, r.State); err != nil {
-			r.logf("FAIL %02d %s: %v", ctx.StepIdx, ctx.StepName, err)
+		err := step.Run(ctx, r.State)
+
+		if err != nil {
+			// Failure marking is handled by structured logging.
+			stepLog.WithError(err).Error(runCtx, "step.fail")
+			r.logf("FAIL %02d %s: %v", stepIdx, stepName, err)
+
+			// Restore prior call path before returning.
+			if hadPrev {
+				_ = os.Setenv("SST_CALL_PATH", prevCallPath)
+			} else {
+				_ = os.Unsetenv("SST_CALL_PATH")
+			}
 			return err
 		}
 
 		if r.persist {
 			if err := r.saveState(); err != nil {
+				stepLog.WithError(err).Error(runCtx, "steps.persist.fail")
+				r.logf("FAIL %02d %s: %v", stepIdx, stepName, err)
+
+				// Restore prior call path before returning.
+				if hadPrev {
+					_ = os.Setenv("SST_CALL_PATH", prevCallPath)
+				} else {
+					_ = os.Unsetenv("SST_CALL_PATH")
+				}
 				return err
 			}
 		}
 
-		r.logf("OK   %02d %s", ctx.StepIdx, ctx.StepName)
+		stepLog.Info(runCtx, "step.ok")
+		r.logf("OK   %02d %s", stepIdx, stepName)
+
+		// Restore prior call path after successful step.
+		if hadPrev {
+			_ = os.Setenv("SST_CALL_PATH", prevCallPath)
+		} else {
+			_ = os.Unsetenv("SST_CALL_PATH")
+		}
 	}
 
+	runLog.Info(runCtx, "steps.run.ok")
 	return nil
+}
+
+func currentCallPath() string {
+	if v, ok := os.LookupEnv("SST_CALL_PATH"); ok {
+		return strings.TrimSpace(v)
+	}
+	return ""
+}
+
+func sanitizeForNamespace(s string) string {
+	s = strings.TrimSpace(strings.ToLower(s))
+	if s == "" {
+		return "step"
+	}
+
+	// Keep [a-z0-9._-], replace others with '_'.
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '.' || r == '_' || r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	out := b.String()
+
+	// Avoid empty/degenerate segments.
+	out = strings.Trim(out, "._-")
+	if out == "" {
+		return "step"
+	}
+	return out
 }
 
 //
