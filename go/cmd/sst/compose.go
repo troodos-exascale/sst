@@ -1,47 +1,19 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/swiss-software-tool/runtime-smart/go/internal/sst"
-	"gopkg.in/yaml.v3"
+
+	sst "github.com/swiss-software-tool/runtime-smart/go/internal/sst"
+
+	composepb "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/compose/v1"
+	"google.golang.org/protobuf/types/known/structpb"
 )
-
-//
-// =========================
-// Domain model (YAML types)
-// =========================
-
-type genericComponent struct {
-	Kind string `yaml:"kind"`
-}
-
-type componentDef struct {
-	Metadata struct {
-		Name string `yaml:"name"`
-	} `yaml:"metadata"`
-	Spec struct {
-		Provides interface{} `yaml:"provides"`
-		Requires interface{} `yaml:"requires"`
-	} `yaml:"spec"`
-}
-
-type OSImagePlanSpec struct {
-	StorageLayout string   `yaml:"storageLayout"`
-	Components    []string `yaml:"components"`
-}
-
-type OSImagePlan struct {
-	APIVersion string `yaml:"apiVersion"`
-	Kind       string `yaml:"kind"`
-	Metadata   struct {
-		Name string `yaml:"name"`
-	} `yaml:"metadata"`
-	Spec OSImagePlanSpec `yaml:"spec"`
-}
 
 //
 // =========================
@@ -59,7 +31,10 @@ type composeApp struct {
 	storageLayout string
 	osComponents  []string
 
-	definitions map[string]*componentDef
+	// component defs keyed by name
+	definitions map[string]*composepb.ComponentDef
+
+	// capability -> provider name
 	providesMap map[string]string
 
 	// behavior + framework
@@ -115,7 +90,7 @@ var composeCmd = &cobra.Command{
 		app := &composeApp{
 			outputName:     args[0],
 			withComponents: withComponents,
-			definitions:    make(map[string]*componentDef),
+			definitions:    make(map[string]*composepb.ComponentDef),
 			providesMap:    make(map[string]string),
 			methods:        newComposeMethods(),
 		}
@@ -146,6 +121,95 @@ func init() {
 		[]string{},
 		"Specify components (storage layout, OS, packages) to include.",
 	)
+}
+
+//
+// =========================
+// YAML/proto loading helpers
+// =========================
+
+// loadGeneric loads only "kind" from a component manifest.
+func loadGeneric(path string) (*composepb.GenericComponent, error) {
+	ctx := context.Background()
+	log := sst.LogxRoot().Subsystem("compose.load")
+
+	gen := &composepb.GenericComponent{}
+	yo := &sst.YamlObject{
+		Path:   path,
+		Schema: "sst.yaml.compose.v1.GenericComponent",
+		Kind:   "GenericComponent",
+		Msg:    gen,
+	}
+	if diags := yo.Load(ctx, log); diags != nil {
+		return nil, fmt.Errorf(diags.Error())
+	}
+	return gen, nil
+}
+
+// loadComponentDef loads the full component definition (metadata/spec).
+func loadComponentDef(path string) (*composepb.ComponentDef, error) {
+	ctx := context.Background()
+	log := sst.LogxRoot().Subsystem("compose.load")
+
+	def := &composepb.ComponentDef{}
+	yo := &sst.YamlObject{
+		Path:   path,
+		Schema: "sst.yaml.compose.v1.ComponentDef",
+		Kind:   "ComponentDef",
+		Msg:    def,
+	}
+	if diags := yo.Load(ctx, log); diags != nil {
+		return nil, fmt.Errorf(diags.Error())
+	}
+	return def, nil
+}
+
+// extractCapabilities converts "provides" YAML (list of maps) into a flat list of keys.
+// This preserves your current semantics: it only cares about the map keys.
+func extractCapabilities(v *structpb.Value) []string {
+	if v == nil {
+		return nil
+	}
+	lv := v.GetListValue()
+	if lv == nil {
+		return nil
+	}
+	var out []string
+	for _, item := range lv.Values {
+		sv := item.GetStructValue()
+		if sv == nil {
+			continue
+		}
+		for k := range sv.Fields {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// extractRequires splits "requires" into:
+// - direct component requires (strings)
+// - capability requires (map keys)
+func extractRequires(v *structpb.Value) (reqComponents []string, reqCaps []string) {
+	if v == nil {
+		return nil, nil
+	}
+	lv := v.GetListValue()
+	if lv == nil {
+		return nil, nil
+	}
+	for _, item := range lv.Values {
+		switch item.Kind.(type) {
+		case *structpb.Value_StringValue:
+			reqComponents = append(reqComponents, item.GetStringValue())
+		case *structpb.Value_StructValue:
+			sv := item.GetStructValue()
+			for k := range sv.Fields {
+				reqCaps = append(reqCaps, k)
+			}
+		}
+	}
+	return reqComponents, reqCaps
 }
 
 //
@@ -182,13 +246,8 @@ func composeLoadComponents(app *composeApp) error {
 			return fmt.Errorf("could not find component manifest for '%s'", name)
 		}
 
-		data, err := os.ReadFile(foundPath)
+		gen, err := loadGeneric(foundPath)
 		if err != nil {
-			return err
-		}
-
-		var gen genericComponent
-		if err := yaml.Unmarshal(data, &gen); err != nil {
 			return err
 		}
 
@@ -205,20 +264,21 @@ func composeLoadComponents(app *composeApp) error {
 		case "OSComponent":
 			app.osComponents = append(app.osComponents, name)
 
-			var def componentDef
-			if err := yaml.Unmarshal(data, &def); err != nil {
+			def, err := loadComponentDef(foundPath)
+			if err != nil {
 				return err
 			}
+			// Preserve old behavior: the name is the filename base.
+			if def.Metadata == nil {
+				def.Metadata = &composepb.ComponentMetadata{}
+			}
 			def.Metadata.Name = name
-			app.definitions[name] = &def
+			app.definitions[name] = def
 
-			if provides, ok := def.Spec.Provides.([]interface{}); ok {
-				for _, p := range provides {
-					if pm, ok := p.(map[string]interface{}); ok {
-						for k := range pm {
-							app.providesMap[k] = name
-						}
-					}
+			// Build providesMap exactly as before: capability key -> component name.
+			if def.Spec != nil {
+				for _, cap := range extractCapabilities(def.Spec.Provides) {
+					app.providesMap[cap] = name
 				}
 			}
 
@@ -236,26 +296,29 @@ func composeLoadComponents(app *composeApp) error {
 func composeValidateDeps(app *composeApp) error {
 	for _, name := range app.osComponents {
 		def := app.definitions[name]
-		if requires, ok := def.Spec.Requires.([]interface{}); ok {
-			for _, r := range requires {
-				switch v := r.(type) {
-				case string:
-					if _, ok := app.definitions[v]; !ok {
-						return fmt.Errorf(
-							"component '%s' requires '%s', which is not selected",
-							def.Metadata.Name, v,
-						)
-					}
-				case map[string]interface{}:
-					for k := range v {
-						if _, ok := app.providesMap[k]; !ok {
-							return fmt.Errorf(
-								"component '%s' requires capability '%s', which is not provided",
-								def.Metadata.Name, k,
-							)
-						}
-					}
-				}
+		if def == nil || def.Spec == nil {
+			continue
+		}
+
+		reqComps, reqCaps := extractRequires(def.Spec.Requires)
+
+		// direct component requires
+		for _, rc := range reqComps {
+			if _, ok := app.definitions[rc]; !ok {
+				return fmt.Errorf(
+					"component '%s' requires '%s', which is not selected",
+					def.Metadata.GetName(), rc,
+				)
+			}
+		}
+
+		// capability requires
+		for _, cap := range reqCaps {
+			if _, ok := app.providesMap[cap]; !ok {
+				return fmt.Errorf(
+					"component '%s' requires capability '%s', which is not provided",
+					def.Metadata.GetName(), cap,
+				)
 			}
 		}
 	}
@@ -263,26 +326,44 @@ func composeValidateDeps(app *composeApp) error {
 }
 
 func composeWritePlan(app *composeApp) error {
-	plan := OSImagePlan{
-		APIVersion: "sst.io/v1",
+	ctx := context.Background()
+	log := sst.LogxRoot().Subsystem("compose.write")
+
+	plan := &composepb.OSImagePlan{
+		ApiVersion: "sst.io/v1",
 		Kind:       "OSImagePlan",
-		Metadata:   struct{ Name string `yaml:"name"` }{Name: app.outputName},
-		Spec: OSImagePlanSpec{
+		Metadata: &composepb.PlanMetadata{
+			Name: app.outputName,
+		},
+		Spec: &composepb.OSImagePlanSpec{
 			StorageLayout: app.storageLayout,
-			Components:    app.osComponents,
+			Components:    append([]string{}, app.osComponents...),
 		},
 	}
 
-	data, err := yaml.Marshal(&plan)
-	if err != nil {
-		return err
+	out := app.outputName + ".plan.yaml"
+
+	yo := &sst.YamlObject{
+		Path:   out,
+		Schema: "sst.yaml.compose.v1.OSImagePlan",
+		Kind:   "OSImagePlan",
+		Msg:    plan,
 	}
 
-	out := app.outputName + ".plan.yaml"
-	if err := os.WriteFile(out, data, 0644); err != nil {
-		return err
+	if diags := yo.Save(ctx, log); diags != nil {
+		return fmt.Errorf(diags.Error())
 	}
 
 	fmt.Printf("Successfully generated validated plan: %s\n", out)
 	return nil
+}
+
+//
+// =========================
+// Small helpers
+// =========================
+
+func sanitizePath(s string) string {
+	s = strings.TrimSpace(s)
+	return s
 }

@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package sst.yaml.compose.v1;
+
+option go_package = "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/compose/v1;composepb";
+
+import "google/protobuf/struct.proto";
+
+// ============================================================================
+// Generic component envelope
+// Used for fast kind-dispatch before loading full specs
+// ============================================================================
+
+message GenericComponent {
+  string api_version = 1; // "sst.io/v1"
+  string kind        = 2; // "StorageLayout", "OSComponent", etc.
+}
+
+// ============================================================================
+// Component definitions (OSComponent)
+// ============================================================================
+
+message ComponentDef {
+  string api_version = 1;
+  string kind        = 2; // "OSComponent"
+
+  ComponentMetadata metadata = 3;
+  ComponentSpec     spec     = 4;
+}
+
+message ComponentMetadata {
+  string name = 1;
+}
+
+// NOTE:
+// `provides` and `requires` intentionally use google.protobuf.Value
+// because the YAML allows:
+//   - strings
+//   - maps
+//   - lists of maps
+// and compose.go only inspects *keys*, not values.
+// This preserves existing semantics exactly.
+
+message ComponentSpec {
+  google.protobuf.Value provides = 1;
+  google.protobuf.Value requires = 2;
+}
+
+// ============================================================================
+// Compose output plan (OS image plan)
+// ============================================================================
+
+message OSImagePlan {
+  string api_version = 1; // "sst.io/v1"
+  string kind        = 2; // "OSImagePlan"
+
+  PlanMetadata      metadata = 3;
+  OSImagePlanSpec   spec     = 4;
+}
+
+message PlanMetadata {
+  string name = 1;
+}
+
+message OSImagePlanSpec {
+  // Name of the selected StorageLayout component
+  string storage_layout = 1;
+
+  // Ordered list of OS component names
+  repeated string components = 2;
+}

@@ -14,3 +14,4 @@ package proto
 //go:generate protoc -I. --go_out=. --go_opt=paths=source_relative yaml/storage/v1/storage.proto
 //go:generate protoc -I. --go_out=. --go_opt=paths=source_relative yaml/runctl/v1/instance.proto
 //go:generate protoc -I. --go_out=. --go_opt=paths=source_relative yaml/mkimage/v1/image.proto
+//go:generate protoc -I. --go_out=. --go_opt=paths=source_relative yaml/compose/v1/compose.proto

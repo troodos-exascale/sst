@@ -3,202 +3,111 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
-	pb "github.com/swiss-software-tool/runtime-smart/go/proto/external/v1"
-	"github.com/swiss-software-tool/runtime-smart/go/internal/sst"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
-	"google.golang.org/grpc/codes"
-	"gopkg.in/yaml.v3"
+
+	sst "github.com/swiss-software-tool/runtime-smart/go/internal/sst"
+	hardwarepb "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/hardware/v1"
 )
-
-var (
-	orderArg   string
-	clusterArg string
-)
-
-//
-// =========================
-// Application root
-// =========================
-
-type probeApp struct {
-	// execution context
-	ctx context.Context
-	log sst.Logx
-
-	// resolved paths & data
-	repoRoot     string
-	projectRoot  string
-	manifestPath string
-
-	orderContent []byte
-	sshKey       []byte
-
-	// grpc
-	conn *grpc.ClientConn
-
-	// behavior + framework
-	methods probeMethods
-	steps   *sst.StepsRunState
-}
-
-//
-// =========================
-// Application methods table
-// =========================
-
-type probeMethods struct {
-	ResolveAndRead func(*probeApp) error
-	ConnectGrpc    func(*probeApp) error
-	CallProbe      func(*probeApp) error
-	CallNormalize  func(*probeApp) error
-}
-
-//
-// =========================
-// CLI wiring
-// =========================
 
 var probeCmd = &cobra.Command{
-	Use:   "probe [--order <order_path> | --cluster <cluster_name>]",
-	Short: "Probes a target host based on an order or cluster manifest.",
-	PreRunE: func(cmd *cobra.Command, args []string) error {
-		if _, err := os.Lstat("active-project"); os.IsNotExist(err) {
-			return fmt.Errorf("no active project set. Please run 'sst project <path>' first")
-		}
-		return nil
-	},
-	RunE: func(cmd *cobra.Command, args []string) error {
-
-		ctx, end := sst.StartSpan(context.Background(), "sst-probe")
-		defer end(nil)
-
-		app := &probeApp{
-			ctx: ctx,
-			log: sst.LogxRoot().Subsystem("sst-probe"),
-		}
-
-		app.methods = probeMethods{
-			ResolveAndRead: probeResolveAndRead,
-			ConnectGrpc:    probeConnectGrpc,
-			CallProbe:      probeCallProbe,
-			CallNormalize:  probeCallNormalize,
-		}
-
-		app.steps = sst.StepsInit("sst-probe-client")
-		app.steps.StepsWithLogger(func(f string, a ...any) {
-			app.log.Info(app.ctx, f, a...)
-		})
-
-		app.steps.StepsAdd("resolve and read config", func(ctx *sst.StepsContext, _ sst.StepState) error {
-			return app.methods.ResolveAndRead(app)
-		})
-		app.steps.StepsAdd("connect grpc", func(ctx *sst.StepsContext, _ sst.StepState) error {
-			return app.methods.ConnectGrpc(app)
-		})
-		app.steps.StepsAdd("call probe rpc", func(ctx *sst.StepsContext, _ sst.StepState) error {
-			return app.methods.CallProbe(app)
-		})
-		app.steps.StepsAdd("call normalize rpc", func(ctx *sst.StepsContext, _ sst.StepState) error {
-			return app.methods.CallNormalize(app)
-		})
-
-		err := sst.StepsRun(app.steps)
-		if app.conn != nil {
-			_ = app.conn.Close()
-		}
-		return err
-	},
+	Use:   "probe",
+	Short: "Probe local hardware and write hardware.yaml",
+	RunE:  runProbe,
 }
 
 func init() {
 	rootCmd.AddCommand(probeCmd)
-	probeCmd.Flags().StringVar(&orderArg, "order", "", "Path to order directory")
-	probeCmd.Flags().StringVar(&clusterArg, "cluster", "", "Cluster name")
-	probeCmd.MarkFlagsMutuallyExclusive("order", "cluster")
 }
 
-//
-// =========================
-// Method implementations
-// =========================
+func runProbe(cmd *cobra.Command, args []string) error {
+	ctx := context.Background()
+	log := sst.LogxRoot().Subsystem("probe")
 
-func probeResolveAndRead(app *probeApp) error {
-	repoRoot, err := os.Getwd()
+	outPath := "hardware.yaml"
+	if len(args) > 0 {
+		outPath = args[0]
+	}
+	outPath, _ = filepath.Abs(outPath)
+
+	devs, err := probeBlockDevices()
 	if err != nil {
 		return err
 	}
-	app.repoRoot = repoRoot
 
-	projectRoot, err := os.Readlink("active-project")
-	if err != nil {
-		return err
-	}
-	app.projectRoot = projectRoot
-
-	if orderArg != "" {
-		app.manifestPath = filepath.Join(projectRoot, "orders", orderArg, "order.yaml")
-	} else if clusterArg != "" {
-		return status.Errorf(codes.Unimplemented, "cluster probing not implemented")
-	} else {
-		return fmt.Errorf("either --order or --cluster must be specified")
+	probe := &hardwarepb.HardwareProbe{
+		ApiVersion: "sst.io/v1",
+		Kind:       "HardwareProbe",
+		Spec: &hardwarepb.HardwareSpec{
+			BlockDevices: devs,
+		},
 	}
 
-	orderBytes, err := os.ReadFile(app.manifestPath)
-	if err != nil {
-		return err
-	}
-	app.orderContent = orderBytes
-
-	var order struct {
-		Host struct {
-			SshKeyName string `yaml:"sshKeyName"`
-		} `yaml:"host"`
-	}
-	if err := yaml.Unmarshal(orderBytes, &order); err != nil {
-		return err
-	}
-	if order.Host.SshKeyName == "" {
-		return fmt.Errorf("host.sshKeyName missing")
+	yo := &sst.YamlObject{
+		Path:   outPath,
+		Schema: "sst.yaml.hardware.v1.HardwareProbe",
+		Kind:   "HardwareProbe",
+		Msg:    probe,
 	}
 
-	keyPath := filepath.Join(projectRoot, "secrets", order.Host.SshKeyName)
-	keyBytes, err := os.ReadFile(keyPath)
-	if err != nil {
-		return err
+	if diags := yo.Save(ctx, log); diags != nil {
+		return fmt.Errorf(diags.Error())
 	}
-	app.sshKey = keyBytes
+
+	log.Info(ctx, "hardware probe written", "path", outPath)
 	return nil
 }
 
-func probeConnectGrpc(app *probeApp) error {
-	conn, err := grpc.NewClient(
-		"localhost:50051",
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+func probeBlockDevices() ([]*hardwarepb.BlockDevice, error) {
+	cmd := exec.Command(
+		"lsblk",
+		"-dn",
+		"-o", "NAME,TYPE,MODEL,SERIAL",
 	)
+
+	out, err := cmd.Output()
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("lsblk failed: %w", err)
 	}
-	app.conn = conn
-	return nil
-}
 
-func probeCallProbe(app *probeApp) error {
-	client := pb.NewSstHiCoreServiceClient(app.conn)
-	_, err := client.Probe(app.ctx, &pb.ProbeRequest{
-		OrderYamlContent: app.orderContent,
-		SshPrivateKey:    app.sshKey,
-	})
-	return err
-}
+	var devices []*hardwarepb.BlockDevice
 
-func probeCallNormalize(app *probeApp) error {
-	client := pb.NewSstHiCoreServiceClient(app.conn)
-	_, err := client.NormalizeProbeData(app.ctx, &pb.NormalizeRequest{})
-	return err
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	for _, ln := range lines {
+		f := strings.Fields(ln)
+		if len(f) < 2 {
+			continue
+		}
+		if f[1] != "disk" {
+			continue
+		}
+
+		dev := &hardwarepb.BlockDevice{
+			Name:     f[0],
+			HostPath: "/dev/" + f[0],
+		}
+
+		if len(f) > 2 {
+			dev.Info = &hardwarepb.BlockDeviceInfo{
+				Model: f[2],
+			}
+		}
+		if len(f) > 3 {
+			if dev.Info == nil {
+				dev.Info = &hardwarepb.BlockDeviceInfo{}
+			}
+			dev.Info.Serial = f[3]
+		}
+
+		devices = append(devices, dev)
+	}
+
+	if len(devices) == 0 {
+		return nil, fmt.Errorf("no block devices found")
+	}
+
+	return devices, nil
 }

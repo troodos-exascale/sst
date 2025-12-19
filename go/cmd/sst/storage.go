@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/swiss-software-tool/runtime-smart/go/internal/sst"
+	sst "github.com/swiss-software-tool/runtime-smart/go/internal/sst"
 
 	hardwarepb "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/hardware/v1"
 	storagepb "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/storage/v1"
@@ -117,20 +117,19 @@ func storagePlanLoadProbe(app *storagePlanApp) error {
 
 	app.probe = &hardwarepb.HardwareProbe{}
 
-	obj := &sst.YamlObject{
+	yo := &sst.YamlObject{
 		Path:   app.nodeFile,
 		Schema: "sst.yaml.hardware.v1.HardwareProbe",
 		Kind:   "HardwareProbe",
 		Msg:    app.probe,
 	}
 
-	if diags := obj.Load(ctx, log); diags != nil {
+	if diags := yo.Load(ctx, log); diags != nil {
 		return fmt.Errorf(diags.Error())
 	}
 
 	if len(app.probe.Spec.BlockDevices) == 0 {
-		log.Diagnose(
-			ctx,
+		log.Diagnose(ctx,
 			"STORAGE_NO_BLOCK_DEVICES",
 			"no block devices found in hardware probe",
 			"path", app.nodeFile,
@@ -165,12 +164,8 @@ func storagePlanBuildLayout(app *storagePlanApp) error {
 	}
 
 	if len(app.probe.Spec.BlockDevices) < numDisks {
-		return fmt.Errorf(
-			"%s requires %d block devices, probe has %d",
-			raidLevel,
-			numDisks,
-			len(app.probe.Spec.BlockDevices),
-		)
+		return fmt.Errorf("%s requires %d block devices, probe has %d",
+			raidLevel, numDisks, len(app.probe.Spec.BlockDevices))
 	}
 
 	var deviceRefs []string
@@ -198,7 +193,6 @@ func storagePlanBuildLayout(app *storagePlanApp) error {
 			State: "plan-recorded",
 		},
 	}
-
 	app.layout.Spec.Pools = append(app.layout.Spec.Pools, pool)
 
 	for _, fsName := range app.filesetNames {
@@ -221,14 +215,14 @@ func storagePlanWriteOutput(app *storagePlanApp) error {
 	log := sst.LogxRoot().Subsystem("storage.write")
 	ctx := context.Background()
 
-	obj := &sst.YamlObject{
+	yo := &sst.YamlObject{
 		Path:   app.outputFile,
 		Schema: "sst.yaml.storage.v1.StorageLayout",
 		Kind:   "StorageLayout",
 		Msg:    app.layout,
 	}
 
-	if diags := obj.Save(ctx, log); diags != nil {
+	if diags := yo.Save(ctx, log); diags != nil {
 		return fmt.Errorf(diags.Error())
 	}
 
@@ -264,14 +258,14 @@ func reconcileMount(cmd *cobra.Command, args []string) error {
 
 	layout := &storagepb.StorageLayout{}
 
-	obj := &sst.YamlObject{
+	yo := &sst.YamlObject{
 		Path:   manifestFile,
 		Schema: "sst.yaml.storage.v1.StorageLayout",
 		Kind:   "StorageLayout",
 		Msg:    layout,
 	}
 
-	if diags := obj.Load(ctx, log); diags != nil {
+	if diags := yo.Load(ctx, log); diags != nil {
 		return fmt.Errorf(diags.Error())
 	}
 
@@ -325,7 +319,7 @@ func reconcileMount(cmd *cobra.Command, args []string) error {
 	}
 
 	if manifestModified {
-		if diags := obj.Save(ctx, log); diags != nil {
+		if diags := yo.Save(ctx, log); diags != nil {
 			return fmt.Errorf(diags.Error())
 		}
 	}
