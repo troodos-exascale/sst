@@ -1,20 +1,19 @@
+.DEFAULT_GOAL := build
 BINS := mkimage runctl sst hetzner-plugin
 ARCH := $(shell go env GOARCH)
 
-
-.PHONY: all build install clean generate tidy
-
-all: build
+.PHONY: build install clean generate tidy format
 
 tidy: generate
 	go mod tidy
+
+format:
+	go fmt ./...
 
 generate:
 	go generate ./...
 
 build: tidy
-	go generate ./...
-	go mod tidy
 	for b in $(BINS); do \
 		go build -o build/${ARCH}/$$b ./cmd/$$b ; \
 	done

@@ -32,12 +32,57 @@ type Logx interface {
 	Warn(ctx context.Context, msg string, kv ...any)
 	Error(ctx context.Context, msg string, kv ...any)
 	Subsystem(name string) Logx
+
+	// Diagnose emits a retention-worthy diagnostic event for the current trace.
+	// Any diagnostic latches "retain" for the trace until the root boundary emits a verdict.
+	Diagnose(ctx context.Context, code string, msg string, kv ...any)
+
+	// TraceVerdict emits a root-level verdict event for the current trace.
+	// Callers should only emit this at a root trace boundary (e.g. SafeExit for CLIs).
+	TraceVerdict(ctx context.Context, verdict string, kv ...any)
 }
 
 // LogxRoot creates a root logger writing to stdout.
 // It seeds execution context from environment.
 func LogxRoot() Logx {
 	return newLogxFromEnv(os.Stdout)
+}
+
+// WithCallPath returns a new context with the call path extended by elem.
+func WithCallPath(ctx context.Context, elem string) context.Context {
+	if elem == "" {
+		return ctx
+	}
+	if prev, ok := ctx.Value(callPathKey{}).(string); ok && prev != "" {
+		return context.WithValue(ctx, callPathKey{}, prev+"/"+elem)
+	}
+	return context.WithValue(ctx, callPathKey{}, elem)
+}
+
+// CallPath returns the current call path from context, if any.
+func CallPath(ctx context.Context) string {
+	if v, ok := ctx.Value(callPathKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// ExportCallPath exports the call path as environment variables
+// suitable for exec.Cmd.Env.
+func ExportCallPath(ctx context.Context) []string {
+	cp := CallPath(ctx)
+	if cp == "" {
+		return nil
+	}
+
+	// Preserve any existing value for debugging / nesting
+	if prev := os.Getenv("SST_CALL_PATH"); prev != "" {
+		cp = prev + "/" + cp
+	}
+
+	return []string{
+		"SST_CALL_PATH=" + cp,
+	}
 }
 
 //
@@ -53,7 +98,13 @@ type zl struct {
 
 // Initialize logger from environment.
 func newLogxFromEnv(w io.Writer) Logx {
-	zlog := zerolog.New(w).With().Timestamp().Logger()
+	var out io.Writer = w
+
+	// If attached to a terminal, mirror logs to stderr for human visibility.
+	if f, ok := w.(*os.File); ok && isTerminal(f) {
+		out = zerolog.MultiLevelWriter(w, os.Stderr)
+	}
+	zlog := zerolog.New(out).With().Timestamp().Logger()
 
 	callPath := strings.TrimSpace(os.Getenv("SST_CALL_PATH"))
 	if callPath != "" {
@@ -171,6 +222,33 @@ func (l *zl) Info(ctx context.Context, msg string, kv ...any)  { l.log(ctx, Leve
 func (l *zl) Warn(ctx context.Context, msg string, kv ...any)  { l.log(ctx, LevelWarn, msg, kv...) }
 func (l *zl) Error(ctx context.Context, msg string, kv ...any) { l.log(ctx, LevelError, msg, kv...) }
 
+// Diagnose implements Logx.Diagnose.
+func (l *zl) Diagnose(ctx context.Context, code string, msg string, kv ...any) {
+	// Latch retention for this trace.
+	if rs := getRunState(ctx); rs != nil {
+		rs.hasDiagnostic.Store(true)
+	}
+
+	// Emit a structured diagnostic event (stable + queryable).
+	fields := []any{
+		"diagnostic", true,
+		"retain", true,
+		"code", code,
+	}
+	fields = append(fields, kv...)
+	l.log(ctx, LevelError, msg, fields...)
+}
+
+// TraceVerdict implements Logx.TraceVerdict.
+// Emit only at a root trace boundary (process/request/job completion).
+func (l *zl) TraceVerdict(ctx context.Context, verdict string, kv ...any) {
+	fields := []any{
+		"verdict", verdict,
+	}
+	fields = append(fields, kv...)
+	l.log(ctx, LevelInfo, "trace.verdict", fields...)
+}
+
 //
 // =========================
 // Levels and config
@@ -281,6 +359,40 @@ func reloadDepthLimitFromEnv() {
 
 type depthKey struct{}
 type callPathKey struct{}
+type runStateKey struct{}
+type rootTraceKey struct{}
+
+// runState is per-trace mutable state carried in context.
+// It allows branches to latch "this trace is valuable" (diagnosed) without global state.
+type runState struct {
+	hasDiagnostic atomic.Bool
+}
+
+func getRunState(ctx context.Context) *runState {
+	if v := ctx.Value(runStateKey{}); v != nil {
+		if rs, ok := v.(*runState); ok {
+			return rs
+		}
+	}
+	return nil
+}
+
+func withRunState(ctx context.Context, rs *runState) context.Context {
+	return context.WithValue(ctx, runStateKey{}, rs)
+}
+
+func isRootTrace(ctx context.Context) bool {
+	if v := ctx.Value(rootTraceKey{}); v != nil {
+		if b, ok := v.(bool); ok {
+			return b
+		}
+	}
+	return false
+}
+
+func markRootTrace(ctx context.Context) context.Context {
+	return context.WithValue(ctx, rootTraceKey{}, true)
+}
 
 func withDepth(ctx context.Context, d int) context.Context {
 	return context.WithValue(ctx, depthKey{}, d)
@@ -323,6 +435,13 @@ func TracingEnabled() bool { return os.Getenv("SST_TRACING") == "1" }
 func StartSpan(ctx context.Context, name string) (context.Context, func(error)) {
 	parentDepth := getDepth(ctx)
 	childDepth := parentDepth + 1
+
+	// Ensure per-trace run state exists, and mark root boundary on the first span.
+	if parentDepth == 0 && getRunState(ctx) == nil {
+		rs := &runState{}
+		ctx = withRunState(ctx, rs)
+		ctx = markRootTrace(ctx)
+	}
 
 	if !TracingEnabled() {
 		return withDepth(ctx, childDepth), func(error) {}
@@ -447,13 +566,47 @@ func sanitize(s string) string {
 	}
 	return out
 }
+
 // SafeExit logs a final message (if logger is non-nil) and exits the process.
 // It allows log backends time to flush.
 func SafeExit(ctx context.Context, l Logx, exitCode int) {
-	if l != nil {
-		l.Info(ctx, "process.exit", "exit_code", exitCode)
+	if l == nil {
+		time.Sleep(10 * time.Millisecond)
+		os.Exit(exitCode)
+		return
 	}
-	// Small delay to allow async log sinks to flush.
+
+	// Emit a root-level verdict if this is the root trace boundary.
+	if isRootTrace(ctx) {
+		verdict := "discard"
+		if rs := getRunState(ctx); rs != nil && rs.hasDiagnostic.Load() {
+			verdict = "retain"
+		}
+
+		tid, sid := TraceIDs(ctx)
+		l.TraceVerdict(ctx, verdict,
+			"trace_id", tid,
+			"span_id", sid,
+			"exit_code", exitCode,
+		)
+
+		// If retained, also anchor the decision in the normal stream.
+		if verdict == "retain" {
+			l.Info(ctx, "execution diagnosed; retaining trace", "trace_id", tid)
+		}
+	}
+
+	l.Info(ctx, "process.exit", "exit_code", exitCode)
+
+	// Small delay to allow async log sinks/exporters to flush.
 	time.Sleep(10 * time.Millisecond)
 	os.Exit(exitCode)
+}
+
+func isTerminal(f *os.File) bool {
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	return (info.Mode() & os.ModeCharDevice) != 0
 }

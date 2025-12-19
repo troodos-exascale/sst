@@ -62,14 +62,12 @@ func (m storagePlanMethods) mustValidate() {
 
 //
 // ======================================================
-// compose-storageplan command (refactored)
+// compose-storageplan command
 // ======================================================
 
 var composeStoragePlanCmd = &cobra.Command{
 	Use:   "compose-storageplan",
 	Short: "Generates a declarative storage-layout.yaml from high-level intent.",
-	Long: `A planning command that takes a hardware probe file and user requirements
-to generate a detailed, declarative storage-layout.yaml manifest.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 
 		nodeFile, _ := cmd.Flags().GetString("node")
@@ -179,6 +177,7 @@ func storagePlanBuildLayout(app *storagePlanApp) error {
 		}
 		app.layout.Spec.Filesystems = append(app.layout.Spec.Filesystems, fs)
 	}
+
 	return nil
 }
 
@@ -191,29 +190,28 @@ func storagePlanWriteOutput(app *storagePlanApp) error {
 		return err
 	}
 	fmt.Printf("✅ Successfully generated '%s'\n", app.outputFile)
-	fmt.Println("   Review the file and change state to 'ready-for-implementation'.")
 	return nil
 }
 
 //
 // ======================================================
-// Existing execution commands (unchanged)
+// Execution commands
 // ======================================================
 
 var (
-	mkdevCmd      = &cobra.Command{Use: "mkdev", Short: "Idempotently create/provision devices from a manifest.", RunE: placeholderRunE}
-	destroydevCmd = &cobra.Command{Use: "destroydev", Short: "Idempotently destroy file-based devices from a manifest.", RunE: placeholderRunE}
-	ejectdevCmd   = &cobra.Command{Use: "ejectdev", Short: "Idempotently detach loopback devices from a manifest.", RunE: placeholderRunE}
+	mkdevCmd      = &cobra.Command{Use: "mkdev", RunE: placeholderRunE}
+	destroydevCmd = &cobra.Command{Use: "destroydev", RunE: placeholderRunE}
+	ejectdevCmd   = &cobra.Command{Use: "ejectdev", RunE: placeholderRunE}
 
-	mkpoolCmd      = &cobra.Command{Use: "mkpool", Short: "Idempotently create storage pools from a manifest.", RunE: placeholderRunE}
-	destroypoolCmd = &cobra.Command{Use: "destroypool", Short: "Idempotently destroy storage pools from a manifest.", RunE: placeholderRunE}
+	mkpoolCmd      = &cobra.Command{Use: "mkpool", RunE: placeholderRunE}
+	destroypoolCmd = &cobra.Command{Use: "destroypool", RunE: placeholderRunE}
 
-	formatCmd = &cobra.Command{Use: "format", Short: "Idempotently format a device with a filesystem.", RunE: placeholderRunE}
-	mountCmd  = &cobra.Command{Use: "mount", Short: "Idempotently mount a filesystem.", RunE: reconcileMount}
-	umountCmd = &cobra.Command{Use: "umount", Short: "Idempotently unmount a filesystem.", RunE: placeholderRunE}
+	formatCmd = &cobra.Command{Use: "format", RunE: placeholderRunE}
+	mountCmd  = &cobra.Command{Use: "mount", RunE: reconcileMount}
+	umountCmd = &cobra.Command{Use: "umount", RunE: placeholderRunE}
 
-	mkfsetCmd      = &cobra.Command{Use: "mkfset", Short: "Idempotently create a ZFS fileset.", RunE: placeholderRunE}
-	destroyfsetCmd = &cobra.Command{Use: "destroyfset", Short: "Idempotently destroy a ZFS fileset.", RunE: placeholderRunE}
+	mkfsetCmd      = &cobra.Command{Use: "mkfset", RunE: placeholderRunE}
+	destroyfsetCmd = &cobra.Command{Use: "destroyfset", RunE: placeholderRunE}
 )
 
 func reconcileMount(cmd *cobra.Command, args []string) error {
@@ -232,41 +230,44 @@ func reconcileMount(cmd *cobra.Command, args []string) error {
 			continue
 		}
 
-		log.Info(ctx, "Reconciling filesystem mount", "name", fs.Name)
 		runner := &sst.Runner{Log: log}
 
-		mountCtx := &sst.Context{
+		stepCtx := &sst.Context{
 			Description: fmt.Sprintf("Mount %s", fs.Name),
 			Action: func(ctx context.Context) (interface{}, error) {
+
 				if fs.Kind == "zfs-fileset" {
-					datasetName := fmt.Sprintf("%s/%s", fs.PoolRef, fs.Name)
-					return runner.Command("zfs", "mount", datasetName)(ctx)
+					ds := fmt.Sprintf("%s/%s", fs.PoolRef, fs.Name)
+					return sst.ExecShell(ctx, log, "zfs", "mount", ds)
 				}
-				opts := ""
+
+				args := []string{}
 				if len(fs.MountOptions) > 0 {
-					opts = "-o " + strings.Join(fs.MountOptions, ",")
+					args = append(args, "-o", strings.Join(fs.MountOptions, ","))
 				}
-				return runner.Command("mount", opts, fs.DeviceRef, fs.Mountpoint)(ctx)
+				args = append(args, fs.DeviceRef, fs.Mountpoint)
+
+				return sst.ExecShell(ctx, log, "mount", args...)
 			},
-			Interpret: func(result *sst.Result) ([]*sst.Context, error) {
-				if result.Error != nil {
-					if strings.Contains(result.Error.Error(), "already mounted") {
-						log.Info(ctx, "Filesystem already mounted", "name", fs.Name)
-					} else {
-						return nil, result.Error
+			Interpret: func(res *sst.Result) ([]*sst.Context, error) {
+				if res.Error != nil {
+					if strings.Contains(res.Error.Error(), "already mounted") {
+						log.Info(ctx, "already mounted", "fs", fs.Name)
+						return nil, nil
 					}
+					return nil, res.Error
 				}
 				return nil, nil
 			},
 			InterpretOnError: true,
 		}
 
-		if err := runner.Run(ctx, mountCtx); err != nil {
+		if err := runner.Run(ctx, stepCtx); err != nil {
 			layout.Spec.Filesystems[i].Status.State = "error"
 			layout.Spec.Filesystems[i].Status.Message = err.Error()
 		} else {
 			layout.Spec.Filesystems[i].Status.State = "deployed"
-			layout.Spec.Filesystems[i].Status.Message = "Successfully mounted."
+			layout.Spec.Filesystems[i].Status.Message = "mounted"
 		}
 		manifestModified = true
 	}
@@ -282,36 +283,31 @@ func reconcileMount(cmd *cobra.Command, args []string) error {
 }
 
 func placeholderRunE(cmd *cobra.Command, args []string) error {
-	fmt.Printf("'%s' command is not yet implemented.\n", cmd.CommandPath())
+	fmt.Printf("'%s' not yet implemented\n", cmd.CommandPath())
 	return nil
 }
 
 func init() {
 	rootCmd.AddCommand(
 		composeStoragePlanCmd,
-		mkdevCmd,
-		destroydevCmd,
-		ejectdevCmd,
-		mkpoolCmd,
-		destroypoolCmd,
-		formatCmd,
-		mountCmd,
-		umountCmd,
-		mkfsetCmd,
-		destroyfsetCmd,
+		mkdevCmd, destroydevCmd, ejectdevCmd,
+		mkpoolCmd, destroypoolCmd,
+		formatCmd, mountCmd, umountCmd,
+		mkfsetCmd, destroyfsetCmd,
 	)
 
-	composeStoragePlanCmd.Flags().String("node", "hardware.yaml", "Path to hardware probe YAML file.")
-	composeStoragePlanCmd.Flags().String("ossize", "30G", "Size to reserve for OS.")
-	composeStoragePlanCmd.Flags().String("remainder", "", "Remaining space (pool,raid).")
-	composeStoragePlanCmd.Flags().StringSlice("filesets", []string{}, "ZFS filesets.")
-	composeStoragePlanCmd.Flags().StringP("output", "o", "storage-layout.yaml", "Output path.")
+	composeStoragePlanCmd.Flags().String("node", "hardware.yaml", "Hardware probe file")
+	composeStoragePlanCmd.Flags().String("ossize", "30G", "OS size")
+	composeStoragePlanCmd.Flags().String("remainder", "", "pool,raid")
+	composeStoragePlanCmd.Flags().StringSlice("filesets", []string{}, "ZFS filesets")
+	composeStoragePlanCmd.Flags().StringP("output", "o", "storage-layout.yaml", "Output file")
 
-	for _, cmd := range []*cobra.Command{
-		mkdevCmd, destroydevCmd, ejectdevCmd, mkpoolCmd,
-		destroypoolCmd, formatCmd, mountCmd, umountCmd,
+	for _, c := range []*cobra.Command{
+		mkdevCmd, destroydevCmd, ejectdevCmd,
+		mkpoolCmd, destroypoolCmd,
+		formatCmd, mountCmd, umountCmd,
 		mkfsetCmd, destroyfsetCmd,
 	} {
-		cmd.Flags().String("manifest", "storage-layout.yaml", "Path to storage layout manifest.")
+		c.Flags().String("manifest", "storage-layout.yaml", "Manifest path")
 	}
 }

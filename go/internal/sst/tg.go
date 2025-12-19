@@ -1,13 +1,9 @@
 package sst
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
-	"strings"
-	"time"
 )
 
 // Result holds the outcome of an Action.
@@ -40,70 +36,6 @@ type Runner struct {
 	Debug   bool
 }
 
-// Command is a helper that creates an Action for running an external shell command.
-func (r *Runner) Command(name string, args ...string) Action {
-	return func(ctx context.Context) (interface{}, error) {
-		cmdStr := fmt.Sprintf("%s %s", name, strings.Join(args, " "))
-
-		if r.DryRun {
-			// In DryRun, console output is always printed, ignoring Silent.
-			fmt.Fprintf(os.Stderr, "[DRY-RUN] %s\n", cmdStr)
-			r.Log.Info(ctx, "Dry run", "command", cmdStr)
-			return "", nil // Return success for dry runs to allow graph traversal.
-		}
-
-		isSilent := r.Silent
-		if r.Debug {
-			isSilent = false // Debug mode forces console output.
-		}
-
-		if !isSilent {
-			fmt.Fprintf(os.Stderr, "==> EXEC: %s\n", cmdStr)
-		}
-
-		r.Log.Info(ctx, "Executing command", "command", cmdStr)
-		start := time.Now()
-
-		cmd := exec.CommandContext(ctx, name, args...)
-		var stdout, stderr bytes.Buffer
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-
-		err := cmd.Run()
-		duration := time.Since(start)
-
-		stdoutStr := strings.TrimSpace(stdout.String())
-		stderrStr := strings.TrimSpace(stderr.String())
-
-		exitCode := 0
-		if err != nil {
-			if exitError, ok := err.(*exec.ExitError); ok {
-				exitCode = exitError.ExitCode()
-			} else {
-				exitCode = -1 // Indicates a non-exit error (e.g., command not found).
-			}
-		}
-
-		logFields := []interface{}{
-			"command", cmdStr, "duration", duration.String(), "exit_code", exitCode,
-		}
-		if stderrStr != "" {
-			logFields = append(logFields, "stderr", stderrStr)
-		}
-		isVerbose := r.Verbose || r.Debug
-		if isVerbose && stdoutStr != "" {
-			logFields = append(logFields, "stdout", stdoutStr)
-		}
-
-		if err != nil {
-			r.Log.Error(ctx, "Command finished with an error", logFields...)
-			return stdoutStr, fmt.Errorf("command failed with exit code %d: %s", exitCode, stderrStr)
-		}
-
-		r.Log.Info(ctx, "Command successful", logFields...)
-		return stdoutStr, nil
-	}
-}
 
 // Run is the main entry point for the executor.
 func (r *Runner) Run(ctx context.Context, rootCtx *Context) error {
