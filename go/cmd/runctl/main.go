@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -13,9 +14,11 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v3"
 
 	rtsst "github.com/swiss-software-tool/runtime-smart/go/internal/rtsst"
+	sst "github.com/swiss-software-tool/runtime-smart/go/internal/sst"
+
+	runctlpb "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/runctl/v1"
 )
 
 var (
@@ -117,10 +120,74 @@ func sshCmd() *cobra.Command {
 	}
 }
 
+/* ======================= instance.yaml loading ======================= */
+
+func loadInstance(instDir string) (*runctlpb.Instance, error) {
+	log := sst.LogxRoot().Subsystem("runctl.instance")
+	ctx := context.Background()
+
+	p := filepath.Join(instDir, "instance.yaml")
+	inst := &runctlpb.Instance{}
+
+	yo := &sst.YamlObject{
+		Path:   p,
+		Schema: "sst.yaml.runctl.v1.Instance",
+		Kind:   "Instance",
+		Msg:    inst,
+	}
+	if diags := yo.Load(ctx, log); diags != nil {
+		return nil, fmt.Errorf(diags.Error())
+	}
+	if inst.Spec == nil {
+		log.Diagnose(ctx, "INSTANCE_SPEC_MISSING", "instance.spec missing", "path", p)
+		return nil, fmt.Errorf("instance.spec missing in %s", p)
+	}
+	return inst, nil
+}
+
+func resolvePath(instDir, p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	if filepath.IsAbs(p) {
+		return p
+	}
+	return filepath.Join(instDir, p)
+}
+
+func diskAlreadyListed(instDir string, want string, disks []*runctlpb.Disk) bool {
+	wantAbs := resolvePath(instDir, want)
+	for _, d := range disks {
+		if d == nil {
+			continue
+		}
+		if resolvePath(instDir, d.Path) == wantAbs {
+			return true
+		}
+	}
+	return false
+}
+
+func netArg(mac, mode string) string {
+	mode = strings.TrimSpace(mode)
+	if mode == "" {
+		mode = "nat"
+	}
+	mac = strings.TrimSpace(mac)
+	if mac == "" {
+		return mode
+	}
+	return fmt.Sprintf("%s@%s", mac, mode)
+}
+
 /* ======================= helpers ======================= */
 
-func instanceIP(cfg *rtsst.RuntimeConfig) (string, error) {
-	mac := strings.ToLower(cfg.Network.MAC)
+func instanceIP(mac string) (string, error) {
+	mac = strings.ToLower(strings.TrimSpace(mac))
+	if mac == "" {
+		return "", fmt.Errorf("instance has no network.mac; cannot locate IP")
+	}
 
 	out, err := exec.Command("arp", "-a").CombinedOutput()
 	if err == nil {
@@ -155,19 +222,7 @@ func instanceIP(cfg *rtsst.RuntimeConfig) (string, error) {
 		}
 	}
 
-	return "", fmt.Errorf("no IP found for MAC %s", cfg.Network.MAC)
-}
-
-func loadConfig(instDir string) (*rtsst.RuntimeConfig, error) {
-	data, err := os.ReadFile(filepath.Join(instDir, "runtime.yaml"))
-	if err != nil {
-		return nil, err
-	}
-	var cfg rtsst.RuntimeConfig
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
-		return nil, err
-	}
-	return &cfg, nil
+	return "", fmt.Errorf("no IP found for MAC %s", mac)
 }
 
 func parseMemorySizeMiB(s string) (uint64, error) {
@@ -205,75 +260,108 @@ func startInstance(name string) error {
 	}
 
 	instDir, _ := filepath.Abs(rtsst.InstanceDir(name))
-	cfg, err := loadConfig(instDir)
+
+	// Keep existing behavior: ensure cidata.iso is up-to-date if present.
+	_ = rtsst.UpdateCIDATAISO(instDir)
+
+	inst, err := loadInstance(instDir)
 	if err != nil {
 		return err
 	}
+	spec := inst.Spec
 
-	cpu := cfg.CPUCount
+	// resources
+	cpu := int(spec.CpuCount)
 	if cpu <= 0 {
 		cpu = 4
 	}
-
-	if err := rtsst.UpdateCIDATAISO(instDir); err != nil {
-		return fmt.Errorf("failed to update cidata.iso")
-	}
-
-	memMiB, err := parseMemorySizeMiB(cfg.MemorySize)
+	memMiB, err := parseMemorySizeMiB(spec.MemorySize)
 	if err != nil {
 		return err
 	}
 
+	// base args
 	args := []string{
-		"--name", cfg.Name,
-		"--net", fmt.Sprintf("%s@%s", cfg.Network.MAC, cfg.Network.Mode),
+		"--name", spec.Name,
+		"--net", netArg(spec.Network.GetMac(), spec.Network.GetMode()),
 		"--cpu-count", strconv.Itoa(cpu),
 		"--memory-size", strconv.FormatUint(memMiB, 10),
 	}
 
-	if cfg.CIDataDisk != "" {
-		args = append(args, "--disk", cfg.CIDataDisk)
+	// bootloader wiring
+	boot := strings.ToLower(strings.TrimSpace(spec.Boot))
+	switch boot {
+	case "efi":
+		args = append(args, "--bootloader", "efi")
+
+		efiVars := spec.EfiVars
+		if strings.TrimSpace(efiVars) == "" {
+			efiVars = "efi-vars"
+		}
+		args = append(args, "--efi-vars", resolvePath(instDir, efiVars))
+
+	case "kernel":
+		if strings.TrimSpace(spec.Kernel) == "" {
+			return fmt.Errorf("boot=kernel requires spec.kernel")
+		}
+		args = append(args, "--bootloader", "linux", "--kernel", resolvePath(instDir, spec.Kernel))
+		if strings.TrimSpace(spec.Initrd) != "" {
+			args = append(args, "--initrd", resolvePath(instDir, spec.Initrd))
+		}
+		if strings.TrimSpace(spec.Params) != "" {
+			args = append(args, "--params", spec.Params)
+		}
+
+	default:
+		return fmt.Errorf("invalid spec.boot %q (expected 'efi' or 'kernel')", spec.Boot)
 	}
 
-	if cfg.Boot == "efi" {
-		args = append(args,
-			"--bootloader", "efi",
-			"--efi-vars", filepath.Join(instDir, "efi-vars"),
-			"--rwdisk", cfg.SystemDisk,
-		)
-		for _, d := range cfg.DataDisks {
-			if d.Mode == "rw" {
-				args = append(args, "--rwdisk", d.Path)
-			} else {
-				args = append(args, "--disk", d.Path)
-			}
-		}
-	} else {
-		if cfg.Kernel == "" {
-			return fmt.Errorf("kernel boot requires 'kernel' field")
-		}
-		args = append(args, "--bootloader", "linux", "--kernel", cfg.Kernel)
-		if cfg.Initrd != "" {
-			args = append(args, "--initrd", cfg.Initrd)
-		}
-		args = append(args, "--rwdisk", cfg.SystemDisk)
-		if cfg.Params != "" {
-			args = append(args, "--params", cfg.Params)
-		}
-		for _, d := range cfg.DataDisks {
-			if d.Mode == "rw" {
-				args = append(args, "--rwdisk", d.Path)
-			} else {
-				args = append(args, "--disk", d.Path)
-			}
+	// system disk: spec.image (treated as RW)
+	if strings.TrimSpace(spec.Image) == "" {
+		return fmt.Errorf("spec.image missing (system disk path)")
+	}
+	args = append(args, "--rwdisk", resolvePath(instDir, spec.Image))
+
+	// optional auto-attach cidata.iso if present and not already listed
+	if _, err := os.Stat(filepath.Join(instDir, "cidata.iso")); err == nil {
+		if !diskAlreadyListed(instDir, "cidata.iso", spec.Disks) {
+			args = append(args, "--disk", filepath.Join(instDir, "cidata.iso"))
 		}
 	}
 
-	for _, s := range cfg.Shares {
-		args = append(args, "--folder", fmt.Sprintf("%s:%s", s.Host, s.Guest))
+	// extra disks
+	for _, d := range spec.Disks {
+		if d == nil {
+			continue
+		}
+		p := resolvePath(instDir, d.Path)
+		if p == "" {
+			continue
+		}
+		mode := strings.ToLower(strings.TrimSpace(d.Mode))
+		if mode == "rw" {
+			args = append(args, "--rwdisk", p)
+		} else {
+			// default: ro
+			args = append(args, "--disk", p)
+		}
 	}
 
-	exeName := cfg.Name
+	// shares
+	for _, sh := range spec.Shares {
+		if sh == nil {
+			continue
+		}
+		host := strings.TrimSpace(sh.Host)
+		guest := strings.TrimSpace(sh.Guest)
+		if host == "" || guest == "" {
+			continue
+		}
+		args = append(args, "--folder", fmt.Sprintf("%s:%s", host, guest))
+	}
+
+	// symlink runvm launcher (same as previous runctl behavior)
+	exeName := spec.Name
 	exePath := filepath.Join(instDir, exeName)
 	_ = os.Remove(exePath)
 	if err := os.Symlink("/usr/local/bin/runvm", exePath); err != nil {
@@ -291,7 +379,7 @@ func startInstance(name string) error {
 	}
 
 	lp := rtsst.LockFilePath(name)
-	_ = rtsst.WriteLock(lp, cfg.Name, cmd.Process.Pid)
+	_ = rtsst.WriteLock(lp, spec.Name, cmd.Process.Pid)
 	return nannyWait(cmd, lp, cmd.Process.Pid)
 }
 
@@ -318,14 +406,18 @@ func nannyWait(cmd *exec.Cmd, lock string, pid int) error {
 }
 
 func sshToInstance(name string) error {
-	cfg, err := loadConfig(rtsst.InstanceDir(name))
+	instDir := rtsst.InstanceDir(name)
+	inst, err := loadInstance(instDir)
 	if err != nil {
 		return err
 	}
-	ip, err := instanceIP(cfg)
+	spec := inst.Spec
+
+	ip, err := instanceIP(spec.Network.GetMac())
 	if err != nil {
 		return err
 	}
+
 	u, _ := user.Current()
 	cmd := exec.Command("ssh",
 		fmt.Sprintf("%s@%s", u.Username, ip),

@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package sst.yaml.hardware.v1;
+
+option go_package = "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/hardware/v1;hardwarepb";
+
+// -----------------------------------------------------------------------------
+// HardwareProbe
+// -----------------------------------------------------------------------------
+
+message HardwareProbe {
+  string api_version = 1; // "sst.io/v1"
+  string kind        = 2; // "HardwareProbe"
+
+  HardwareSpec spec = 3;
+}
+
+// -----------------------------------------------------------------------------
+// Spec
+// -----------------------------------------------------------------------------
+
+message HardwareSpec {
+  repeated BlockDevice block_devices = 1;
+}
+
+// -----------------------------------------------------------------------------
+// Block devices
+// -----------------------------------------------------------------------------
+
+message BlockDevice {
+  string name      = 1;
+  string host_path = 2; // e.g. /dev/nvme0n1
+
+  BlockDeviceInfo info = 3;
+}
+
+// -----------------------------------------------------------------------------
+// Optional metadata (kept loose on purpose)
+// -----------------------------------------------------------------------------
+
+message BlockDeviceInfo {
+  uint64 size_bytes = 1;
+  string model      = 2;
+  string serial     = 3;
+  string bus        = 4;
+}

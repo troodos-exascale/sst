@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
+
 	"github.com/swiss-software-tool/runtime-smart/go/internal/sst"
-	"gopkg.in/yaml.v3"
+
+	hardwarepb "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/hardware/v1"
+	storagepb "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/storage/v1"
 )
 
 //
@@ -24,9 +26,9 @@ type storagePlanApp struct {
 	filesetNames  []string
 	outputFile    string
 
-	// derived state
-	probe  sst.HardwareProbe
-	layout sst.StorageLayout
+	// derived state (PROTO)
+	probe  *hardwarepb.HardwareProbe
+	layout *storagepb.StorageLayout
 
 	// behavior + framework
 	methods storagePlanMethods
@@ -110,12 +112,32 @@ var composeStoragePlanCmd = &cobra.Command{
 // ======================================================
 
 func storagePlanLoadProbe(app *storagePlanApp) error {
-	if err := sst.LoadManifest(app.nodeFile, &app.probe); err != nil {
-		return err
+	log := sst.LogxRoot().Subsystem("storage.probe")
+	ctx := context.Background()
+
+	app.probe = &hardwarepb.HardwareProbe{}
+
+	obj := &sst.YamlObject{
+		Path:   app.nodeFile,
+		Schema: "sst.yaml.hardware.v1.HardwareProbe",
+		Kind:   "HardwareProbe",
+		Msg:    app.probe,
 	}
+
+	if diags := obj.Load(ctx, log); diags != nil {
+		return fmt.Errorf(diags.Error())
+	}
+
 	if len(app.probe.Spec.BlockDevices) == 0 {
+		log.Diagnose(
+			ctx,
+			"STORAGE_NO_BLOCK_DEVICES",
+			"no block devices found in hardware probe",
+			"path", app.nodeFile,
+		)
 		return fmt.Errorf("no block devices found in probe file %s", app.nodeFile)
 	}
+
 	return nil
 }
 
@@ -128,9 +150,10 @@ func storagePlanValidate(app *storagePlanApp) error {
 }
 
 func storagePlanBuildLayout(app *storagePlanApp) error {
-	app.layout = sst.StorageLayout{
-		APIVersion: "sst.io/v1",
+	app.layout = &storagepb.StorageLayout{
+		ApiVersion: "sst.io/v1",
 		Kind:       "StorageLayout",
+		Spec:       &storagepb.StorageSpec{},
 	}
 
 	parts := strings.Split(app.remainderSpec, ",")
@@ -142,38 +165,51 @@ func storagePlanBuildLayout(app *storagePlanApp) error {
 	}
 
 	if len(app.probe.Spec.BlockDevices) < numDisks {
-		return fmt.Errorf("%s requires %d block devices, probe has %d",
-			raidLevel, numDisks, len(app.probe.Spec.BlockDevices))
+		return fmt.Errorf(
+			"%s requires %d block devices, probe has %d",
+			raidLevel,
+			numDisks,
+			len(app.probe.Spec.BlockDevices),
+		)
 	}
 
 	var deviceRefs []string
 	for i := 0; i < numDisks; i++ {
 		pdev := app.probe.Spec.BlockDevices[i]
-		dev := sst.Device{
+
+		dev := &storagepb.Device{
 			Name:      fmt.Sprintf("disk%d", i),
 			Kind:      "block-device",
 			DeviceRef: pdev.HostPath,
-			Status:    sst.ResourceStatus{State: "plan-recorded"},
+			Status: &storagepb.ResourceStatus{
+				State: "plan-recorded",
+			},
 		}
+
 		app.layout.Spec.Devices = append(app.layout.Spec.Devices, dev)
 		deviceRefs = append(deviceRefs, dev.Name)
 	}
 
-	pool := sst.Pool{
+	pool := &storagepb.Pool{
 		Name:      poolName,
 		RaidLevel: raidLevel,
 		Devices:   deviceRefs,
-		Status:    sst.ResourceStatus{State: "plan-recorded"},
+		Status: &storagepb.ResourceStatus{
+			State: "plan-recorded",
+		},
 	}
+
 	app.layout.Spec.Pools = append(app.layout.Spec.Pools, pool)
 
 	for _, fsName := range app.filesetNames {
-		fs := sst.Filesystem{
+		fs := &storagepb.Filesystem{
 			Name:       fmt.Sprintf("%s-data", fsName),
-			Kind:       "zfs-fileset",
+			Kind:       storagepb.Filesystem_ZFS_FILESET,
 			PoolRef:    pool.Name,
 			Mountpoint: fmt.Sprintf("/mnt/data/%s", fsName),
-			Status:     sst.ResourceStatus{State: "plan-recorded"},
+			Status: &storagepb.ResourceStatus{
+				State: "plan-recorded",
+			},
 		}
 		app.layout.Spec.Filesystems = append(app.layout.Spec.Filesystems, fs)
 	}
@@ -182,20 +218,27 @@ func storagePlanBuildLayout(app *storagePlanApp) error {
 }
 
 func storagePlanWriteOutput(app *storagePlanApp) error {
-	out, err := yaml.Marshal(&app.layout)
-	if err != nil {
-		return err
+	log := sst.LogxRoot().Subsystem("storage.write")
+	ctx := context.Background()
+
+	obj := &sst.YamlObject{
+		Path:   app.outputFile,
+		Schema: "sst.yaml.storage.v1.StorageLayout",
+		Kind:   "StorageLayout",
+		Msg:    app.layout,
 	}
-	if err := os.WriteFile(app.outputFile, out, 0644); err != nil {
-		return err
+
+	if diags := obj.Save(ctx, log); diags != nil {
+		return fmt.Errorf(diags.Error())
 	}
+
 	fmt.Printf("✅ Successfully generated '%s'\n", app.outputFile)
 	return nil
 }
 
 //
 // ======================================================
-// Execution commands
+// Execution commands (mount path)
 // ======================================================
 
 var (
@@ -219,12 +262,21 @@ func reconcileMount(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 	manifestFile, _ := cmd.Flags().GetString("manifest")
 
-	var layout sst.StorageLayout
-	if err := sst.LoadManifest(manifestFile, &layout); err != nil {
-		return err
+	layout := &storagepb.StorageLayout{}
+
+	obj := &sst.YamlObject{
+		Path:   manifestFile,
+		Schema: "sst.yaml.storage.v1.StorageLayout",
+		Kind:   "StorageLayout",
+		Msg:    layout,
+	}
+
+	if diags := obj.Load(ctx, log); diags != nil {
+		return fmt.Errorf(diags.Error())
 	}
 
 	manifestModified := false
+
 	for i, fs := range layout.Spec.Filesystems {
 		if fs.Status.State != "ready-for-implementation" {
 			continue
@@ -236,7 +288,7 @@ func reconcileMount(cmd *cobra.Command, args []string) error {
 			Description: fmt.Sprintf("Mount %s", fs.Name),
 			Action: func(ctx context.Context) (interface{}, error) {
 
-				if fs.Kind == "zfs-fileset" {
+				if fs.Kind == storagepb.Filesystem_ZFS_FILESET {
 					ds := fmt.Sprintf("%s/%s", fs.PoolRef, fs.Name)
 					return sst.ExecShell(ctx, log, "zfs", "mount", ds)
 				}
@@ -273,12 +325,11 @@ func reconcileMount(cmd *cobra.Command, args []string) error {
 	}
 
 	if manifestModified {
-		out, err := yaml.Marshal(&layout)
-		if err != nil {
-			return err
+		if diags := obj.Save(ctx, log); diags != nil {
+			return fmt.Errorf(diags.Error())
 		}
-		return os.WriteFile(manifestFile, out, 0644)
 	}
+
 	return nil
 }
 

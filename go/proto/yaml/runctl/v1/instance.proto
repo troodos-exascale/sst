@@ -1,0 +1,80 @@
+syntax = "proto3";
+
+package sst.yaml.runctl.v1;
+
+option go_package = "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/runctl/v1;runctlpb";
+
+// -----------------------------------------------------------------------------
+// Instance (top-level object)
+// -----------------------------------------------------------------------------
+
+message Instance {
+  string api_version = 1; // "sst.io/v1"
+  string kind        = 2; // "Instance"
+
+  InstanceSpec spec = 3;
+}
+
+// -----------------------------------------------------------------------------
+// Spec
+// -----------------------------------------------------------------------------
+
+message InstanceSpec {
+  string name = 1;
+
+  // Base image reference (path or logical name)
+  string image = 2;
+
+  // Boot mode: "efi" or "kernel"
+  string boot = 3;
+
+  // Explicit kernel/initrd (used when boot == "kernel")
+  string kernel = 4;
+  string initrd = 5;
+
+  // Kernel command-line parameters
+  string params = 6;
+
+  // Resources
+  int32 cpu_count = 7;
+  string memory_size = 8;
+
+  // Attached disks
+  repeated Disk disks = 9;
+
+  // Host ↔ guest shares
+  repeated Share shares = 10;
+
+  // Networking
+  Network network = 11;
+
+  // EFI variables store (used when boot == "efi")
+  string efi_vars = 12;
+}
+
+// -----------------------------------------------------------------------------
+// Disk
+// -----------------------------------------------------------------------------
+
+message Disk {
+  string path = 1;  // e.g. data.img
+  string mode = 2;  // "rw" or "ro"
+}
+
+// -----------------------------------------------------------------------------
+// Share
+// -----------------------------------------------------------------------------
+
+message Share {
+  string host  = 1;
+  string guest = 2;
+}
+
+// -----------------------------------------------------------------------------
+// Network
+// -----------------------------------------------------------------------------
+
+message Network {
+  string mac = 1;
+  string mode = 2;
+}

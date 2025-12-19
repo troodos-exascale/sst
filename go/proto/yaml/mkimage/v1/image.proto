@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package sst.yaml.mkimage.v1;
+
+option go_package = "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/mkimage/v1;mkimagepb";
+
+// Matches go/internal/rtsst/write_yaml.go (ImageYAML + Source)
+// and replaces go/internal/rtsst/schema.cue validation.
+
+message ImageYAML {
+  ImageMeta image = 1;
+  repeated Source sources = 2;
+}
+
+message ImageMeta {
+  string name = 1;
+  string version = 2;
+  string description = 3;
+}
+
+message Source {
+  string name = 1;
+  string upstream = 2;
+  string sha256 = 3;
+  string format = 4;
+  string retrieved_at = 5;
+}

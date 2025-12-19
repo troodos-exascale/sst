@@ -1,44 +1,36 @@
 package main
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
-	"github.com/spf13/cobra"
-	"gopkg.in/yaml.v3"
-	"net/url"
+	"io"
 	"os"
-	"os/exec"
-	"os/user"
-	"path"
 	"path/filepath"
-	rtsst "github.com/swiss-software-tool/runtime-smart/go/internal/rtsst"
 	"strings"
 	"time"
+
+	"github.com/spf13/cobra"
+
+	mkimagepb "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/mkimage/v1"
+	runctlpb "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/runctl/v1"
+
+	sst "github.com/swiss-software-tool/runtime-smart/go/internal/sst"
+	rtsst "github.com/swiss-software-tool/runtime-smart/go/internal/rtsst"
 )
 
 var (
 	flagRoot    string
 	flagForce   bool
 	flagVerbose bool
-	rootCmd     = &cobra.Command{
-		Use:           "mkimage",
-		Short:         "Create SST VM image directories from upstream sources",
-		Long:          "mkimage pulls, pushes, builds runtime images and instances",
-		SilenceUsage:  true,
-		SilenceErrors: true,
-	}
 )
 
-func init() {
-	rootCmd.AddCommand(pullvmCmd)
-	rootCmd.AddCommand(instanceCmd)
-	home, _ := os.UserHomeDir()
-	defaultRoot := filepath.Join(home, ".runtimes")
-	rootCmd.PersistentFlags().StringVarP(&flagRoot, "dir", "d", defaultRoot,
-		"Runtime root directory (e.g. /Users/you/.runtimes)")
-	rootCmd.PersistentFlags().BoolVarP(&flagVerbose, "verbose", "v", false,
-		"Verbose logging")
-	rootCmd.PersistentFlags().BoolVarP(&flagForce, "force", "f", false,
-		"Overwrite existing image directory if it exists")
+var rootCmd = &cobra.Command{
+	Use:           "mkimage",
+	Short:         "Create SST VM image directories from upstream sources",
+	SilenceUsage:  true,
+	SilenceErrors: true,
 }
 
 func main() {
@@ -48,257 +40,170 @@ func main() {
 	}
 }
 
+func init() {
+	home, _ := os.UserHomeDir()
+	defaultRoot := filepath.Join(home, ".runtimes")
 
-var instanceCmd = &cobra.Command{
-	Use:   "instance <image-file> <name>",
-	Short: "Create an instance directory from an image",
-	Args:  cobra.ExactArgs(2),
-	RunE: func(cmd *cobra.Command, args []string) error {
-		imageFile := args[0]
-		name := args[1]
+	rootCmd.PersistentFlags().StringVarP(&flagRoot, "dir", "d", defaultRoot, "Runtime root directory")
+	rootCmd.PersistentFlags().BoolVarP(&flagVerbose, "verbose", "v", false, "Verbose logging")
+	rootCmd.PersistentFlags().BoolVarP(&flagForce, "force", "f", false, "Overwrite existing image directory")
 
-		instDir := rtsst.InstanceDir(name)
-		if st, err := os.Stat(instDir); err == nil && st.IsDir() {
-			if !flagForce {
-				return fmt.Errorf("instance %s exists (use --force)", name)
-			}
-			_ = os.RemoveAll(instDir)
-		}
-		if err := os.MkdirAll(instDir, 0755); err != nil {
-			return err
-		}
-
-		// 1) Create disk.raw from source image
-		dstDisk := filepath.Join(instDir, "disk.raw")
-
-		if rtsst.IsQCOW2(imageFile) {
-			rtsst.LogDebug(flagVerbose, "detected qcow2; running qemu-img convert")
-			cmd := exec.Command("qemu-img", "convert", "-O", "raw", imageFile, dstDisk)
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			if err := cmd.Run(); err != nil {
-				return fmt.Errorf("qemu-img convert failed: %w", err)
-			}
-		} else {
-			rtsst.LogDebug(flagVerbose, "assuming raw image; performing sparse copy")
-			if err := rtsst.CopySparse(imageFile, dstDisk); err != nil {
-				return fmt.Errorf("sparse copy failed: %w", err)
-			}
-		}
-
-		// 2
-		err := rtsst.WriteCIData(instDir, name)
-		if err != nil {
-			return fmt.Errorf("Failed to write cidata: %w", err)
-		}
-		if err := rtsst.UpdateCIDATAISO(instDir); err != nil {
-			return fmt.Errorf("Failed to update cidata.iso")
-		}
-		
-		// 3) Create 30GB sparse data disk (default)
-		dataImg := filepath.Join(instDir, "data.img")
-		if _, err := os.Stat(dataImg); os.IsNotExist(err) {
-			if err := rtsst.CreateSparse(dataImg, 30*1024*1024*1024); err != nil {
-				return fmt.Errorf("creating data.img: %w", err)
-			}
-		} else if err != nil {
-			return fmt.Errorf("stat data.img: %w", err)
-		}
-
-		// 4) Add share /Users/$USER -> /Users/$USER
-		u, _ := user.Current()
-		hostShare := filepath.Join("/Users", u.Username)
-		guestShare := filepath.Join("/Users", u.Username)
-
-		// 5) Verbose kernel params (still stored even if EFI mode)
-		params := "console=hvc0 systemd.log_target=console"
-
-		// 6) Defaults for CPU and memory
-		defaultCPU := 4
-		defaultMem := "8G"
-
-		cfg := rtsst.RuntimeConfig{
-			Name:       name,
-			Boot:       "efi",
-			SystemDisk: dstDisk,
-			CIDataDisk: "cidata.iso",
-			EFIVars:    "efi-vars.fd",
-			Params:     params,
-			CPUCount:   defaultCPU,
-			MemorySize: defaultMem,
-			DataDisks:  []rtsst.DataDisk{{Path: filepath.Base(dataImg), Mode: "rw"}},
-			Shares: []rtsst.Share{
-				{Host: hostShare, Guest: guestShare},
-			},
-		}
-		mac, err := rtsst.GenerateMAC()
-		if err != nil {
-			return err
-		}
-		cfg.Network.MAC = mac
-		cfg.Network.Mode = "nat"
-
-		data, err := yaml.Marshal(&cfg)
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(filepath.Join(instDir, "rtsst.yaml"), data, 0o644)
-	},
+	rootCmd.AddCommand(pullvmCmd())
+	rootCmd.AddCommand(instanceCmd())
 }
 
-// Logging helpers
+/* ======================= pullvm ======================= */
 
-func requireRoot() error {
-	if os.Geteuid() != 0 {
-		return fmt.Errorf("mkimage must be run as root")
+func pullvmCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "pullvm <upstream-image>",
+		Short: "Pull an upstream VM image and create an SST image directory",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return pullVM(args[0])
+		},
+	}
+}
+
+func pullVM(upstream string) error {
+	ctx := context.Background()
+	log := sst.LogxRoot().Subsystem("mkimage.pullvm")
+
+	name := strings.TrimSuffix(filepath.Base(upstream), filepath.Ext(upstream))
+	imageDir := filepath.Join(flagRoot, "images", name)
+
+	if _, err := os.Stat(imageDir); err == nil && !flagForce {
+		return fmt.Errorf("destination %s exists; use --force to overwrite", imageDir)
+	}
+	_ = os.RemoveAll(imageDir)
+	if err := os.MkdirAll(imageDir, 0755); err != nil {
+		return err
+	}
+
+	// Copy upstream image
+	dst := filepath.Join(imageDir, filepath.Base(upstream))
+	if err := copyFile(upstream, dst); err != nil {
+		return err
+	}
+
+	sha, err := sha256File(dst)
+	if err != nil {
+		return err
+	}
+
+	// Write image.yaml via proto + YamlObject
+	meta := &mkimagepb.ImageYAML{
+		Image: &mkimagepb.ImageMeta{
+			Name: name,
+		},
+		Sources: []*mkimagepb.Source{
+			{
+				Name:        name,
+				Upstream:    upstream,
+				Format:      filepath.Ext(upstream),
+				Sha256:      sha,
+				RetrievedAt: time.Now().UTC().Format(time.RFC3339),
+			},
+		},
+	}
+
+	yo := &sst.YamlObject{
+		Path:   filepath.Join(imageDir, "image.yaml"),
+		Schema: "sst.yaml.mkimage.v1.ImageYAML",
+		Kind:   "Image",
+		Msg:    meta,
+	}
+
+	if diags := yo.Save(ctx, log); diags != nil {
+		return fmt.Errorf(diags.Error())
+	}
+
+	if flagVerbose {
+		fmt.Printf("Image %s created\n", name)
 	}
 	return nil
 }
 
-func step(msg string) {
-	if flagVerbose {
-		fmt.Println("→", msg)
+/* ======================= instance ======================= */
+
+func instanceCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "instance <image> <name>",
+		Short: "Create an instance directory from an image",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return createInstance(args[0], args[1])
+		},
 	}
 }
 
-func done(msg string) {
-	if flagVerbose {
-		fmt.Println("✓", msg)
+func createInstance(image, name string) error {
+	ctx := context.Background()
+	log := sst.LogxRoot().Subsystem("mkimage.instance")
+
+	imageDir := filepath.Join(flagRoot, "images", image)
+	instDir := rtsst.InstanceDir(name)
+
+	if _, err := os.Stat(instDir); err == nil && !flagForce {
+		return fmt.Errorf("instance %s exists; use --force to overwrite", name)
 	}
+	_ = os.RemoveAll(instDir)
+	if err := os.MkdirAll(instDir, 0755); err != nil {
+		return err
+	}
+
+	// Load instance.yaml (proto-backed)
+	inst := &runctlpb.Instance{}
+	yo := &sst.YamlObject{
+		Path:   filepath.Join(instDir, "instance.yaml"),
+		Schema: "sst.yaml.runctl.v1.Instance",
+		Kind:   "Instance",
+		Msg:    inst,
+	}
+
+	if diags := yo.Load(ctx, log); diags != nil {
+		return fmt.Errorf(diags.Error())
+	}
+
+	// Copy base image
+	src := filepath.Join(imageDir, filepath.Base(image))
+	dst := filepath.Join(instDir, filepath.Base(image))
+	if err := copyFile(src, dst); err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func deriveUpstreamFilename(upstream string) string {
-	var base string
+/* ======================= helpers ======================= */
 
-	if rtsst.IsURL(upstream) {
-		u, err := url.Parse(upstream)
-		if err == nil {
-			base = path.Base(u.Path)
-		}
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
 	}
+	defer in.Close()
 
-	if base == "" {
-		base = filepath.Base(upstream)
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
 	}
+	defer out.Close()
 
-	if base == "" || base == "." || base == "/" {
-		base = "upstream.img"
-	}
-
-	ext := filepath.Ext(base)
-	name := strings.TrimSuffix(base, ext)
-	if ext == "" {
-		ext = ".img"
-	}
-	return fmt.Sprintf("%s%s", name, ext)
+	_, err = io.Copy(out, in)
+	return err
 }
 
-// Cobra convert command
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
 
-var pullvmCmd = &cobra.Command{
-	Use:   "pullvm <distro> <version> <variant> <qcow-or-url>",
-	Args:  cobra.ExactArgs(4),
-	Short: "Convert a qcow2/URL upstream image into an SST image directory",
-
-	RunE: func(cmd *cobra.Command, args []string) error {
-		distro := args[0]
-		version := args[1]
-		variant := args[2]
-		upstream := args[3]
-
-		// Resolve runtimes root → DIR/images/<name>
-
-		absRoot, _ := filepath.Abs(flagRoot)           // DIR
-		imagesRoot := filepath.Join(absRoot, "images") // DIR/images
-		distroDir := filepath.Join(imagesRoot, distro+"-"+version)
-		variantDir := filepath.Join(distroDir, variant)
-
-		// determine filesystem owner
-		targetUid, targetGid, _ := rtsst.GetFileOwnership(absRoot)
-
-		// XXX not needed anymore  requireRoot()
-		if flagVerbose {
-			fmt.Println("-> mkimage pullvm")
-			fmt.Println("  upstream:", upstream)
-			fmt.Println("  dest:    ", distroDir)
-			fmt.Printf("  target owner: %d:%d\n", targetUid, targetGid)
-		}
-
-		// Enforce directory existence rules
-		_, err := os.Stat(variantDir)
-		if err == nil {
-			// directory exists
-			if !flagForce {
-				return fmt.Errorf("destination %s exists; use --force to overwrite", variantDir)
-			}
-			_ = os.RemoveAll(variantDir)
-		}
-
-		// create images root and destination
-		if _, err := os.Stat(variantDir); os.IsNotExist(err) {
-			if err := os.MkdirAll(variantDir, 0o755); err != nil {
-				return err
-			}
-		}
-
-		// Fix ownership early
-		_ = os.Chown(distroDir, targetUid, targetGid)
-		_ = os.Chown(variantDir, targetUid, targetGid)
-
-		// Acquire LOCK for this image
-		lockPath := filepath.Join(distroDir, ".mkimage.lock")
-		lk, err := rtsst.CreateLock(lockPath)
-		if err != nil {
-			return err
-		}
-		defer lk.Remove()
-
-		// Download or copy upstream source
-
-		step("Processing upstream source…")
-		name := deriveUpstreamFilename(upstream)
-		target := filepath.Join(variantDir, name)
-
-		if rtsst.IsURL(upstream) {
-			step("Downloading upstream image…")
-			if err := rtsst.DownloadToFile(upstream, target); err != nil {
-				return fmt.Errorf("download failed: %w", err)
-			}
-			done("Download complete")
-		} else {
-			step("Copying upstream image into upstream dir")
-			if err := rtsst.CopyFile(upstream, target); err != nil {
-				return fmt.Errorf("copy upstream image: %w", err)
-			}
-			done("Local upstream image copied")
-		}
-
-		// Write + Validate image.yaml
-
-		step("Writing image.yaml…")
-
-		meta := rtsst.ImageYAML{}
-		meta.Image.Name = name
-		meta.Image.Description = "Generated by mkimage pullvm"
-		meta.Sources = append(meta.Sources, rtsst.Source{
-			Name:        variant,
-			Upstream:    upstream,
-			Format:      "disk-image",
-			RetrievedAt: time.Now().UTC().Format(time.RFC3339),
-		})
-
-		if err := rtsst.WriteYAML(variantDir, &meta); err != nil {
-			return err
-		}
-		done("image.yaml written")
-
-		step("Validating image.yaml…")
-		if err := rtsst.ValidateFile(filepath.Join(variantDir, "image.yaml")); err != nil {
-			return fmt.Errorf("image.yaml invalid: %w", err)
-		}
-		done("image.yaml validated")
-
-		fmt.Println("-> Image created:", variantDir)
-		return nil
-	},
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
