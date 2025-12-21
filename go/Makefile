@@ -4,16 +4,16 @@ ARCH := $(shell go env GOARCH)
 
 .PHONY: build install clean generate tidy format
 
-tidy: generate
+tidy:
 	go mod tidy
 
 format:
 	go fmt ./...
 
-generate:
+generate: tidy
 	go generate ./...
 
-build: tidy
+build: generate
 	for b in $(BINS); do \
 		go build -o build/${ARCH}/$$b ./cmd/$$b ; \
 	done

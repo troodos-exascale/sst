@@ -1,9 +1,9 @@
 package rtsst
 
 import (
+	"fmt"
 	"io"
 	"os"
-	"fmt"
 	"path/filepath"
 	"syscall"
 )

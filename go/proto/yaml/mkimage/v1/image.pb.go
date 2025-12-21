@@ -22,11 +22,22 @@ const (
 )
 
 type ImageYAML struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Image         *ImageMeta             `protobuf:"bytes,1,opt,name=image,proto3" json:"image,omitempty"`
-	Sources       []*Source              `protobuf:"bytes,2,rep,name=sources,proto3" json:"sources,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	Name           string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Upstream       string                 `protobuf:"bytes,2,opt,name=upstream,proto3" json:"upstream,omitempty"`
+	RetrievedAt    string                 `protobuf:"bytes,3,opt,name=retrieved_at,json=retrievedAt,proto3" json:"retrieved_at,omitempty"`
+	SourceFileName string                 `protobuf:"bytes,4,opt,name=source_file_name,json=sourceFileName,proto3" json:"source_file_name,omitempty"`
+	Format         string                 `protobuf:"bytes,5,opt,name=format,proto3" json:"format,omitempty"`
+	LocalSha       string                 `protobuf:"bytes,6,opt,name=local_sha,json=localSha,proto3" json:"local_sha,omitempty"`
+	RawImage       string                 `protobuf:"bytes,7,opt,name=raw_image,json=rawImage,proto3" json:"raw_image,omitempty"`
+	Kernel         string                 `protobuf:"bytes,8,opt,name=kernel,proto3" json:"kernel,omitempty"`
+	Initrd         string                 `protobuf:"bytes,9,opt,name=initrd,proto3" json:"initrd,omitempty"`
+	RootfsPartUuid string                 `protobuf:"bytes,10,opt,name=rootfs_part_uuid,json=rootfsPartUuid,proto3" json:"rootfs_part_uuid,omitempty"`
+	BootfsPartUuid string                 `protobuf:"bytes,11,opt,name=bootfs_part_uuid,json=bootfsPartUuid,proto3" json:"bootfs_part_uuid,omitempty"`
+	RootfsType     string                 `protobuf:"bytes,12,opt,name=rootfs_type,json=rootfsType,proto3" json:"rootfs_type,omitempty"`
+	BootfsType     string                 `protobuf:"bytes,13,opt,name=bootfs_type,json=bootfsType,proto3" json:"bootfs_type,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ImageYAML) Reset() {
@@ -59,152 +70,93 @@ func (*ImageYAML) Descriptor() ([]byte, []int) {
 	return file_yaml_mkimage_v1_image_proto_rawDescGZIP(), []int{0}
 }
 
-func (x *ImageYAML) GetImage() *ImageMeta {
-	if x != nil {
-		return x.Image
-	}
-	return nil
-}
-
-func (x *ImageYAML) GetSources() []*Source {
-	if x != nil {
-		return x.Sources
-	}
-	return nil
-}
-
-type ImageMeta struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Version       string                 `protobuf:"bytes,2,opt,name=version,proto3" json:"version,omitempty"`
-	Description   string                 `protobuf:"bytes,3,opt,name=description,proto3" json:"description,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ImageMeta) Reset() {
-	*x = ImageMeta{}
-	mi := &file_yaml_mkimage_v1_image_proto_msgTypes[1]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ImageMeta) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ImageMeta) ProtoMessage() {}
-
-func (x *ImageMeta) ProtoReflect() protoreflect.Message {
-	mi := &file_yaml_mkimage_v1_image_proto_msgTypes[1]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ImageMeta.ProtoReflect.Descriptor instead.
-func (*ImageMeta) Descriptor() ([]byte, []int) {
-	return file_yaml_mkimage_v1_image_proto_rawDescGZIP(), []int{1}
-}
-
-func (x *ImageMeta) GetName() string {
+func (x *ImageYAML) GetName() string {
 	if x != nil {
 		return x.Name
 	}
 	return ""
 }
 
-func (x *ImageMeta) GetVersion() string {
-	if x != nil {
-		return x.Version
-	}
-	return ""
-}
-
-func (x *ImageMeta) GetDescription() string {
-	if x != nil {
-		return x.Description
-	}
-	return ""
-}
-
-type Source struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
-	Upstream      string                 `protobuf:"bytes,2,opt,name=upstream,proto3" json:"upstream,omitempty"`
-	Sha256        string                 `protobuf:"bytes,3,opt,name=sha256,proto3" json:"sha256,omitempty"`
-	Format        string                 `protobuf:"bytes,4,opt,name=format,proto3" json:"format,omitempty"`
-	RetrievedAt   string                 `protobuf:"bytes,5,opt,name=retrieved_at,json=retrievedAt,proto3" json:"retrieved_at,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *Source) Reset() {
-	*x = Source{}
-	mi := &file_yaml_mkimage_v1_image_proto_msgTypes[2]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *Source) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*Source) ProtoMessage() {}
-
-func (x *Source) ProtoReflect() protoreflect.Message {
-	mi := &file_yaml_mkimage_v1_image_proto_msgTypes[2]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use Source.ProtoReflect.Descriptor instead.
-func (*Source) Descriptor() ([]byte, []int) {
-	return file_yaml_mkimage_v1_image_proto_rawDescGZIP(), []int{2}
-}
-
-func (x *Source) GetName() string {
-	if x != nil {
-		return x.Name
-	}
-	return ""
-}
-
-func (x *Source) GetUpstream() string {
+func (x *ImageYAML) GetUpstream() string {
 	if x != nil {
 		return x.Upstream
 	}
 	return ""
 }
 
-func (x *Source) GetSha256() string {
+func (x *ImageYAML) GetRetrievedAt() string {
 	if x != nil {
-		return x.Sha256
+		return x.RetrievedAt
 	}
 	return ""
 }
 
-func (x *Source) GetFormat() string {
+func (x *ImageYAML) GetSourceFileName() string {
+	if x != nil {
+		return x.SourceFileName
+	}
+	return ""
+}
+
+func (x *ImageYAML) GetFormat() string {
 	if x != nil {
 		return x.Format
 	}
 	return ""
 }
 
-func (x *Source) GetRetrievedAt() string {
+func (x *ImageYAML) GetLocalSha() string {
 	if x != nil {
-		return x.RetrievedAt
+		return x.LocalSha
+	}
+	return ""
+}
+
+func (x *ImageYAML) GetRawImage() string {
+	if x != nil {
+		return x.RawImage
+	}
+	return ""
+}
+
+func (x *ImageYAML) GetKernel() string {
+	if x != nil {
+		return x.Kernel
+	}
+	return ""
+}
+
+func (x *ImageYAML) GetInitrd() string {
+	if x != nil {
+		return x.Initrd
+	}
+	return ""
+}
+
+func (x *ImageYAML) GetRootfsPartUuid() string {
+	if x != nil {
+		return x.RootfsPartUuid
+	}
+	return ""
+}
+
+func (x *ImageYAML) GetBootfsPartUuid() string {
+	if x != nil {
+		return x.BootfsPartUuid
+	}
+	return ""
+}
+
+func (x *ImageYAML) GetRootfsType() string {
+	if x != nil {
+		return x.RootfsType
+	}
+	return ""
+}
+
+func (x *ImageYAML) GetBootfsType() string {
+	if x != nil {
+		return x.BootfsType
 	}
 	return ""
 }
@@ -213,20 +165,24 @@ var File_yaml_mkimage_v1_image_proto protoreflect.FileDescriptor
 
 const file_yaml_mkimage_v1_image_proto_rawDesc = "" +
 	"\n" +
-	"\x1byaml/mkimage/v1/image.proto\x12\x13sst.yaml.mkimage.v1\"x\n" +
-	"\tImageYAML\x124\n" +
-	"\x05image\x18\x01 \x01(\v2\x1e.sst.yaml.mkimage.v1.ImageMetaR\x05image\x125\n" +
-	"\asources\x18\x02 \x03(\v2\x1b.sst.yaml.mkimage.v1.SourceR\asources\"[\n" +
-	"\tImageMeta\x12\x12\n" +
-	"\x04name\x18\x01 \x01(\tR\x04name\x12\x18\n" +
-	"\aversion\x18\x02 \x01(\tR\aversion\x12 \n" +
-	"\vdescription\x18\x03 \x01(\tR\vdescription\"\x8b\x01\n" +
-	"\x06Source\x12\x12\n" +
+	"\x1byaml/mkimage/v1/image.proto\x12\x13sst.yaml.mkimage.v1\"\xa0\x03\n" +
+	"\tImageYAML\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x1a\n" +
-	"\bupstream\x18\x02 \x01(\tR\bupstream\x12\x16\n" +
-	"\x06sha256\x18\x03 \x01(\tR\x06sha256\x12\x16\n" +
-	"\x06format\x18\x04 \x01(\tR\x06format\x12!\n" +
-	"\fretrieved_at\x18\x05 \x01(\tR\vretrievedAtBQZOgithub.com/swiss-software-tool/runtime-smart/go/proto/yaml/mkimage/v1;mkimagepbb\x06proto3"
+	"\bupstream\x18\x02 \x01(\tR\bupstream\x12!\n" +
+	"\fretrieved_at\x18\x03 \x01(\tR\vretrievedAt\x12(\n" +
+	"\x10source_file_name\x18\x04 \x01(\tR\x0esourceFileName\x12\x16\n" +
+	"\x06format\x18\x05 \x01(\tR\x06format\x12\x1b\n" +
+	"\tlocal_sha\x18\x06 \x01(\tR\blocalSha\x12\x1b\n" +
+	"\traw_image\x18\a \x01(\tR\brawImage\x12\x16\n" +
+	"\x06kernel\x18\b \x01(\tR\x06kernel\x12\x16\n" +
+	"\x06initrd\x18\t \x01(\tR\x06initrd\x12(\n" +
+	"\x10rootfs_part_uuid\x18\n" +
+	" \x01(\tR\x0erootfsPartUuid\x12(\n" +
+	"\x10bootfs_part_uuid\x18\v \x01(\tR\x0ebootfsPartUuid\x12\x1f\n" +
+	"\vrootfs_type\x18\f \x01(\tR\n" +
+	"rootfsType\x12\x1f\n" +
+	"\vbootfs_type\x18\r \x01(\tR\n" +
+	"bootfsTypeBQZOgithub.com/swiss-software-tool/runtime-smart/go/proto/yaml/mkimage/v1;mkimagepbb\x06proto3"
 
 var (
 	file_yaml_mkimage_v1_image_proto_rawDescOnce sync.Once
@@ -240,20 +196,16 @@ func file_yaml_mkimage_v1_image_proto_rawDescGZIP() []byte {
 	return file_yaml_mkimage_v1_image_proto_rawDescData
 }
 
-var file_yaml_mkimage_v1_image_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_yaml_mkimage_v1_image_proto_msgTypes = make([]protoimpl.MessageInfo, 1)
 var file_yaml_mkimage_v1_image_proto_goTypes = []any{
 	(*ImageYAML)(nil), // 0: sst.yaml.mkimage.v1.ImageYAML
-	(*ImageMeta)(nil), // 1: sst.yaml.mkimage.v1.ImageMeta
-	(*Source)(nil),    // 2: sst.yaml.mkimage.v1.Source
 }
 var file_yaml_mkimage_v1_image_proto_depIdxs = []int32{
-	1, // 0: sst.yaml.mkimage.v1.ImageYAML.image:type_name -> sst.yaml.mkimage.v1.ImageMeta
-	2, // 1: sst.yaml.mkimage.v1.ImageYAML.sources:type_name -> sst.yaml.mkimage.v1.Source
-	2, // [2:2] is the sub-list for method output_type
-	2, // [2:2] is the sub-list for method input_type
-	2, // [2:2] is the sub-list for extension type_name
-	2, // [2:2] is the sub-list for extension extendee
-	0, // [0:2] is the sub-list for field type_name
+	0, // [0:0] is the sub-list for method output_type
+	0, // [0:0] is the sub-list for method input_type
+	0, // [0:0] is the sub-list for extension type_name
+	0, // [0:0] is the sub-list for extension extendee
+	0, // [0:0] is the sub-list for field type_name
 }
 
 func init() { file_yaml_mkimage_v1_image_proto_init() }
@@ -267,7 +219,7 @@ func file_yaml_mkimage_v1_image_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_yaml_mkimage_v1_image_proto_rawDesc), len(file_yaml_mkimage_v1_image_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   3,
+			NumMessages:   1,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

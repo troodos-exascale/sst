@@ -129,7 +129,6 @@ func FindRepoRoot() (string, error) {
 	return topLevelRoot, nil
 }
 
-
 // FormatLsLine creates a single line of `ls -l` style output for a given file.
 func FormatLsLine(path string, info fs.FileInfo) string {
 	mode := info.Mode().String()

@@ -125,7 +125,7 @@ func storagePlanLoadProbe(app *storagePlanApp) error {
 	}
 
 	if diags := yo.Load(ctx, log); diags != nil {
-		return fmt.Errorf(diags.Error())
+		return diags
 	}
 
 	if len(app.probe.Spec.BlockDevices) == 0 {
@@ -223,7 +223,7 @@ func storagePlanWriteOutput(app *storagePlanApp) error {
 	}
 
 	if diags := yo.Save(ctx, log); diags != nil {
-		return fmt.Errorf(diags.Error())
+		return diags
 	}
 
 	fmt.Printf("✅ Successfully generated '%s'\n", app.outputFile)
@@ -266,7 +266,7 @@ func reconcileMount(cmd *cobra.Command, args []string) error {
 	}
 
 	if diags := yo.Load(ctx, log); diags != nil {
-		return fmt.Errorf(diags.Error())
+		return diags
 	}
 
 	manifestModified := false
@@ -275,7 +275,6 @@ func reconcileMount(cmd *cobra.Command, args []string) error {
 		if fs.Status.State != "ready-for-implementation" {
 			continue
 		}
-
 		runner := &sst.Runner{Log: log}
 
 		stepCtx := &sst.Context{
@@ -320,7 +319,7 @@ func reconcileMount(cmd *cobra.Command, args []string) error {
 
 	if manifestModified {
 		if diags := yo.Save(ctx, log); diags != nil {
-			return fmt.Errorf(diags.Error())
+			return diags
 		}
 	}
 

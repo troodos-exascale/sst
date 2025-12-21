@@ -141,7 +141,7 @@ func loadGeneric(path string) (*composepb.GenericComponent, error) {
 		Msg:    gen,
 	}
 	if diags := yo.Load(ctx, log); diags != nil {
-		return nil, fmt.Errorf(diags.Error())
+		return nil, diags
 	}
 	return gen, nil
 }
@@ -159,7 +159,7 @@ func loadComponentDef(path string) (*composepb.ComponentDef, error) {
 		Msg:    def,
 	}
 	if diags := yo.Load(ctx, log); diags != nil {
-		return nil, fmt.Errorf(diags.Error())
+		return nil, diags
 	}
 	return def, nil
 }
@@ -351,7 +351,7 @@ func composeWritePlan(app *composeApp) error {
 	}
 
 	if diags := yo.Save(ctx, log); diags != nil {
-		return fmt.Errorf(diags.Error())
+		return diags
 	}
 
 	fmt.Printf("Successfully generated validated plan: %s\n", out)

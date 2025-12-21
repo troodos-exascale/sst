@@ -54,7 +54,7 @@ func runProbe(cmd *cobra.Command, args []string) error {
 	}
 
 	if diags := yo.Save(ctx, log); diags != nil {
-		return fmt.Errorf(diags.Error())
+		return diags
 	}
 
 	log.Info(ctx, "hardware probe written", "path", outPath)

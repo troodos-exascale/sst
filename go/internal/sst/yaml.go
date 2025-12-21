@@ -88,7 +88,7 @@ type YamlObject struct {
 	Msg proto.Message
 
 	// Optional hooks
-	ValidateFn func(ctx context.Context, y *YamlObject) *YAMLErrors
+	ValidateFn  func(ctx context.Context, y *YamlObject) *YAMLErrors
 	NormalizeFn func(ctx context.Context, y *YamlObject)
 }
 
@@ -114,7 +114,7 @@ func (y *YamlObject) ensure() error {
 // Load / Validate / Save
 // ======================================================
 
-func (y *YamlObject) Load(ctx context.Context, log Logx) *YAMLErrors {
+func (y *YamlObject) Load(ctx context.Context, log *Logx) *YAMLErrors {
 	if err := y.ensure(); err != nil {
 		return y.diag(ctx, log, "YAML_OBJ_INVALID", err.Error(), nil)
 	}
@@ -159,7 +159,7 @@ func (y *YamlObject) Load(ctx context.Context, log Logx) *YAMLErrors {
 	return nil
 }
 
-func (y *YamlObject) Validate(ctx context.Context, log Logx) *YAMLErrors {
+func (y *YamlObject) Validate(ctx context.Context, log *Logx) *YAMLErrors {
 	if err := y.ensure(); err != nil {
 		return y.diag(ctx, log, "YAML_OBJ_INVALID", err.Error(), nil)
 	}
@@ -191,20 +191,9 @@ func (y *YamlObject) Validate(ctx context.Context, log Logx) *YAMLErrors {
 	return nil
 }
 
-func (y *YamlObject) Save(ctx context.Context, log Logx) *YAMLErrors {
+func (y *YamlObject) Save(ctx context.Context, log *Logx) *YAMLErrors {
 	if err := y.ensure(); err != nil {
 		return y.diag(ctx, log, "YAML_OBJ_INVALID", err.Error(), nil)
-	}
-
-	// Normalize (optional) before save
-	if y.NormalizeFn != nil {
-		y.NormalizeFn(ctx, y)
-	}
-
-	// Validate before save
-	if diags := y.Validate(ctx, log); diags != nil && diags.HasAny() {
-		// Already emitted as diagnostics by Validate()
-		return diags
 	}
 
 	mopts := protojson.MarshalOptions{
@@ -243,7 +232,7 @@ func (y *YamlObject) Save(ctx context.Context, log Logx) *YAMLErrors {
 // Emission helpers
 // ======================================================
 
-func (y *YamlObject) diag(ctx context.Context, log Logx, code, msg string, meta map[string]any) *YAMLErrors {
+func (y *YamlObject) diag(ctx context.Context, log *Logx, code, msg string, meta map[string]any) *YAMLErrors {
 	d := &YAMLErrors{}
 	d.Add(YAMLDiagnostic{
 		Code:    code,
@@ -256,14 +245,8 @@ func (y *YamlObject) diag(ctx context.Context, log Logx, code, msg string, meta 
 	return d
 }
 
-func (y *YamlObject) emitAll(ctx context.Context, log Logx, ds *YAMLErrors, defaultCode string) {
+func (y *YamlObject) emitAll(ctx context.Context, log *Logx, ds *YAMLErrors, defaultCode string) {
 	if ds == nil || len(ds.Items) == 0 {
-		return
-	}
-	// Invariant: logx always supports diagnostics now.
-	if log == nil {
-		// If you truly want to forbid nil logx, you can panic here instead.
-		// For now, do nothing to avoid nil deref.
 		return
 	}
 
@@ -283,11 +266,10 @@ func (y *YamlObject) emitAll(ctx context.Context, log Logx, ds *YAMLErrors, defa
 		if y.APIVersion != "" {
 			kv = append(kv, "api_version", y.APIVersion)
 		}
-		if it.Meta != nil && len(it.Meta) > 0 {
+		if len(it.Meta) > 0 {
 			kv = append(kv, "meta", it.Meta)
 		}
 
 		log.Diagnose(ctx, code, it.Message, kv...)
 	}
 }
-

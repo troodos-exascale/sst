@@ -18,9 +18,9 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// RunRemoteProbe connects to a host via SSH and executes a series of discovery
-// commands, saving their raw output to a temporary directory.
-func RunRemoteProbe(ctx context.Context, logger sst.Logx, hostname string, sshKey []byte, tempDir string) error {
+// RunRemoteProbe connects to a host via SSH...
+// UPDATED: logger is now *sst.Logx
+func RunRemoteProbe(ctx context.Context, logger *sst.Logx, hostname string, sshKey []byte, tempDir string) error {
 	logger.Info(ctx, "Preparing to probe remote host", "host", hostname)
 
 	signer, err := ssh.ParsePrivateKey(sshKey)
@@ -107,9 +107,9 @@ func RunRemoteProbe(ctx context.Context, logger sst.Logx, hostname string, sshKe
 	return nil
 }
 
-// Normalize reads the raw probe data from a directory, parses it,
-// and creates the final HardwareProbe manifest.
-func Normalize(ctx context.Context, logger sst.Logx, probeDataDir string) ([]byte, error) {
+// Normalize reads the raw probe data...
+// UPDATED: logger is now *sst.Logx
+func Normalize(ctx context.Context, logger *sst.Logx, probeDataDir string) ([]byte, error) {
 	probe := HardwareProbe{
 		APIVersion: "s2.io/v1",
 		Kind:       "HardwareProbe",
@@ -148,7 +148,6 @@ func Normalize(ctx context.Context, logger sst.Logx, probeDataDir string) ([]byt
 		logger.WithError(err).Warn(ctx, "Could not parse serial number")
 	}
 
-	// CORRECTED: Fallback to MAC address if serial number is unavailable.
 	if serial == "" {
 		logger.Warn(ctx, "System serial number is empty, falling back to primary MAC address for unique identifier.")
 		probe.Metadata.Identifiers.SerialNumber = primaryMAC
@@ -170,8 +169,7 @@ func Normalize(ctx context.Context, logger sst.Logx, probeDataDir string) ([]byt
 	return yamlBytes, nil
 }
 
-// --- The rest of the file (parsing helpers) is unchanged ---
-
+// ... (Rest of file: parsing helpers remain unchanged) ...
 func parseLscpu(path string) (CPUSpec, error) {
 	var spec CPUSpec
 	bytes, err := os.ReadFile(path)

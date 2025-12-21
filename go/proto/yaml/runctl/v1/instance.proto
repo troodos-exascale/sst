@@ -23,6 +23,7 @@ message InstanceSpec {
   string name = 1;
 
   // Base image reference (path or logical name)
+  // This is the primary RW disk.
   string image = 2;
 
   // Boot mode: "efi" or "kernel"
@@ -39,7 +40,7 @@ message InstanceSpec {
   int32 cpu_count = 7;
   string memory_size = 8;
 
-  // Attached disks
+  // Attached disks (additional)
   repeated Disk disks = 9;
 
   // Host ↔ guest shares
@@ -50,6 +51,22 @@ message InstanceSpec {
 
   // EFI variables store (used when boot == "efi")
   string efi_vars = 12;
+
+  // ---------------------------------------------------------------------------
+  // Added: host identity + boot/root selection + explicit cloud-init
+  // ---------------------------------------------------------------------------
+
+  // Hostname for the guest. If network.hostname is set, it overrides this.
+  string hostname = 13;
+
+  // PARTUUID of the root filesystem partition. Used for stable root=PARTUUID=…
+  // and for constructing correct cmdline in "kernel" boot mode.
+  string rootfs_part_uuid = 14;
+
+  // Explicit cloud-init source. Typically a path like "cidata.iso",
+  // but intentionally modeled as a free string so it can become a URI later
+  // (e.g. "http(s)://…", "nfs://…", "vsock://…").
+  string cidata = 15;
 }
 
 // -----------------------------------------------------------------------------
@@ -77,4 +94,8 @@ message Share {
 message Network {
   string mac = 1;
   string mode = 2;
+
+  // Optional per-network hostname override.
+  // If empty, InstanceSpec.hostname is used.
+  string hostname = 3;
 }

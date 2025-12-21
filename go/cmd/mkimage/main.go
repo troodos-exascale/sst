@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -16,8 +14,8 @@ import (
 	mkimagepb "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/mkimage/v1"
 	runctlpb "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/runctl/v1"
 
-	sst "github.com/swiss-software-tool/runtime-smart/go/internal/sst"
 	rtsst "github.com/swiss-software-tool/runtime-smart/go/internal/rtsst"
+	sst "github.com/swiss-software-tool/runtime-smart/go/internal/sst"
 )
 
 var (
@@ -66,11 +64,30 @@ func pullvmCmd() *cobra.Command {
 }
 
 func pullVM(upstream string) error {
-	ctx := context.Background()
-	log := sst.LogxRoot().Subsystem("mkimage.pullvm")
+	var sb rtsst.ImageSB
+	var imageDir string
 
-	name := strings.TrimSuffix(filepath.Base(upstream), filepath.Ext(upstream))
-	imageDir := filepath.Join(flagRoot, "images", name)
+	sb.Ctx = context.Background()
+	sb.Log = *sst.LogxRoot().Subsystem("mkimage.pullvm")
+	sb.YamlObject = &mkimagepb.ImageYAML{}
+
+	// ------------------------------------------------------------------
+	// Resolve runtime dir
+	// ------------------------------------------------------------------
+	home, _ := os.UserHomeDir()
+	if flagRoot != "" {
+		sb.SstRuntimeDir = flagRoot
+	} else if env := os.Getenv("SST_RUNTIMEDIR"); env != "" {
+		sb.SstRuntimeDir = env
+	} else {
+		sb.SstRuntimeDir = filepath.Join(home, ".runtimes")
+	}
+
+	imagesRoot := filepath.Join(sb.SstRuntimeDir, "images")
+
+	base := filepath.Base(upstream)
+	imageName := strings.TrimSuffix(base, filepath.Ext(base))
+	imageDir = filepath.Join(imagesRoot, imageName)
 
 	if _, err := os.Stat(imageDir); err == nil && !flagForce {
 		return fmt.Errorf("destination %s exists; use --force to overwrite", imageDir)
@@ -80,47 +97,95 @@ func pullVM(upstream string) error {
 		return err
 	}
 
+	// ------------------------------------------------------------------
 	// Copy upstream image
-	dst := filepath.Join(imageDir, filepath.Base(upstream))
-	if err := copyFile(upstream, dst); err != nil {
+	// ------------------------------------------------------------------
+	srcImage := filepath.Join(imageDir, base)
+	if err := copyFile(upstream, srcImage); err != nil {
 		return err
 	}
-
-	sha, err := sha256File(dst)
+	sha, err := rtsst.SHA256File(srcImage)
 	if err != nil {
 		return err
 	}
 
-	// Write image.yaml via proto + YamlObject
-	meta := &mkimagepb.ImageYAML{
-		Image: &mkimagepb.ImageMeta{
-			Name: name,
-		},
-		Sources: []*mkimagepb.Source{
-			{
-				Name:        name,
-				Upstream:    upstream,
-				Format:      filepath.Ext(upstream),
-				Sha256:      sha,
-				RetrievedAt: time.Now().UTC().Format(time.RFC3339),
-			},
-		},
+	rawImageFile := imageName + ".raw"
+	rawImage := filepath.Join(imageDir, rawImageFile) // raw disk
+	if strings.HasSuffix(srcImage, ".qcow2") {
+		sb.Log.Info(sb.Ctx, "image.convert",
+			"from", srcImage,
+			"to", rawImage,
+			"format", "raw",
+		)
+
+		if _, err := sst.ExecShell(
+			sb.Ctx,
+			&sb.Log,
+			"qemu-img",
+			"convert",
+			"-O", "raw",
+			srcImage,
+			rawImage,
+		); err != nil {
+			return fmt.Errorf("failed to convert qcow2 to raw: %w", err)
+		}
+	} else {
+		// Assume raw already
+		rawImage = srcImage
 	}
 
+	// ------------------------------------------------------------------
+	// Initialise image.yaml object
+	// ------------------------------------------------------------------
+
+	sb.YamlObject = &mkimagepb.ImageYAML{
+		Name:           imageName,
+		SourceFileName: base,
+		Upstream:       upstream,
+		Format:         strings.TrimPrefix(filepath.Ext(base), "."),
+		LocalSha:       sha,
+		RetrievedAt:    time.Now().UTC().Format(time.RFC3339),
+		RawImage:       rawImageFile,
+	}
+
+	// ------------------------------------------------------------------
+	// STEP (ii): analyse partition table (pure GPT)
+	// ------------------------------------------------------------------
+	err = rtsst.AnalyseImg(&sb)
+	if err != nil {
+		return err
+	}
+
+	// ------------------------------------------------------------------
+	// STEP (iv): deterministic kernel/initrd extraction
+	// ------------------------------------------------------------------
+
+	err = rtsst.ExtractKernelAndInitrdFromBootPartition(&sb)
+	if err != nil {
+		return err
+	}
+
+	// ------------------------------------------------------------------
+	// Write image.yaml
+	// ------------------------------------------------------------------
 	yo := &sst.YamlObject{
 		Path:   filepath.Join(imageDir, "image.yaml"),
 		Schema: "sst.yaml.mkimage.v1.ImageYAML",
 		Kind:   "Image",
-		Msg:    meta,
+		Msg:    sb.YamlObject,
 	}
 
-	if diags := yo.Save(ctx, log); diags != nil {
-		return fmt.Errorf(diags.Error())
+	if diags := yo.Save(sb.Ctx, &sb.Log); diags != nil {
+		return diags
 	}
 
 	if flagVerbose {
-		fmt.Printf("Image %s created\n", name)
+		sb.Log.Info(sb.Ctx, "image.created",
+			"name", imageName,
+			"dir", imageDir,
+		)
 	}
+
 	return nil
 }
 
@@ -162,7 +227,7 @@ func createInstance(image, name string) error {
 	}
 
 	if diags := yo.Load(ctx, log); diags != nil {
-		return fmt.Errorf(diags.Error())
+		return diags
 	}
 
 	// Copy base image
@@ -190,20 +255,8 @@ func copyFile(src, dst string) error {
 	}
 	defer out.Close()
 
-	_, err = io.Copy(out, in)
-	return err
-}
-
-func sha256File(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
+	if _, err := io.Copy(out, in); err != nil {
+		return err
 	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return out.Close()
 }

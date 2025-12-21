@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
-	"os/signal"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -17,7 +15,6 @@ import (
 
 	rtsst "github.com/swiss-software-tool/runtime-smart/go/internal/rtsst"
 	sst "github.com/swiss-software-tool/runtime-smart/go/internal/sst"
-
 	runctlpb "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/runctl/v1"
 )
 
@@ -26,203 +23,146 @@ var (
 	force bool
 )
 
-/* ======================= main / cobra ======================= */
+/* ======================= main ======================= */
 
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
+	rc := NewRunctl()
+
 	rootCmd := &cobra.Command{
-		Use:   "runctl",
-		Short: "Runtime VM controller",
+		Use:           "runctl",
+		Short:         "Runtime VM controller",
+		SilenceUsage:  true,
+		SilenceErrors: true,
 	}
 
 	rootCmd.PersistentFlags().BoolVar(&debug, "debug", false, "enable debug output")
 	rootCmd.PersistentFlags().BoolVar(&force, "force", false, "force operation")
 
 	rootCmd.AddCommand(
-		startCmd(),
-		stopCmd(),
-		pauseCmd(),
-		resumeCmd(),
-		listCmd(),
-		sshCmd(),
+		rc.startCmd(),
+		rc.stopCmd(),
+		rc.pauseCmd(),
+		rc.resumeCmd(),
+		rc.listCmd(),
+		rc.sshCmd(),
 	)
 
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintf(os.Stderr, "runctl error: %v\n", err)
+		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
 	}
 }
 
-func startCmd() *cobra.Command {
+/* ======================= superblock ======================= */
+
+type Runctl struct {
+	Ctx context.Context
+	Log *sst.Logx // CHANGED: Now a pointer
+}
+
+func NewRunctl() *Runctl {
+	ctx := context.Background()
+	log := sst.LogxRoot().Subsystem("runctl")
+	// CHANGED: Pass pointer directly, no dereference (*log)
+	return &Runctl{Ctx: ctx, Log: log}
+}
+
+/* ======================= cobra commands ======================= */
+
+func (r *Runctl) startCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "start <name>",
 		Short: "Start an instance",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return startInstance(args[0])
+			return r.Start(args[0])
 		},
 	}
 }
 
-func stopCmd() *cobra.Command {
+func (r *Runctl) stopCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "stop <name>",
 		Short: "Stop an instance",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return stopInstance(args[0])
+			return r.Stop(args[0])
 		},
 	}
 }
 
-func pauseCmd() *cobra.Command {
+func (r *Runctl) pauseCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "pause <name>",
 		Short: "Pause an instance",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return pauseInstance(args[0])
+			return r.Pause(args[0])
 		},
 	}
 }
 
-func resumeCmd() *cobra.Command {
+func (r *Runctl) resumeCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "resume <name>",
 		Short: "Resume an instance",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return resumeInstance(args[0])
+			return r.Resume(args[0])
 		},
 	}
 }
 
-func listCmd() *cobra.Command {
+func (r *Runctl) listCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
 		Short: "List instances",
-		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return listInstances()
+			return r.List()
 		},
 	}
 }
 
-func sshCmd() *cobra.Command {
+func (r *Runctl) sshCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "ssh <name>",
 		Short: "SSH into an instance",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return sshToInstance(args[0])
+			return r.SSH(args[0])
 		},
 	}
 }
 
-/* ======================= instance.yaml loading ======================= */
+/* ======================= helpers ======================= */
 
-func loadInstance(instDir string) (*runctlpb.Instance, error) {
-	log := sst.LogxRoot().Subsystem("runctl.instance")
-	ctx := context.Background()
+func (r *Runctl) instanceDir(name string) string {
+	return rtsst.InstanceDir(name)
+}
 
-	p := filepath.Join(instDir, "instance.yaml")
+func (r *Runctl) loadInstance(name string) (*runctlpb.Instance, error) {
+	instDir := r.instanceDir(name)
+	path := filepath.Join(instDir, "instance.yaml")
+
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("instance '%s' has no instance.yaml (expected %s)", name, path)
+	}
+
 	inst := &runctlpb.Instance{}
-
 	yo := &sst.YamlObject{
-		Path:   p,
+		Path:   path,
 		Schema: "sst.yaml.runctl.v1.Instance",
 		Kind:   "Instance",
 		Msg:    inst,
 	}
-	if diags := yo.Load(ctx, log); diags != nil {
-		return nil, fmt.Errorf(diags.Error())
-	}
-	if inst.Spec == nil {
-		log.Diagnose(ctx, "INSTANCE_SPEC_MISSING", "instance.spec missing", "path", p)
-		return nil, fmt.Errorf("instance.spec missing in %s", p)
+
+	// r.Log is already *sst.Logx, so we pass it directly
+	if diags := yo.Load(r.Ctx, r.Log); diags != nil {
+		return nil, diags // Return error directly
 	}
 	return inst, nil
-}
-
-func resolvePath(instDir, p string) string {
-	p = strings.TrimSpace(p)
-	if p == "" {
-		return ""
-	}
-	if filepath.IsAbs(p) {
-		return p
-	}
-	return filepath.Join(instDir, p)
-}
-
-func diskAlreadyListed(instDir string, want string, disks []*runctlpb.Disk) bool {
-	wantAbs := resolvePath(instDir, want)
-	for _, d := range disks {
-		if d == nil {
-			continue
-		}
-		if resolvePath(instDir, d.Path) == wantAbs {
-			return true
-		}
-	}
-	return false
-}
-
-func netArg(mac, mode string) string {
-	mode = strings.TrimSpace(mode)
-	if mode == "" {
-		mode = "nat"
-	}
-	mac = strings.TrimSpace(mac)
-	if mac == "" {
-		return mode
-	}
-	return fmt.Sprintf("%s@%s", mac, mode)
-}
-
-/* ======================= helpers ======================= */
-
-func instanceIP(mac string) (string, error) {
-	mac = strings.ToLower(strings.TrimSpace(mac))
-	if mac == "" {
-		return "", fmt.Errorf("instance has no network.mac; cannot locate IP")
-	}
-
-	out, err := exec.Command("arp", "-a").CombinedOutput()
-	if err == nil {
-		for _, ln := range strings.Split(string(out), "\n") {
-			if strings.Contains(strings.ToLower(ln), mac) {
-				if start, end := strings.Index(ln, "("), strings.Index(ln, ")"); start > -1 && end > start {
-					return ln[start+1 : end], nil
-				}
-			}
-		}
-	}
-
-	out6, err6 := exec.Command("ndp", "-a").CombinedOutput()
-	if err6 == nil {
-		for _, ln := range strings.Split(string(out6), "\n") {
-			if strings.Contains(strings.ToLower(ln), mac) {
-				if f := strings.Fields(ln); len(f) > 0 {
-					return f[0], nil
-				}
-			}
-		}
-	}
-
-	out6b, err6b := exec.Command("ip", "neigh").CombinedOutput()
-	if err6b == nil {
-		for _, ln := range strings.Split(string(out6b), "\n") {
-			if strings.Contains(strings.ToLower(ln), mac) {
-				if f := strings.Fields(ln); len(f) > 0 {
-					return f[0], nil
-				}
-			}
-		}
-	}
-
-	return "", fmt.Errorf("no IP found for MAC %s", mac)
 }
 
 func parseMemorySizeMiB(s string) (uint64, error) {
@@ -230,7 +170,6 @@ func parseMemorySizeMiB(s string) (uint64, error) {
 	if s == "" {
 		return 4096, nil
 	}
-
 	i := 0
 	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
 		i++
@@ -239,7 +178,6 @@ func parseMemorySizeMiB(s string) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-
 	switch strings.TrimSpace(s[i:]) {
 	case "", "M", "MB", "MIB":
 		return n, nil
@@ -252,25 +190,26 @@ func parseMemorySizeMiB(s string) (uint64, error) {
 	}
 }
 
-/* ======================= instance control ======================= */
+/* ======================= actions ======================= */
 
-func startInstance(name string) error {
+func (r *Runctl) Start(name string) error {
 	if err := rtsst.EnsureInstanceNotBusy(name); err != nil {
 		return err
 	}
 
-	instDir, _ := filepath.Abs(rtsst.InstanceDir(name))
-
-	// Keep existing behavior: ensure cidata.iso is up-to-date if present.
-	_ = rtsst.UpdateCIDATAISO(instDir)
-
-	inst, err := loadInstance(instDir)
+	instDir, _ := filepath.Abs(r.instanceDir(name))
+	inst, err := r.loadInstance(name)
 	if err != nil {
 		return err
 	}
 	spec := inst.Spec
 
-	// resources
+	r.Log.Info(r.Ctx, "starting instance",
+		"instance", spec.Name,
+		"boot", spec.Boot,
+		"image", spec.Image,
+	)
+
 	cpu := int(spec.CpuCount)
 	if cpu <= 0 {
 		cpu = 4
@@ -280,155 +219,89 @@ func startInstance(name string) error {
 		return err
 	}
 
-	// base args
 	args := []string{
 		"--name", spec.Name,
-		"--net", netArg(spec.Network.GetMac(), spec.Network.GetMode()),
 		"--cpu-count", strconv.Itoa(cpu),
 		"--memory-size", strconv.FormatUint(memMiB, 10),
 	}
 
-	// bootloader wiring
-	boot := strings.ToLower(strings.TrimSpace(spec.Boot))
-	switch boot {
+	switch spec.Boot {
 	case "efi":
-		args = append(args, "--bootloader", "efi")
-
 		efiVars := spec.EfiVars
-		if strings.TrimSpace(efiVars) == "" {
+		if efiVars == "" {
 			efiVars = "efi-vars"
 		}
-		args = append(args, "--efi-vars", resolvePath(instDir, efiVars))
+		args = append(args,
+			"--bootloader", "efi",
+			"--efi-vars", filepath.Join(instDir, efiVars),
+		)
 
 	case "kernel":
-		if strings.TrimSpace(spec.Kernel) == "" {
+		if spec.Kernel == "" {
 			return fmt.Errorf("boot=kernel requires spec.kernel")
 		}
-		args = append(args, "--bootloader", "linux", "--kernel", resolvePath(instDir, spec.Kernel))
-		if strings.TrimSpace(spec.Initrd) != "" {
-			args = append(args, "--initrd", resolvePath(instDir, spec.Initrd))
+		args = append(args,
+			"--bootloader", "linux",
+			"--kernel", spec.Kernel,
+		)
+		if spec.Initrd != "" {
+			args = append(args, "--initrd", spec.Initrd)
 		}
-		if strings.TrimSpace(spec.Params) != "" {
+		if spec.Params != "" {
 			args = append(args, "--params", spec.Params)
 		}
 
 	default:
-		return fmt.Errorf("invalid spec.boot %q (expected 'efi' or 'kernel')", spec.Boot)
+		return fmt.Errorf("invalid boot mode %q", spec.Boot)
 	}
 
-	// system disk: spec.image (treated as RW)
-	if strings.TrimSpace(spec.Image) == "" {
-		return fmt.Errorf("spec.image missing (system disk path)")
-	}
-	args = append(args, "--rwdisk", resolvePath(instDir, spec.Image))
+	args = append(args, "--rwdisk", spec.Image)
 
-	// optional auto-attach cidata.iso if present and not already listed
-	if _, err := os.Stat(filepath.Join(instDir, "cidata.iso")); err == nil {
-		if !diskAlreadyListed(instDir, "cidata.iso", spec.Disks) {
-			args = append(args, "--disk", filepath.Join(instDir, "cidata.iso"))
-		}
+	if spec.Cidata != "" {
+		args = append(args, "--disk", filepath.Join(instDir, spec.Cidata))
 	}
 
-	// extra disks
 	for _, d := range spec.Disks {
-		if d == nil {
-			continue
-		}
-		p := resolvePath(instDir, d.Path)
-		if p == "" {
-			continue
-		}
-		mode := strings.ToLower(strings.TrimSpace(d.Mode))
-		if mode == "rw" {
-			args = append(args, "--rwdisk", p)
+		if d.Mode == "rw" {
+			args = append(args, "--rwdisk", d.Path)
 		} else {
-			// default: ro
-			args = append(args, "--disk", p)
+			args = append(args, "--disk", d.Path)
 		}
 	}
 
-	// shares
-	for _, sh := range spec.Shares {
-		if sh == nil {
-			continue
-		}
-		host := strings.TrimSpace(sh.Host)
-		guest := strings.TrimSpace(sh.Guest)
-		if host == "" || guest == "" {
-			continue
-		}
-		args = append(args, "--folder", fmt.Sprintf("%s:%s", host, guest))
+	for _, s := range spec.Shares {
+		args = append(args, "--folder", fmt.Sprintf("%s:%s", s.Host, s.Guest))
 	}
 
-	// symlink runvm launcher (same as previous runctl behavior)
-	exeName := spec.Name
-	exePath := filepath.Join(instDir, exeName)
+	exePath := filepath.Join(instDir, spec.Name)
 	_ = os.Remove(exePath)
 	if err := os.Symlink("/usr/local/bin/runvm", exePath); err != nil {
 		return err
 	}
 
-	cmd := exec.Command("./"+exeName, args...)
-	cmd.Dir = instDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-
-	lp := rtsst.LockFilePath(name)
-	_ = rtsst.WriteLock(lp, spec.Name, cmd.Process.Pid)
-	return nannyWait(cmd, lp, cmd.Process.Pid)
-}
-
-func nannyWait(cmd *exec.Cmd, lock string, pid int) error {
-	waitCh := make(chan error, 1)
-	go func() { waitCh <- cmd.Wait() }()
-
-	sigCh := make(chan os.Signal, 8)
-	signal.Notify(sigCh,
-		syscall.SIGINT, syscall.SIGTERM,
-		syscall.SIGHUP, syscall.SIGTSTP,
-		syscall.SIGCONT,
-	)
-
-	for {
-		select {
-		case err := <-waitCh:
-			_ = os.Remove(lock)
-			return err
-		case s := <-sigCh:
-			_ = syscall.Kill(pid, s.(syscall.Signal))
-		}
-	}
-}
-
-func sshToInstance(name string) error {
-	instDir := rtsst.InstanceDir(name)
-	inst, err := loadInstance(instDir)
+	// CHANGED: Pass r.Log directly (it's already a pointer)
+	_, err = sst.Exec(r.Ctx, r.Log, sst.ExecRequest{
+		Cmd:  "./" + spec.Name,
+		Args: args,
+		Dir:  instDir,
+		Mode: sst.ExecForeground,
+	})
 	if err != nil {
+		r.Log.Diagnose(
+			r.Ctx,
+			"RUNVM_FAILED",
+			"runvm exited with failure",
+			"instance", spec.Name,
+			"error", err.Error(),
+		)
 		return err
 	}
-	spec := inst.Spec
 
-	ip, err := instanceIP(spec.Network.GetMac())
-	if err != nil {
-		return err
-	}
-
-	u, _ := user.Current()
-	cmd := exec.Command("ssh",
-		fmt.Sprintf("%s@%s", u.Username, ip),
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-	)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	return cmd.Run()
+	r.Log.Info(r.Ctx, "instance exited cleanly", "instance", spec.Name)
+	return nil
 }
 
-func stopInstance(name string) error {
+func (r *Runctl) Stop(name string) error {
 	lp := rtsst.LockFilePath(name)
 	info, err := rtsst.ReadLock(lp)
 	if err != nil {
@@ -440,7 +313,7 @@ func stopInstance(name string) error {
 	return nil
 }
 
-func pauseInstance(name string) error {
+func (r *Runctl) Pause(name string) error {
 	lp := rtsst.LockFilePath(name)
 	info, err := rtsst.ReadLock(lp)
 	if err != nil {
@@ -452,7 +325,7 @@ func pauseInstance(name string) error {
 	return nil
 }
 
-func resumeInstance(name string) error {
+func (r *Runctl) Resume(name string) error {
 	lp := rtsst.LockFilePath(name)
 	info, err := rtsst.ReadLock(lp)
 	if err != nil {
@@ -464,7 +337,36 @@ func resumeInstance(name string) error {
 	return nil
 }
 
-func listInstances() error {
+func (r *Runctl) SSH(name string) error {
+	inst, err := r.loadInstance(name)
+	if err != nil {
+		return err
+	}
+	mac := inst.Spec.Network.Mac
+	if mac == "" {
+		return fmt.Errorf("no MAC address in instance spec")
+	}
+
+	ip, err := instanceIP(mac)
+	if err != nil {
+		return err
+	}
+
+	u, _ := user.Current()
+	// CHANGED: Pass r.Log directly
+	_, err = sst.Exec(r.Ctx, r.Log, sst.ExecRequest{
+		Cmd: "ssh",
+		Args: []string{
+			fmt.Sprintf("%s@%s", u.Username, ip),
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "UserKnownHostsFile=/dev/null",
+		},
+		Mode: sst.ExecForeground,
+	})
+	return err
+}
+
+func (r *Runctl) List() error {
 	root := rtsst.InstanceRoot()
 	ents, err := os.ReadDir(root)
 	if err != nil {
@@ -484,4 +386,40 @@ func listInstances() error {
 		fmt.Printf("%s\t%s\n", name, state)
 	}
 	return nil
+}
+
+/* ======================= network helper ======================= */
+
+func instanceIP(mac string) (string, error) {
+	mac = strings.ToLower(mac)
+
+	// CHANGED: sst.LogxRoot() returns *Logx, so we pass it directly.
+	log := sst.LogxRoot().Subsystem("runctl.instanceip")
+
+	for _, cmd := range [][]string{
+		{"arp", "-a"},
+		{"ndp", "-a"},
+		{"ip", "neigh"},
+	} {
+		res, err := sst.Exec(context.Background(), log, sst.ExecRequest{
+			Cmd:  cmd[0],
+			Args: cmd[1:],
+			Mode: sst.ExecCaptured,
+		})
+		if err != nil {
+			continue
+		}
+		for _, ln := range strings.Split(res.Stdout, "\n") {
+			if strings.Contains(strings.ToLower(ln), mac) {
+				if start, end := strings.Index(ln, "("), strings.Index(ln, ")"); start > -1 && end > start {
+					return ln[start+1 : end], nil
+				}
+				if f := strings.Fields(ln); len(f) > 0 {
+					return f[0], nil
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("no IP found for MAC %s", mac)
 }

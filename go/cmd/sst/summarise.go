@@ -39,11 +39,11 @@ type summariseApp struct {
 // =========================
 
 type summariseMethods struct {
-	ApplyFlags  func(*summariseApp) error
-	FindRepo    func(*summariseApp) error
-	ListFiles   func(*summariseApp) error
-	WriteResult func(*summariseApp) error
-	AppendLsTree func(*summariseApp) error   // NEW
+	ApplyFlags   func(*summariseApp) error
+	FindRepo     func(*summariseApp) error
+	ListFiles    func(*summariseApp) error
+	WriteResult  func(*summariseApp) error
+	AppendLsTree func(*summariseApp) error // NEW
 	WriteOutput  func(*summariseApp) error
 }
 
@@ -100,7 +100,7 @@ var summariseCmd = &cobra.Command{
 			return app.methods.AppendLsTree(app)
 		})
 		app.steps.StepsAdd("write output", func(ctx *sst.StepsContext, _ sst.StepState) error {
-	return app.methods.WriteOutput(app)
+			return app.methods.WriteOutput(app)
 		})
 
 		return sst.StepsRun(app.steps)
@@ -174,7 +174,6 @@ func summariseWriteResult(app *summariseApp) error {
 	}
 	return nil
 }
-
 
 func summariseAppendLsTree(app *summariseApp) error {
 	fmt.Fprintf(&app.builder, "\n\n---\n\n# Repository tree (ls -R)\n\n")

@@ -4,10 +4,10 @@ import "time"
 
 // HardwareProbe is the top-level struct for the normalized hardware manifest.
 type HardwareProbe struct {
-	APIVersion string            `yaml:"apiVersion"`
-	Kind       string            `yaml:"kind"`
-	Metadata   ProbeMetadata     `yaml:"metadata"`
-	Spec       HardwareSpec      `yaml:"spec"`
+	APIVersion string        `yaml:"apiVersion"`
+	Kind       string        `yaml:"kind"`
+	Metadata   ProbeMetadata `yaml:"metadata"`
+	Spec       HardwareSpec  `yaml:"spec"`
 }
 
 // ProbeMetadata contains the identifiers for the probed machine.
@@ -25,11 +25,11 @@ type ProbeIdentifiers struct {
 
 // HardwareSpec contains the detailed specifications of the hardware.
 type HardwareSpec struct {
-	CPU        CPUSpec            `yaml:"cpu"`
-	Memory     MemorySpec         `yaml:"memory"`
-	Storage    StorageSpec        `yaml:"storage"`
-	Network    NetworkSpec        `yaml:"network"`
-	PCIDevices []PCIDevice        `yaml:"pciDevices,omitempty"`
+	CPU        CPUSpec     `yaml:"cpu"`
+	Memory     MemorySpec  `yaml:"memory"`
+	Storage    StorageSpec `yaml:"storage"`
+	Network    NetworkSpec `yaml:"network"`
+	PCIDevices []PCIDevice `yaml:"pciDevices,omitempty"`
 }
 
 type CPUSpec struct {

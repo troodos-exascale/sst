@@ -9,8 +9,8 @@ import (
 	"google.golang.org/grpc/status"
 	"gopkg.in/yaml.v3"
 
-	pb "github.com/swiss-software-tool/runtime-smart/go/proto/external/v1"
 	sst "github.com/swiss-software-tool/runtime-smart/go/internal/sst"
+	pb "github.com/swiss-software-tool/runtime-smart/go/proto/external/v1"
 
 	"github.com/swiss-software-tool/runtime-smart/go/cmd/hetzner-plugin/internal/probe"
 )
@@ -22,9 +22,9 @@ type Server struct {
 }
 
 // New creates a new server instance.
-func New(log sst.Logx) *Server {
+func New(log *sst.Logx) *Server {
 	return &Server{
-		log: log.Subsystem("plugin-server"),
+		log: *log.Subsystem("plugin-server"),
 	}
 }
 
@@ -51,7 +51,7 @@ func (s *Server) Probe(ctx context.Context, req *pb.ProbeRequest) (*pb.ProbeResp
 		return nil, status.Error(codes.InvalidArgument, "hostname not found in order YAML")
 	}
 
-	if err := probe.RunRemoteProbe(ctx, s.log, hostname, req.GetSshPrivateKey(), tempDir); err != nil {
+	if err := probe.RunRemoteProbe(ctx, &s.log, hostname, req.GetSshPrivateKey(), tempDir); err != nil {
 		return nil, status.Errorf(codes.Internal, "remote probe failed: %v", err)
 	}
 
@@ -62,7 +62,7 @@ func (s *Server) Probe(ctx context.Context, req *pb.ProbeRequest) (*pb.ProbeResp
 func (s *Server) NormalizeProbeData(ctx context.Context, req *pb.NormalizeRequest) (*pb.NormalizeResponse, error) {
 	s.log.Info(ctx, "NormalizeProbeData RPC called", "session_id", req.GetProbeSessionId())
 
-	yamlBytes, err := probe.Normalize(ctx, s.log, req.GetProbeSessionId())
+	yamlBytes, err := probe.Normalize(ctx, &s.log, req.GetProbeSessionId())
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to normalize probe data: %v", err)
 	}
@@ -71,6 +71,6 @@ func (s *Server) NormalizeProbeData(ctx context.Context, req *pb.NormalizeReques
 }
 
 // RegisterService registers the server implementation with a gRPC server.
-func RegisterService(g *grpc.Server, log sst.Logx) {
+func RegisterService(g *grpc.Server, log *sst.Logx) {
 	pb.RegisterSstHiCoreServiceServer(g, New(log))
 }

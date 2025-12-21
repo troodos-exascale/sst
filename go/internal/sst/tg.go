@@ -28,14 +28,14 @@ type Context struct {
 }
 
 // Runner is the engine that executes a graph of Contexts.
+// UPDATED: Log is now *Logx
 type Runner struct {
-	Log     Logx
+	Log     *Logx
 	DryRun  bool
 	Verbose bool
 	Silent  bool
 	Debug   bool
 }
-
 
 // Run is the main entry point for the executor.
 func (r *Runner) Run(ctx context.Context, rootCtx *Context) error {
@@ -52,7 +52,7 @@ func (r *Runner) runRecursive(ctx context.Context, tgCtx *Context) error {
 	actionValue, actionErr := tgCtx.Action(ctx)
 	result := &Result{Value: actionValue, Error: actionErr}
 
-	shouldInterpret := (actionErr == nil) || (actionErr != nil && tgCtx.InterpretOnError)
+	shouldInterpret := (actionErr == nil) || (tgCtx.InterpretOnError)
 
 	if tgCtx.Interpret != nil && shouldInterpret {
 		continuation, interpErr := tgCtx.Interpret(result)

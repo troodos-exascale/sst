@@ -237,4 +237,3 @@ func copyFile(src, dst string) (err error) {
 	_, err = io.Copy(destFile, sourceFile)
 	return err
 }
-

@@ -4,24 +4,24 @@ package sst.yaml.mkimage.v1;
 
 option go_package = "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/mkimage/v1;mkimagepb";
 
-// Matches go/internal/rtsst/write_yaml.go (ImageYAML + Source)
-// and replaces go/internal/rtsst/schema.cue validation.
+// ============================================================================
+// Top-level image document
+// ============================================================================
 
 message ImageYAML {
-  ImageMeta image = 1;
-  repeated Source sources = 2;
+   string name = 1;
+   string upstream = 2;
+   string retrieved_at = 3;
+   string source_file_name = 4;
+   string format = 5;
+   string local_sha =6;
+
+   string raw_image = 7;
+   string kernel = 8;
+   string initrd = 9;
+   string rootfs_part_uuid = 10;
+   string bootfs_part_uuid = 11;
+   string rootfs_type = 12;
+   string bootfs_type = 13;
 }
 
-message ImageMeta {
-  string name = 1;
-  string version = 2;
-  string description = 3;
-}
-
-message Source {
-  string name = 1;
-  string upstream = 2;
-  string sha256 = 3;
-  string format = 4;
-  string retrieved_at = 5;
-}

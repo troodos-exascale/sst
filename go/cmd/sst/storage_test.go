@@ -4,10 +4,9 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"os"
 
 	sst "github.com/swiss-software-tool/runtime-smart/go/internal/sst"
-
-	hardwarepb "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/hardware/v1"
 	storagepb "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/storage/v1"
 )
 

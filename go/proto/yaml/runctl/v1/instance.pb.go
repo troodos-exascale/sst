@@ -85,6 +85,7 @@ type InstanceSpec struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Name  string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
 	// Base image reference (path or logical name)
+	// This is the primary RW disk.
 	Image string `protobuf:"bytes,2,opt,name=image,proto3" json:"image,omitempty"`
 	// Boot mode: "efi" or "kernel"
 	Boot string `protobuf:"bytes,3,opt,name=boot,proto3" json:"boot,omitempty"`
@@ -96,14 +97,23 @@ type InstanceSpec struct {
 	// Resources
 	CpuCount   int32  `protobuf:"varint,7,opt,name=cpu_count,json=cpuCount,proto3" json:"cpu_count,omitempty"`
 	MemorySize string `protobuf:"bytes,8,opt,name=memory_size,json=memorySize,proto3" json:"memory_size,omitempty"`
-	// Attached disks
+	// Attached disks (additional)
 	Disks []*Disk `protobuf:"bytes,9,rep,name=disks,proto3" json:"disks,omitempty"`
 	// Host ↔ guest shares
 	Shares []*Share `protobuf:"bytes,10,rep,name=shares,proto3" json:"shares,omitempty"`
 	// Networking
 	Network *Network `protobuf:"bytes,11,opt,name=network,proto3" json:"network,omitempty"`
 	// EFI variables store (used when boot == "efi")
-	EfiVars       string `protobuf:"bytes,12,opt,name=efi_vars,json=efiVars,proto3" json:"efi_vars,omitempty"`
+	EfiVars string `protobuf:"bytes,12,opt,name=efi_vars,json=efiVars,proto3" json:"efi_vars,omitempty"`
+	// Hostname for the guest. If network.hostname is set, it overrides this.
+	Hostname string `protobuf:"bytes,13,opt,name=hostname,proto3" json:"hostname,omitempty"`
+	// PARTUUID of the root filesystem partition. Used for stable root=PARTUUID=…
+	// and for constructing correct cmdline in "kernel" boot mode.
+	RootfsPartUuid string `protobuf:"bytes,14,opt,name=rootfs_part_uuid,json=rootfsPartUuid,proto3" json:"rootfs_part_uuid,omitempty"`
+	// Explicit cloud-init source. Typically a path like "cidata.iso",
+	// but intentionally modeled as a free string so it can become a URI later
+	// (e.g. "http(s)://…", "nfs://…", "vsock://…").
+	Cidata        string `protobuf:"bytes,15,opt,name=cidata,proto3" json:"cidata,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -222,6 +232,27 @@ func (x *InstanceSpec) GetEfiVars() string {
 	return ""
 }
 
+func (x *InstanceSpec) GetHostname() string {
+	if x != nil {
+		return x.Hostname
+	}
+	return ""
+}
+
+func (x *InstanceSpec) GetRootfsPartUuid() string {
+	if x != nil {
+		return x.RootfsPartUuid
+	}
+	return ""
+}
+
+func (x *InstanceSpec) GetCidata() string {
+	if x != nil {
+		return x.Cidata
+	}
+	return ""
+}
+
 type Disk struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Path          string                 `protobuf:"bytes,1,opt,name=path,proto3" json:"path,omitempty"` // e.g. data.img
@@ -327,9 +358,12 @@ func (x *Share) GetGuest() string {
 }
 
 type Network struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Mac           string                 `protobuf:"bytes,1,opt,name=mac,proto3" json:"mac,omitempty"`
-	Mode          string                 `protobuf:"bytes,2,opt,name=mode,proto3" json:"mode,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Mac   string                 `protobuf:"bytes,1,opt,name=mac,proto3" json:"mac,omitempty"`
+	Mode  string                 `protobuf:"bytes,2,opt,name=mode,proto3" json:"mode,omitempty"`
+	// Optional per-network hostname override.
+	// If empty, InstanceSpec.hostname is used.
+	Hostname      string `protobuf:"bytes,3,opt,name=hostname,proto3" json:"hostname,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -378,6 +412,13 @@ func (x *Network) GetMode() string {
 	return ""
 }
 
+func (x *Network) GetHostname() string {
+	if x != nil {
+		return x.Hostname
+	}
+	return ""
+}
+
 var File_yaml_runctl_v1_instance_proto protoreflect.FileDescriptor
 
 const file_yaml_runctl_v1_instance_proto_rawDesc = "" +
@@ -387,7 +428,7 @@ const file_yaml_runctl_v1_instance_proto_rawDesc = "" +
 	"\vapi_version\x18\x01 \x01(\tR\n" +
 	"apiVersion\x12\x12\n" +
 	"\x04kind\x18\x02 \x01(\tR\x04kind\x124\n" +
-	"\x04spec\x18\x03 \x01(\v2 .sst.yaml.runctl.v1.InstanceSpecR\x04spec\"\x87\x03\n" +
+	"\x04spec\x18\x03 \x01(\v2 .sst.yaml.runctl.v1.InstanceSpecR\x04spec\"\xe5\x03\n" +
 	"\fInstanceSpec\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12\x14\n" +
 	"\x05image\x18\x02 \x01(\tR\x05image\x12\x12\n" +
@@ -402,16 +443,20 @@ const file_yaml_runctl_v1_instance_proto_rawDesc = "" +
 	"\x06shares\x18\n" +
 	" \x03(\v2\x19.sst.yaml.runctl.v1.ShareR\x06shares\x125\n" +
 	"\anetwork\x18\v \x01(\v2\x1b.sst.yaml.runctl.v1.NetworkR\anetwork\x12\x19\n" +
-	"\befi_vars\x18\f \x01(\tR\aefiVars\".\n" +
+	"\befi_vars\x18\f \x01(\tR\aefiVars\x12\x1a\n" +
+	"\bhostname\x18\r \x01(\tR\bhostname\x12(\n" +
+	"\x10rootfs_part_uuid\x18\x0e \x01(\tR\x0erootfsPartUuid\x12\x16\n" +
+	"\x06cidata\x18\x0f \x01(\tR\x06cidata\".\n" +
 	"\x04Disk\x12\x12\n" +
 	"\x04path\x18\x01 \x01(\tR\x04path\x12\x12\n" +
 	"\x04mode\x18\x02 \x01(\tR\x04mode\"1\n" +
 	"\x05Share\x12\x12\n" +
 	"\x04host\x18\x01 \x01(\tR\x04host\x12\x14\n" +
-	"\x05guest\x18\x02 \x01(\tR\x05guest\"/\n" +
+	"\x05guest\x18\x02 \x01(\tR\x05guest\"K\n" +
 	"\aNetwork\x12\x10\n" +
 	"\x03mac\x18\x01 \x01(\tR\x03mac\x12\x12\n" +
-	"\x04mode\x18\x02 \x01(\tR\x04modeBOZMgithub.com/swiss-software-tool/runtime-smart/go/proto/yaml/runctl/v1;runctlpbb\x06proto3"
+	"\x04mode\x18\x02 \x01(\tR\x04mode\x12\x1a\n" +
+	"\bhostname\x18\x03 \x01(\tR\bhostnameBOZMgithub.com/swiss-software-tool/runtime-smart/go/proto/yaml/runctl/v1;runctlpbb\x06proto3"
 
 var (
 	file_yaml_runctl_v1_instance_proto_rawDescOnce sync.Once
