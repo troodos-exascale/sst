@@ -3,3 +3,5 @@
 **/.DS_Store
 /oldbuild/*
 /runctl/runctl
+
+**/*.pb.go

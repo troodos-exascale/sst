@@ -10,7 +10,7 @@ tidy:
 format:
 	go fmt ./...
 
-generate: tidy
+generate:
 	go generate ./...
 
 build: generate
