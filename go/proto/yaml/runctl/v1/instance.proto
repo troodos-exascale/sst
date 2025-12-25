@@ -4,98 +4,40 @@ package sst.yaml.runctl.v1;
 
 option go_package = "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/runctl/v1;runctlpb";
 
-// -----------------------------------------------------------------------------
-// Instance (top-level object)
-// -----------------------------------------------------------------------------
-
 message Instance {
   string api_version = 1; // "sst.io/v1"
   string kind        = 2; // "Instance"
-
-  InstanceSpec spec = 3;
+  string name = 3;
+  // Relative path of the image
+  string image = 4;
+  string boot = 5;
+  string kernel = 6;
+  string initrd = 7;
+  string params = 8;
+  int32 cpu_count = 9;
+  string memory_size = 10;
+  repeated Disk disks = 11;
+  repeated Share shares = 12;
+  Network network = 13;
+  string efi_vars = 14;
+  string hostname = 15;
+  string rootfs_part_uuid = 16;
+  string rootfs_type = 17; 
+  string bootfs_part_uuid = 18;
+  string bootfs_type = 19;
+  string cidata = 20;
 }
-
-// -----------------------------------------------------------------------------
-// Spec
-// -----------------------------------------------------------------------------
-
-message InstanceSpec {
-  string name = 1;
-
-  // Base image reference (path or logical name)
-  // This is the primary RW disk.
-  string image = 2;
-
-  // Boot mode: "efi" or "kernel"
-  string boot = 3;
-
-  // Explicit kernel/initrd (used when boot == "kernel")
-  string kernel = 4;
-  string initrd = 5;
-
-  // Kernel command-line parameters
-  string params = 6;
-
-  // Resources
-  int32 cpu_count = 7;
-  string memory_size = 8;
-
-  // Attached disks (additional)
-  repeated Disk disks = 9;
-
-  // Host ↔ guest shares
-  repeated Share shares = 10;
-
-  // Networking
-  Network network = 11;
-
-  // EFI variables store (used when boot == "efi")
-  string efi_vars = 12;
-
-  // ---------------------------------------------------------------------------
-  // Added: host identity + boot/root selection + explicit cloud-init
-  // ---------------------------------------------------------------------------
-
-  // Hostname for the guest. If network.hostname is set, it overrides this.
-  string hostname = 13;
-
-  // PARTUUID of the root filesystem partition. Used for stable root=PARTUUID=…
-  // and for constructing correct cmdline in "kernel" boot mode.
-  string rootfs_part_uuid = 14;
-
-  // Explicit cloud-init source. Typically a path like "cidata.iso",
-  // but intentionally modeled as a free string so it can become a URI later
-  // (e.g. "http(s)://…", "nfs://…", "vsock://…").
-  string cidata = 15;
-}
-
-// -----------------------------------------------------------------------------
-// Disk
-// -----------------------------------------------------------------------------
-
 message Disk {
   string path = 1;  // e.g. data.img
   string mode = 2;  // "rw" or "ro"
 }
-
-// -----------------------------------------------------------------------------
-// Share
-// -----------------------------------------------------------------------------
-
 message Share {
   string host  = 1;
   string guest = 2;
 }
-
-// -----------------------------------------------------------------------------
-// Network
-// -----------------------------------------------------------------------------
-
 message Network {
   string mac = 1;
   string mode = 2;
-
-  // Optional per-network hostname override.
-  // If empty, InstanceSpec.hostname is used.
+  // Optional
   string hostname = 3;
 }

@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"crypto/sha256"
+	"encoding/hex"	
 )
 
 func GetFileOwnership(path string) (int, int, error) {
@@ -105,4 +107,18 @@ func CopyFile(src, dst string) error {
 
 	_, err = io.Copy(out, in)
 	return err
+}
+func SHA256File(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(h.Sum(nil)), nil
 }

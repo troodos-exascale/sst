@@ -3,11 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+	"os/user"
 
 	"github.com/spf13/cobra"
 
@@ -163,7 +163,7 @@ func pullVMSetupEnv(app *pullVMApp) error {
 func pullVMDownload(app *pullVMApp) error {
 	base := filepath.Base(app.upstreamArg)
 	app.srcImage = filepath.Join(app.imageDir, base)
-	return copyFile(app.upstreamArg, app.srcImage)
+	return rtsst.CopySparse(app.upstreamArg, app.srcImage)
 }
 
 func pullVMConvert(app *pullVMApp) error {
@@ -282,46 +282,113 @@ func createInstance(image, name string) error {
 		return err
 	}
 
-	// Load instance.yaml (proto-backed)
-	inst := &runctlpb.Instance{}
-	yo := &sst.YamlObject{
-		Path:   filepath.Join(instDir, "instance.yaml"),
-		Schema: "sst.yaml.runctl.v1.Instance",
-		Kind:   "Instance",
-		Msg:    inst,
+	imageYaml := &mkimagepb.ImageYAML{}
+	imgYo := &sst.YamlObject{
+		Path:   filepath.Join(instDir, "image.yaml"),
+		Schema: "sst.yaml.mkimage.v1.ImageYAML",
+		Kind:   "Image",
+		Msg:    imageYaml,
 	}
-
-	if diags := yo.Load(ctx, log); diags != nil {
+	if diags := imgYo.Load(ctx, log); diags != nil {
 		return diags
 	}
 
+	// Load instance.yaml (proto-backed)
+	instanceYaml := &runctlpb.Instance{}
+	instYo := &sst.YamlObject{
+		Path:   filepath.Join(instDir, "instance.yaml"),
+		Schema: "sst.yaml.runctl.v1.Instance",
+		Kind:   "Instance",
+		Msg:    instanceYaml,
+	}
+
 	// Copy base image
-	src := filepath.Join(imageDir, filepath.Base(image))
-	dst := filepath.Join(instDir, filepath.Base(image))
-	if err := copyFile(src, dst); err != nil {
+	src := filepath.Join(imageDir, imageYaml.RawImage)
+	dst := filepath.Join(instDir, imageYaml.RawImage)
+	if err := rtsst.CopySparse(src, dst); err != nil {
+		return err
+	}
+	if err := rtsst.CopyFile(filepath.Join(imageDir, "kernel"), filepath.Join(instDir, "kernel")); err != nil {
+		return err
+	}
+	if err := rtsst.CopyFile(filepath.Join(imageDir, "initrd"), filepath.Join(instDir, "initrd")); err != nil {
+		return err
+	}
+	mac, err := rtsst.GenerateMAC()
+	if err != nil {
+		return err
+	}
+
+
+
+	instanceYaml.Boot = "kernel"
+	instanceYaml.Image = imageYaml.RawImage
+	instanceYaml.Name = name
+	instanceYaml.Hostname = name
+	instanceYaml.Kernel = imageYaml.Kernel
+	instanceYaml.Initrd = imageYaml.Initrd
+	instanceYaml.CpuCount = 4
+	instanceYaml.MemorySize = "8096"
+	instanceYaml.Network = &runctlpb.Network{
+		Mac: mac,
+		Mode: "dhcp",
+	}
+	instanceYaml.EfiVars = "efi-vars"
+	instanceYaml.RootfsPartUuid = imageYaml.RootfsPartUuid
+	instanceYaml.RootfsType = imageYaml.RootfsType
+	instanceYaml.Params = fmt.Sprintf(
+		"console=hvc0 console=tty0 oops=panic panic=10 sysrq_always_enabled=1 loglevel=4 initrd=%s root=UUID=%s rootfstype=%s", 
+		imageYaml.Initrd, 
+		imageYaml.RootfsPartUuid,
+		imageYaml.RootfsType,
+	)
+	u, err := user.Current()
+	if err != nil {
+		return err
+	}
+
+	instanceYaml.Shares = []*runctlpb.Share{
+		{
+			Host:  u.HomeDir,
+			Guest: "/Users/" + u.Username,
+		},
+	}
+
+	size := int64(30) * 1024 * 1024 * 1024 // 30 GiB
+	f, err := os.Create(filepath.Join(instDir, "data.img"))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := f.Truncate(size); err != nil {
+		return err
+	}
+	instanceYaml.Disks = []*runctlpb.Disk{
+		{
+			Path: "data.img",
+			Mode: "rw",
+		},{
+	    	Path: instanceYaml.Image,
+			Mode: "ro",
+		},{
+			Path: "cidata.iso",
+			Mode: "ro",
+		},
+	}
+
+	if err := instYo.Save(ctx, log); err != nil {
+		return err
+	}
+
+	err = rtsst.WriteCIData(instDir, instanceYaml.Hostname)
+	if err != nil {
+		return err
+	}
+
+	err = rtsst.UpdateCIDATAISO(instDir)
+	if err != nil {
 		return err
 	}
 
 	return nil
-}
-
-/* ======================= helpers ======================= */
-
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-	return out.Close()
 }

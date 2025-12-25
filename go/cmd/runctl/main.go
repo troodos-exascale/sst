@@ -202,32 +202,31 @@ func (r *Runctl) Start(name string) error {
 	if err != nil {
 		return err
 	}
-	spec := inst.Spec
-
+	
 	r.Log.Info(r.Ctx, "starting instance",
-		"instance", spec.Name,
-		"boot", spec.Boot,
-		"image", spec.Image,
+		"instance", inst.Name,
+		"boot", inst.Boot,
+		"image", inst.Image,
 	)
 
-	cpu := int(spec.CpuCount)
+	cpu := int(inst.CpuCount)
 	if cpu <= 0 {
 		cpu = 4
 	}
-	memMiB, err := parseMemorySizeMiB(spec.MemorySize)
+	memMiB, err := parseMemorySizeMiB(inst.MemorySize)
 	if err != nil {
 		return err
 	}
 
 	args := []string{
-		"--name", spec.Name,
+		"--name", inst.Name,
 		"--cpu-count", strconv.Itoa(cpu),
 		"--memory-size", strconv.FormatUint(memMiB, 10),
 	}
 
-	switch spec.Boot {
+	switch inst.Boot {
 	case "efi":
-		efiVars := spec.EfiVars
+		efiVars := inst.EfiVars
 		if efiVars == "" {
 			efiVars = "efi-vars"
 		}
@@ -237,31 +236,31 @@ func (r *Runctl) Start(name string) error {
 		)
 
 	case "kernel":
-		if spec.Kernel == "" {
-			return fmt.Errorf("boot=kernel requires spec.kernel")
+		if inst.Kernel == "" {
+			return fmt.Errorf("boot=kernel requires inst.kernel")
 		}
 		args = append(args,
 			"--bootloader", "linux",
-			"--kernel", spec.Kernel,
+			"--kernel", inst.Kernel,
 		)
-		if spec.Initrd != "" {
-			args = append(args, "--initrd", spec.Initrd)
+		if inst.Initrd != "" {
+			args = append(args, "--initrd", inst.Initrd)
 		}
-		if spec.Params != "" {
-			args = append(args, "--params", spec.Params)
+		if inst.Params != "" {
+			args = append(args, "--params", inst.Params)
 		}
 
 	default:
-		return fmt.Errorf("invalid boot mode %q", spec.Boot)
+		return fmt.Errorf("invalid boot mode %q", inst.Boot)
 	}
 
-	args = append(args, "--rwdisk", spec.Image)
+	args = append(args, "--rwdisk", inst.Image)
 
-	if spec.Cidata != "" {
-		args = append(args, "--disk", filepath.Join(instDir, spec.Cidata))
+	if inst.Cidata != "" {
+		args = append(args, "--disk", filepath.Join(instDir, inst.Cidata))
 	}
 
-	for _, d := range spec.Disks {
+	for _, d := range inst.Disks {
 		if d.Mode == "rw" {
 			args = append(args, "--rwdisk", d.Path)
 		} else {
@@ -269,11 +268,11 @@ func (r *Runctl) Start(name string) error {
 		}
 	}
 
-	for _, s := range spec.Shares {
+	for _, s := range inst.Shares {
 		args = append(args, "--folder", fmt.Sprintf("%s:%s", s.Host, s.Guest))
 	}
 
-	exePath := filepath.Join(instDir, spec.Name)
+	exePath := filepath.Join(instDir, inst.Name)
 	_ = os.Remove(exePath)
 	if err := os.Symlink("/usr/local/bin/runvm", exePath); err != nil {
 		return err
@@ -281,7 +280,7 @@ func (r *Runctl) Start(name string) error {
 
 	// CHANGED: Pass r.Log directly (it's already a pointer)
 	_, err = sst.Exec(r.Ctx, r.Log, sst.ExecRequest{
-		Cmd:  "./" + spec.Name,
+		Cmd:  "./" + inst.Name,
 		Args: args,
 		Dir:  instDir,
 		Mode: sst.ExecForeground,
@@ -291,13 +290,13 @@ func (r *Runctl) Start(name string) error {
 			r.Ctx,
 			"RUNVM_FAILED",
 			"runvm exited with failure",
-			"instance", spec.Name,
+			"instance", inst.Name,
 			"error", err.Error(),
 		)
 		return err
 	}
 
-	r.Log.Info(r.Ctx, "instance exited cleanly", "instance", spec.Name)
+		r.Log.Info(r.Ctx, "instance exited cleanly", "instance", inst.Name)
 	return nil
 }
 
@@ -342,7 +341,7 @@ func (r *Runctl) SSH(name string) error {
 	if err != nil {
 		return err
 	}
-	mac := inst.Spec.Network.Mac
+	mac := inst.Network.Mac
 	if mac == "" {
 		return fmt.Errorf("no MAC address in instance spec")
 	}

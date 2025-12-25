@@ -136,7 +136,7 @@ func TestScenario1_SeparateBootPartition(t *testing.T) {
 		// Just copy upstreamPath -> app.srcImage
 		base := filepath.Base(a.upstreamArg)
 		a.srcImage = filepath.Join(a.imageDir, base)
-		return copyFile(a.upstreamArg, a.srcImage)
+		return rtsst.CopySparse(a.upstreamArg, a.srcImage)
 	}
 
 	// 3. Run
