@@ -69,9 +69,9 @@ func TestLogxLevels(t *testing.T) {
 	ctx := context.Background()
 
 	testCases := []struct {
-		name              string
-		globalLevel       string
-		subsystemLevels   string
+		name            string
+		globalLevel     string
+		subsystemLevels string
 		// Updated to take *sst.Logx
 		logFn             func(l *sst.Logx)
 		expectInOutput    []map[string]string
@@ -79,7 +79,7 @@ func TestLogxLevels(t *testing.T) {
 	}{
 		{
 			name:        "Default Level (INFO)",
-			globalLevel: "", 
+			globalLevel: "",
 			logFn: func(l *sst.Logx) {
 				l.Debug(ctx, "debug message")
 				l.Info(ctx, "info message")

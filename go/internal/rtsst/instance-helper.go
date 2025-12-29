@@ -1,9 +1,12 @@
 package rtsst
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
+	sst "github.com/swiss-software-tool/runtime-smart/go/internal/sst"
+	"github.com/swiss-software-tool/runtime-smart/go/proto/yaml/runctl/v1"
 	"os"
 	"os/exec"
 	"os/user"
@@ -139,26 +142,17 @@ func GenerateMAC() (string, error) {
 		buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]), nil
 }
 
-func WriteCIData(instDir string, hostname string) error {
-
-	cidataDir := filepath.Join(instDir, "cidata")
-	if err := os.MkdirAll(cidataDir, 0755); err != nil {
-		return fmt.Errorf("cannot create cidata directory: %w", err)
-	}
-
-	// --- Resolve user information ---
+// GetLocalPublicKey attempts to find a valid SSH public key in the current user's ~/.ssh directory.
+// It checks standard key names in priority order (ed25519, rsa, ecdsa, dsa).
+func GetLocalPublicKey() (string, error) {
 	u, err := user.Current()
 	if err != nil {
-		return fmt.Errorf("cannot determine current user: %w", err)
-	}
-	username := u.Username
-	gecos := u.Name
-	if gecos == "" {
-		gecos = username
+		return "", fmt.Errorf("cannot determine current user: %w", err)
 	}
 
-	// --- Find a public SSH key ---
 	sshDir := filepath.Join(u.HomeDir, ".ssh")
+
+	// Priority order matches standard ssh preferences
 	pubCandidates := []string{
 		filepath.Join(sshDir, "id_ed25519.pub"),
 		filepath.Join(sshDir, "id_rsa.pub"),
@@ -166,67 +160,158 @@ func WriteCIData(instDir string, hostname string) error {
 		filepath.Join(sshDir, "id_dsa.pub"),
 	}
 
-	var pubKey string
 	for _, p := range pubCandidates {
 		b, err := os.ReadFile(p)
-		if err == nil && len(strings.TrimSpace(string(b))) > 0 {
-			pubKey = strings.TrimSpace(string(b))
-			break
+		if err == nil {
+			key := strings.TrimSpace(string(b))
+			if len(key) > 0 {
+				return key, nil
+			}
 		}
 	}
 
-	if pubKey == "" {
-		return fmt.Errorf("no usable SSH public key found in %s", sshDir)
-	}
+	return "", fmt.Errorf("no usable SSH public key found in %s", sshDir)
+}
 
-	// --- Write user-data ---
-	// Include directory creation for /Users/<username>
-	userData := fmt.Sprintf(`#cloud-config
-network:
-  config: disabled
-hostname: %s
+func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *runctlpb.Instance) error {
+    cidataDir := filepath.Join(instanceDir, "cidata")
+    if err := os.MkdirAll(cidataDir, 0755); err != nil {
+        return fmt.Errorf("failed to create cidata dir: %w", err)
+    }
 
-ssh_pwauth: false
-disable_root: true
+    pubKey, err := GetLocalPublicKey()
+    if err != nil {
+        return fmt.Errorf("failed to get user's local public key: %w", err)
+    }
 
-users:
-  - name: %s
-    gecos: %s
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    shell: /bin/bash
-    ssh_authorized_keys:
-      - %s
+    user, err := user.Current()
+    if err != nil {
+        return fmt.Errorf("failed to get current user: %w", err)
+    }
 
-runcmd:
-  - mkdir -p /Users/%s
-  - chown %s:%s /Users/%s
-  - touch /etc/cloud/cloud-init.disabled
-`,
-		hostname, // hostname
-		username, // user
-		gecos,    // gecos
-		pubKey,   // ssh key
-		username, // /Users/<user>
-		username, // owner
-		username, // group
-		username, // /Users/<user>
-	)
+    // ---- Prepare mounts ----
+    type mountInfo struct {
+        tag       string
+        guestPath string
+        options   string
+    }
+    var mounts []mountInfo
 
-	if err := os.WriteFile(filepath.Join(cidataDir, "user-data"),
-		[]byte(userData), 0644); err != nil {
-		return fmt.Errorf("writing user-data failed: %w", err)
-	}
+    for _, shareStr := range inst.SharedDir {
+        parts := strings.Split(shareStr, ":")
+        if len(parts) == 0 || parts[0] == "" {
+            continue
+        }
 
-	// --- Write meta-data ---
-	meta := fmt.Sprintf("instance-id: %s\nlocal-hostname: %s\n",
-		hostname, hostname)
+        tag := parts[0]
+        guestPath := tag
+        if len(parts) > 1 && parts[1] != "" {
+            guestPath = parts[1]
+        }
 
-	if err := os.WriteFile(filepath.Join(cidataDir, "meta-data"),
-		[]byte(meta), 0644); err != nil {
-		return fmt.Errorf("writing meta-data failed: %w", err)
-	}
+        opts := "rw"
+        if len(parts) > 2 && parts[2] == "ro" {
+            opts = "ro"
+        }
 
-	return nil
+        mounts = append(mounts, mountInfo{
+            tag:       tag,
+            guestPath: guestPath,
+            options:   opts,
+        })
+    }
+
+    // ---- Build user-data ----
+    var sb strings.Builder
+
+    sb.WriteString("#cloud-config\n")
+    sb.WriteString("# syntax=yaml\n\n")
+
+    fmt.Fprintf(&sb, "hostname: %s\n", inst.Hostname)
+    sb.WriteString("lock_passwd: false\n")
+    sb.WriteString("ssh_pwauth: false\n")
+    sb.WriteString("disable_root: true\n\n")
+
+    // 1. Install packages first
+    sb.WriteString("packages:\n")
+    sb.WriteString("  - sudo\n")
+    sb.WriteString("  - bash\n\n")
+
+    // 2. Configure Users
+    sb.WriteString("users:\n")
+    sb.WriteString("  - default\n")
+    fmt.Fprintf(&sb, "  - name: %s\n", user.Username)
+    if user.Name != "" {
+        fmt.Fprintf(&sb, "    gecos: %s\n", user.Name)
+    }
+    sb.WriteString("    sudo: ALL=(ALL) NOPASSWD:ALL\n")
+    sb.WriteString("    shell: /bin/bash\n")
+    if pubKey != "" {
+        sb.WriteString("    ssh_authorized_keys:\n")
+        sb.WriteString("      - " + pubKey + "\n")
+    }
+
+    // 3. Set Passwords
+    sb.WriteString("\nchpasswd:\n")
+    sb.WriteString("  list: |\n")
+    fmt.Fprintf(&sb, "    %s:abcd1234\n", user.Username)
+    sb.WriteString("  expire: False\n")
+
+    // 4. Mounts
+    if len(mounts) > 0 {
+        sb.WriteString("\n# Mount virtiofs shares\n")
+        sb.WriteString("mounts:\n")
+        for _, m := range mounts {
+            fmt.Fprintf(
+                &sb,
+                "  - [ \"%s\", \"%s\", \"virtiofs\", \"%s\", \"0\", \"0\" ]\n",
+                m.tag,
+                m.guestPath,
+                m.options,
+            )
+        }
+    }
+
+    // 5. runcmd (Using raw strings)
+    sb.WriteString("\nruncmd:\n")
+    
+    // Alpine console fix
+    sb.WriteString("  - |\n")
+    sb.WriteString(`    if [ -f /etc/alpine-release ]; then
+      # Disable the missing serial console in inittab to stop the spam
+      sed -i 's/^ttyAMA0/#ttyAMA0/' /etc/inittab
+      
+      # Reload init to apply changes immediately
+      kill -HUP 1
+    fi
+`)
+
+    // Ensure mountpoints exist
+    for _, m := range mounts {
+        sb.WriteString("  - |\n")
+        fmt.Fprintf(&sb, "    mkdir -p %s\n", m.guestPath)
+    }
+
+    userData := sb.String()
+
+    // ---- meta-data ----
+    metaData := fmt.Sprintf(
+        "instance-id: %s\nlocal-hostname: %s\n",
+        inst.Hostname,
+        inst.Hostname,
+    )
+
+    // ---- Write files ----
+    if err := os.WriteFile(filepath.Join(cidataDir, "user-data"), []byte(userData), 0644); err != nil {
+        return fmt.Errorf("failed to write user-data: %w", err)
+    }
+
+    if err := os.WriteFile(filepath.Join(cidataDir, "meta-data"), []byte(metaData), 0644); err != nil {
+        return fmt.Errorf("failed to write meta-data: %w", err)
+    }
+
+    log.Info(ctx, "cidata.written", "dir", cidataDir)
+    return nil
 }
 
 func UpdateCIDATAISO(instDir string) error {
@@ -262,7 +347,7 @@ func UpdateCIDATAISO(instDir string) error {
 		"hdiutil", "makehybrid",
 		"-o", iso,
 		src,
-		"-hfs", "-joliet", "-iso",
+		"-joliet", "-iso",
 		"-default-volume-name", "cidata",
 	)
 	cmd.Stdout = os.Stdout
@@ -296,4 +381,77 @@ func CreateLock(lockPath string) (*Lock, error) {
 // Remove deletes the lock file.
 func (l *Lock) Remove() {
 	_ = os.Remove(l.Path)
+}
+
+// EnsureCIDataISO ensures that cidata.iso exists and is up to date.
+// If user-data or meta-data is newer than the ISO, it regenerates the ISO
+// and writes a new instance-id into meta-data so cloud-init re-runs.
+//
+// The instance-id is human-readable and collision-free.
+func EnsureCIDataISO(ctx context.Context, log *sst.Logx, instDir string) error {
+	cidataDir := filepath.Join(instDir, "cidata")
+	isoPath := filepath.Join(instDir, "cidata.iso")
+	userDataPath := filepath.Join(cidataDir, "user-data")
+	metaDataPath := filepath.Join(cidataDir, "meta-data")
+
+	// --- decide whether rebuild is needed ---
+	needsRebuild := false
+
+	isoInfo, err := os.Stat(isoPath)
+	if os.IsNotExist(err) {
+		needsRebuild = true
+		log.Info(ctx, "cidata.iso missing, generating")
+	} else if err != nil {
+		return fmt.Errorf("stat cidata.iso: %w", err)
+	} else {
+		if ui, err := os.Stat(userDataPath); err == nil && ui.ModTime().After(isoInfo.ModTime()) {
+			needsRebuild = true
+			log.Info(ctx, "user-data newer than cidata.iso, regenerating")
+		}
+		if mi, err := os.Stat(metaDataPath); err == nil && mi.ModTime().After(isoInfo.ModTime()) {
+			needsRebuild = true
+			log.Info(ctx, "meta-data newer than cidata.iso, regenerating")
+		}
+	}
+
+	if !needsRebuild {
+		return nil
+	}
+
+	// --- write fresh meta-data with new instance-id ---
+	// Cloud-init accepts any string; use readable + monotonic format.
+	instanceID := "iid-" + time.Now().UTC().Format("2006-01-02-15-04-05.000000000")
+	hostname := filepath.Base(instDir)
+
+	metaData := fmt.Sprintf(
+		"instance-id: %s\nlocal-hostname: %s\n",
+		instanceID,
+		hostname,
+	)
+
+	if err := os.WriteFile(metaDataPath, []byte(metaData), 0644); err != nil {
+		return fmt.Errorf("write meta-data: %w", err)
+	}
+
+	log.Info(ctx, "Updated instance-id", "instance_id", instanceID)
+
+	// --- rebuild cidata.iso ---
+	_ = os.Remove(isoPath) // ignore error; hdiutil will fail if it matters
+
+	cmd := exec.Command(
+		"hdiutil", "makehybrid",
+		"-o", isoPath,
+		cidataDir,
+		"-joliet", "-iso",
+		"-default-volume-name", "cidata",
+	)
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Error(ctx, "hdiutil makehybrid failed", "output", string(out))
+		return fmt.Errorf("generate cidata.iso: %w", err)
+	}
+
+	log.Info(ctx, "cidata.iso regenerated successfully")
+	return nil
 }

@@ -20,8 +20,12 @@ message ImageYAML {
    string kernel = 8;
    string initrd = 9;
    string rootfs_part_uuid = 10;
-   string bootfs_part_uuid = 11;
-   string rootfs_type = 12;
-   string bootfs_type = 13;
+   string rootfs_device = 11;
+   string rootfs_uuid = 12;
+   string rootfs_type = 13;
+   string bootfs_part_uuid = 14;
+   string bootfs_device = 15;
+   string bootfs_uuid = 16;
+   string bootfs_type = 17;
 }
 

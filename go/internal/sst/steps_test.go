@@ -11,9 +11,9 @@ import (
 
 func TestSteps_StatePassing(t *testing.T) {
 	// Scenario: Step 1 sets a value, Step 2 reads it.
-	
+
 	runner := sst.StepsInit("test-state-passing")
-	
+
 	// Step 1: Produce
 	runner.StepsAdd("generate-token", func(ctx *sst.StepsContext, state sst.StepState) error {
 		state["token"] = "secret-123"
@@ -40,7 +40,7 @@ func TestSteps_StatePassing(t *testing.T) {
 
 func TestSteps_Persistence(t *testing.T) {
 	// Scenario: Run partly, save state, then verify file on disk.
-	
+
 	tmpDir := t.TempDir()
 	stateFile := filepath.Join(tmpDir, "state.json")
 

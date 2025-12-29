@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"golang.org/x/term"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"time"
-    "strings"
-	"golang.org/x/term"
 )
 
 // ============================================================================

@@ -12,7 +12,7 @@ func newTestRunner() (*Runner, *bytes.Buffer) {
 	var buf bytes.Buffer
 	// NewWithWriter returns *Logx
 	logger := NewWithWriter(&buf).Subsystem("test.loggerwiring")
-	
+
 	runner := &Runner{
 		Log: logger, // Now matches *Logx field in Runner
 	}

@@ -1,13 +1,13 @@
 package rtsst
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"syscall"
-	"crypto/sha256"
-	"encoding/hex"	
 )
 
 func GetFileOwnership(path string) (int, int, error) {

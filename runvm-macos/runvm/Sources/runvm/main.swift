@@ -82,6 +82,14 @@ func openDisk(path: String, readOnly: Bool) throws -> VZVirtioBlockDeviceConfigu
     return vmBlockDevCfg
 }
 
+// NEW: attach ISO as USB mass storage for cloud-init NoCloud seed detection
+func openCDROM(path: String) throws -> VZUSBMassStorageDeviceConfiguration {
+    let vmDiskURL = URL(fileURLWithPath: path)
+    let vmDisk = try VZDiskImageStorageDeviceAttachment(url: vmDiskURL, readOnly: true)
+    let vmUSBStorageCfg = VZUSBMassStorageDeviceConfiguration(attachment: vmDisk)
+    return vmUSBStorageCfg
+}
+
 @available(macOS 12, *)
 func openFolder(path: String, tag: String, readOnly: Bool) throws -> VZDirectorySharingDeviceConfiguration {
     let sharedDirectory = VZSharedDirectory(url: URL(fileURLWithPath: path), readOnly: readOnly)
@@ -226,10 +234,7 @@ struct RunVM: ParsableCommand {
     @Option(name: [ .customLong("cdrom") ], help: "CD-ROMs to use (legacy)")
     var cdroms: [String] = []
 
-    @Option(name: [ .short, .customLong("folder")], help: "Folders to share")
-    var folders: [String] = []
-
-    @Option(name: [.customLong("shared-dir")], help: "Folders to share (crosvm: --shared-dir)")
+    @Option(name: [.customLong("shared-dir")], help: "Folders to share")
     var sharedDirs: [String] = []
 
     @Option(name: [ .short, .customLong("network"), .customLong("net") ], help: "Networks to use")
@@ -250,7 +255,7 @@ struct RunVM: ParsableCommand {
     @Option(help: "Initrd to use (Linux bootloader only)")
     var initrd: String?
 
-    @Option(name: [.customLong("params"), .customShort("p")], help: "Kernel cmdline (crosvm: --params)")
+    @Option(name: [.customLong("params"), .customShort("p")], help: "Kernel cmdline")
     var params: String?
 
     @Option(help: "Escape Sequence, when using a tty")
@@ -337,20 +342,43 @@ struct RunVM: ParsableCommand {
             try vmCfg.storageDevices.append(openDisk(path: path, readOnly: true))
         }
         for path in cdroms {
-            try vmCfg.storageDevices.append(openDisk(path: path, readOnly: true))
+            // CHANGED: attach via USB mass storage for better NoCloud seed detection
+            try vmCfg.storageDevices.append(openCDROM(path: path))
         }
 
         //
         // Shared folders
         //
+        for _, shareStr := range inst.SharedDir {
+        // Parse the "host:guest:mode" string format
+        parts := strings.Split(shareStr, ":")
+        if len(parts) == 0 {
+            continue
+        }
+
+        // Part 1: Host Path (Required)
+        hostPath := parts[0]
+        
+        // Part 2: Guest Path / Tag (Optional, defaults to Host Path)
+        guestPath := parts[0]
+        if len(parts) > 1 && parts[1] != "" {
+            guestPath = parts[1]
+        }
+
+        // Part 3: Mode (Optional, e.g. "ro")
+        mountOptions := "defaults"
+        if len(parts) > 2 && parts[2] == "ro" {
+            mountOptions = "ro"
+        }
+
+        // Cloud-init 'mounts' module entry
+        // Format: [ "tag_name", "/mount/point", "fstype", "options", "dump", "pass" ]
+        // Note: The Swift code uses the Guest Path as the 'tag' for the shared device.
+        mountEntry := fmt.Sprintf(`- [ "%s", "%s", "virtiofs", "%s", "0", "0" ]`, guestPath, guestPath, mountOptions)
+        mountsConfig = append(mountsConfig, mountEntry)
+    }
         if #available(macOS 12, *) {
-            var allFolders = folders
-            // also parse --shared-dir host:tag:ro or host:tag
-            for sd in sharedDirs {
-                 allFolders.append(sd)
-            }
-            
-            for folder in allFolders {
+            for folder in sharedDirs {
                 let parts = folder.split(separator: ":")
                 if parts.count == 0 { continue }
                 

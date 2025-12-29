@@ -182,12 +182,12 @@ func TestScenario2_UnifiedPartitionBackupGPT(t *testing.T) {
 
 	// --- SETUP USING QEMU-NBD ---
 	sh(t, tmpDir, "modprobe nbd max_part=16")
-	
+
 	setupDev := "/dev/nbd1"
 	exec.Command("qemu-nbd", "-d", setupDev).Run()
-	
+
 	sh(t, tmpDir, "qemu-nbd -f raw -c %s %s", setupDev, rawPath)
-	
+
 	// Use standard blockdev tool
 	sh(t, tmpDir, "blockdev --rereadpt %s", setupDev)
 	sh(t, tmpDir, "udevadm settle")
@@ -209,13 +209,13 @@ func TestScenario2_UnifiedPartitionBackupGPT(t *testing.T) {
 	sh(t, tmpDir, "cp %s %s/boot/initrd", initrdSrc, mountDir)
 
 	sh(t, tmpDir, "umount %s", mountDir)
-	
+
 	// Detach setup device explicitly
 	sh(t, tmpDir, "qemu-nbd -d %s", setupDev)
 
 	// CORRUPTION: Wipe ONLY Primary GPT Header (LBA 1).
 	// We MUST preserve LBA 0 (PMBR).
-	// We MUST preserve LBA 2-33 (Partition Entries) if we want to be nice, 
+	// We MUST preserve LBA 2-33 (Partition Entries) if we want to be nice,
 	// though they technically shouldn't be read if Header is bad.
 	// Wiping just the header (512 bytes) forces checksum failure -> fallback to Backup.
 	sh(t, tmpDir, "dd if=/dev/zero of=%s bs=512 seek=1 count=1 conv=notrunc", rawPath)

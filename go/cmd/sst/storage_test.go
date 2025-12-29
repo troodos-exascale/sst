@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
-	"os"
 
 	sst "github.com/swiss-software-tool/runtime-smart/go/internal/sst"
 	storagepb "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/storage/v1"

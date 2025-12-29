@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"time"
-	"os/user"
 
 	"github.com/spf13/cobra"
 
@@ -211,7 +211,7 @@ func pullVMConvert(app *pullVMApp) error {
 			}
 		}
 	}
-	
+
 	app.sb.YamlObject = &mkimagepb.ImageYAML{
 		Name:           imageName,
 		SourceFileName: base,
@@ -271,7 +271,21 @@ func createInstance(image, name string) error {
 	ctx := context.Background()
 	log := sst.LogxRoot().Subsystem("mkimage.instance")
 
-	imageDir := filepath.Join(flagRoot, "images", image)
+	var imageDir string
+
+	// 1. Check if the argument is a valid path to an existing directory
+	if info, err := os.Stat(image); err == nil && info.IsDir() {
+		imageDir = image
+	} else {
+		// 2. Otherwise, assume it is a name in the default images directory
+		imageDir = filepath.Join(flagRoot, "images", image)
+	}
+
+	// Validate the resolved directory
+	if _, err := os.Stat(imageDir); os.IsNotExist(err) {
+		return fmt.Errorf("image directory not found at: %s", imageDir)
+	}
+
 	instDir := rtsst.InstanceDir(name)
 
 	if _, err := os.Stat(instDir); err == nil && !flagForce {
@@ -284,7 +298,7 @@ func createInstance(image, name string) error {
 
 	imageYaml := &mkimagepb.ImageYAML{}
 	imgYo := &sst.YamlObject{
-		Path:   filepath.Join(instDir, "image.yaml"),
+		Path:   filepath.Join(imageDir, "image.yaml"),
 		Schema: "sst.yaml.mkimage.v1.ImageYAML",
 		Kind:   "Image",
 		Msg:    imageYaml,
@@ -302,16 +316,16 @@ func createInstance(image, name string) error {
 		Msg:    instanceYaml,
 	}
 
-	// Copy base image
+	// Copy base image + kernel + initrd (unchanged)
 	src := filepath.Join(imageDir, imageYaml.RawImage)
 	dst := filepath.Join(instDir, imageYaml.RawImage)
 	if err := rtsst.CopySparse(src, dst); err != nil {
 		return err
 	}
-	if err := rtsst.CopyFile(filepath.Join(imageDir, "kernel"), filepath.Join(instDir, "kernel")); err != nil {
+	if err := rtsst.CopyFile(filepath.Join(imageDir, imageYaml.Kernel), filepath.Join(instDir, imageYaml.Kernel)); err != nil {
 		return err
 	}
-	if err := rtsst.CopyFile(filepath.Join(imageDir, "initrd"), filepath.Join(instDir, "initrd")); err != nil {
+	if err := rtsst.CopyFile(filepath.Join(imageDir, imageYaml.Initrd), filepath.Join(instDir, imageYaml.Initrd)); err != nil {
 		return err
 	}
 	mac, err := rtsst.GenerateMAC()
@@ -319,41 +333,12 @@ func createInstance(image, name string) error {
 		return err
 	}
 
-
-
-	instanceYaml.Boot = "kernel"
-	instanceYaml.Image = imageYaml.RawImage
-	instanceYaml.Name = name
-	instanceYaml.Hostname = name
-	instanceYaml.Kernel = imageYaml.Kernel
-	instanceYaml.Initrd = imageYaml.Initrd
-	instanceYaml.CpuCount = 4
-	instanceYaml.MemorySize = "8096"
-	instanceYaml.Network = &runctlpb.Network{
-		Mac: mac,
-		Mode: "dhcp",
-	}
-	instanceYaml.EfiVars = "efi-vars"
-	instanceYaml.RootfsPartUuid = imageYaml.RootfsPartUuid
-	instanceYaml.RootfsType = imageYaml.RootfsType
-	instanceYaml.Params = fmt.Sprintf(
-		"console=hvc0 console=tty0 oops=panic panic=10 sysrq_always_enabled=1 loglevel=4 initrd=%s root=UUID=%s rootfstype=%s", 
-		imageYaml.Initrd, 
-		imageYaml.RootfsPartUuid,
-		imageYaml.RootfsType,
-	)
 	u, err := user.Current()
 	if err != nil {
 		return err
 	}
 
-	instanceYaml.Shares = []*runctlpb.Share{
-		{
-			Host:  u.HomeDir,
-			Guest: "/Users/" + u.Username,
-		},
-	}
-
+	// Create data.img (unchanged)
 	size := int64(30) * 1024 * 1024 * 1024 // 30 GiB
 	f, err := os.Create(filepath.Join(instDir, "data.img"))
 	if err != nil {
@@ -363,26 +348,63 @@ func createInstance(image, name string) error {
 	if err := f.Truncate(size); err != nil {
 		return err
 	}
-	instanceYaml.Disks = []*runctlpb.Disk{
-		{
-			Path: "data.img",
-			Mode: "rw",
-		},{
-	    	Path: instanceYaml.Image,
-			Mode: "ro",
-		},{
-			Path: "cidata.iso",
-			Mode: "ro",
-		},
+
+	// Populate new schema
+	instanceYaml.ApiVersion = "sst.io/v1"
+	instanceYaml.Kind = "Instance"
+	instanceYaml.Name = name
+	instanceYaml.Hostname = name
+
+	instanceYaml.Gui = false
+	instanceYaml.CpuCount = "4"
+	instanceYaml.MemorySize = "8096"
+	instanceYaml.MemorySizeSuffix = "MiB" // matches runvm default; optional but explicit
+
+	instanceYaml.Balloon = false
+	instanceYaml.Bootloader = "linux"
+	instanceYaml.EfiVars = "efi-vars"
+
+	instanceYaml.Kernel = imageYaml.Kernel
+	instanceYaml.Initrd = imageYaml.Initrd
+
+	// Root disk is RW; extra data disk RW; cidata is CDROM (USB mass storage in your runvm)
+	instanceYaml.Rwdisk = []string{
+		imageYaml.RawImage, // the copied root image in instDir
+		"data.img",
+	}
+	instanceYaml.Disk = []string{
+		"cidata.iso",
 	}
 
-	if err := instYo.Save(ctx, log); err != nil {
-		return err
+	// Shared folders: prefer --shared-dir (your unified name); put host:tag or host:tag:ro per your parser.
+	// If you want host path == tag (as your current runvm supports), this is fine too.
+	instanceYaml.SharedDir = []string{
+		fmt.Sprintf("%s:%s", "/Users/"+u.Username, "/Users/"+u.Username),
 	}
 
-	err = rtsst.WriteCIData(instDir, instanceYaml.Hostname)
-	if err != nil {
-		return err
+	// Network: your runvm accepts "aa:bb:...@nat" to set MAC, so store exactly that argv value.
+	instanceYaml.Network = []string{
+		fmt.Sprintf("%s@nat", mac),
+	}
+
+	// Kernel params: one token per line (runctl joins into --params string later)
+	instanceYaml.Params = []string{
+		"console=hvc0",
+		"oops=panic",
+		"panic=10",
+		"sysrq_always_enabled=1",
+		"loglevel=4",
+		"cpuidle.off=1",
+		fmt.Sprintf("root=%s", imageYaml.RootfsDevice),
+		fmt.Sprintf("rootfstype=%s", imageYaml.RootfsType),
+	}
+
+	// Write instance.yaml
+	if diags := instYo.Save(ctx, log); diags != nil {
+		return diags
+	}
+	if err := rtsst.WriteCIData(ctx, log, instDir, instanceYaml); err != nil {
+		return fmt.Errorf("failed to write cidata: %w", err)
 	}
 
 	err = rtsst.UpdateCIDATAISO(instDir)

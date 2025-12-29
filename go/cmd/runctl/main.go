@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/user"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -165,33 +164,43 @@ func (r *Runctl) loadInstance(name string) (*runctlpb.Instance, error) {
 	return inst, nil
 }
 
-func parseMemorySizeMiB(s string) (uint64, error) {
-	s = strings.TrimSpace(strings.ToUpper(s))
-	if s == "" {
-		return 4096, nil
+func parseMemorySizeMiB(sizeStr, suffix string) (uint64, error) {
+	if sizeStr == "" {
+		return 0, fmt.Errorf("memory size is empty")
 	}
-	i := 0
-	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-		i++
-	}
-	n, err := strconv.ParseUint(s[:i], 10, 64)
+
+	size, err := strconv.ParseUint(sizeStr, 10, 64)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("invalid memory size %q: %w", sizeStr, err)
 	}
-	switch strings.TrimSpace(s[i:]) {
-	case "", "M", "MB", "MIB":
-		return n, nil
-	case "G", "GB", "GIB":
-		return n * 1024, nil
-	case "K", "KB", "KIB":
-		return n / 1024, nil
+
+	switch strings.ToLower(suffix) {
+	case "", "mib":
+		// already MiB
+		return size, nil
+
+	case "mb":
+		// decimal MB → MiB
+		return size * 1000 / 1024, nil
+
+	case "gib":
+		return size * 1024, nil
+
+	case "gb":
+		return size * 1000 * 1000 / 1024 / 1024, nil
+
+	case "kib":
+		return size / 1024, nil
+
+	case "kb":
+		return size * 1000 / 1024 / 1024, nil
+
 	default:
-		return 0, fmt.Errorf("invalid memory size %q", s)
+		return 0, fmt.Errorf("unknown memory size suffix %q", suffix)
 	}
 }
 
 /* ======================= actions ======================= */
-
 func (r *Runctl) Start(name string) error {
 	if err := rtsst.EnsureInstanceNotBusy(name); err != nil {
 		return err
@@ -202,18 +211,27 @@ func (r *Runctl) Start(name string) error {
 	if err != nil {
 		return err
 	}
-	
+
+	// Allow editing cloud-init user-data and restarting
+	if err := rtsst.EnsureCIDataISO(r.Ctx, r.Log, instDir); err != nil {
+		r.Log.Warn(r.Ctx, "failed to refresh cidata.iso (ignoring)", "error", err)
+	}
+
 	r.Log.Info(r.Ctx, "starting instance",
 		"instance", inst.Name,
-		"boot", inst.Boot,
-		"image", inst.Image,
+		"bootloader", inst.Bootloader,
+		"kernel", inst.Kernel,
 	)
 
-	cpu := int(inst.CpuCount)
+	cpu, err := strconv.Atoi(inst.CpuCount)
+	if err != nil {
+		return err
+	}
 	if cpu <= 0 {
 		cpu = 4
 	}
-	memMiB, err := parseMemorySizeMiB(inst.MemorySize)
+
+	memMiB, err := parseMemorySizeMiB(inst.MemorySize, inst.MemorySizeSuffix)
 	if err != nil {
 		return err
 	}
@@ -224,7 +242,23 @@ func (r *Runctl) Start(name string) error {
 		"--memory-size", strconv.FormatUint(memMiB, 10),
 	}
 
-	switch inst.Boot {
+	// Flags
+	if inst.Gui {
+		args = append(args, "--gui")
+	}
+	if inst.Balloon {
+		args = append(args, "--balloon", "true")
+	} else {
+		args = append(args, "--balloon", "false")
+	}
+
+	// Networking (repeated)
+	for _, net := range inst.Network {
+		args = append(args, "--network", net)
+	}
+
+	// Bootloader
+	switch inst.Bootloader {
 	case "efi":
 		efiVars := inst.EfiVars
 		if efiVars == "" {
@@ -235,9 +269,9 @@ func (r *Runctl) Start(name string) error {
 			"--efi-vars", filepath.Join(instDir, efiVars),
 		)
 
-	case "kernel":
+	case "linux":
 		if inst.Kernel == "" {
-			return fmt.Errorf("boot=kernel requires inst.kernel")
+			return fmt.Errorf("bootloader=linux requires kernel")
 		}
 		args = append(args,
 			"--bootloader", "linux",
@@ -246,39 +280,44 @@ func (r *Runctl) Start(name string) error {
 		if inst.Initrd != "" {
 			args = append(args, "--initrd", inst.Initrd)
 		}
-		if inst.Params != "" {
-			args = append(args, "--params", inst.Params)
+		if len(inst.Params) > 0 {
+			args = append(args, "--params", strings.Join(inst.Params, " "))
 		}
 
 	default:
-		return fmt.Errorf("invalid boot mode %q", inst.Boot)
+		return fmt.Errorf("invalid bootloader %q", inst.Bootloader)
 	}
 
-	args = append(args, "--rwdisk", inst.Image)
-
-	if inst.Cidata != "" {
-		args = append(args, "--disk", filepath.Join(instDir, inst.Cidata))
+	// Storage
+	for _, d := range inst.Rwdisk {
+		args = append(args, "--rwdisk", d)
+	}
+	for _, d := range inst.Disk {
+		args = append(args, "--disk", d)
+	}
+	for _, d := range inst.Cdrom {
+		args = append(args, "--cdrom", d)
 	}
 
-	for _, d := range inst.Disks {
-		if d.Mode == "rw" {
-			args = append(args, "--rwdisk", d.Path)
-		} else {
-			args = append(args, "--disk", d.Path)
-		}
+	// Shared directories
+	for _, s := range inst.SharedDir {
+		args = append(args, "--shared-dir", s)
 	}
 
-	for _, s := range inst.Shares {
-		args = append(args, "--folder", fmt.Sprintf("%s:%s", s.Host, s.Guest))
-	}
-
+	// Prepare executable shim
 	exePath := filepath.Join(instDir, inst.Name)
 	_ = os.Remove(exePath)
 	if err := os.Symlink("/usr/local/bin/runvm", exePath); err != nil {
 		return err
 	}
 
-	// CHANGED: Pass r.Log directly (it's already a pointer)
+	lockPath := rtsst.LockFilePath(inst.Name)
+	lock, err := rtsst.CreateLock(lockPath)
+	if err != nil {
+		return err
+	}
+	defer lock.Remove()
+
 	_, err = sst.Exec(r.Ctx, r.Log, sst.ExecRequest{
 		Cmd:  "./" + inst.Name,
 		Args: args,
@@ -296,7 +335,7 @@ func (r *Runctl) Start(name string) error {
 		return err
 	}
 
-		r.Log.Info(r.Ctx, "instance exited cleanly", "instance", inst.Name)
+	r.Log.Info(r.Ctx, "instance exited cleanly", "instance", inst.Name)
 	return nil
 }
 
@@ -341,9 +380,16 @@ func (r *Runctl) SSH(name string) error {
 	if err != nil {
 		return err
 	}
-	mac := inst.Network.Mac
-	if mac == "" {
-		return fmt.Errorf("no MAC address in instance spec")
+
+	if len(inst.Network) == 0 {
+		return fmt.Errorf("instance %q has no network configuration", name)
+	}
+
+	// Network entries are "aa:bb:cc:dd:ee:ff@nat"
+	net := inst.Network[0]
+	mac := net
+	if i := strings.IndexByte(net, '@'); i >= 0 {
+		mac = net[:i]
 	}
 
 	ip, err := instanceIP(mac)
@@ -351,15 +397,10 @@ func (r *Runctl) SSH(name string) error {
 		return err
 	}
 
-	u, _ := user.Current()
-	// CHANGED: Pass r.Log directly
+	// Exec ssh in foreground
 	_, err = sst.Exec(r.Ctx, r.Log, sst.ExecRequest{
-		Cmd: "ssh",
-		Args: []string{
-			fmt.Sprintf("%s@%s", u.Username, ip),
-			"-o", "StrictHostKeyChecking=no",
-			"-o", "UserKnownHostsFile=/dev/null",
-		},
+		Cmd:  "ssh",
+		Args: []string{ip},
 		Mode: sst.ExecForeground,
 	})
 	return err
@@ -394,7 +435,11 @@ func instanceIP(mac string) (string, error) {
 
 	// CHANGED: sst.LogxRoot() returns *Logx, so we pass it directly.
 	log := sst.LogxRoot().Subsystem("runctl.instanceip")
-
+	_, _ = sst.Exec(context.Background(), log, sst.ExecRequest{
+		Cmd:  "ping",
+		Args: []string{"-c", "1", "-W", "1", "192.168.64.1"}, // NAT gateway
+		Mode: sst.ExecCaptured,
+	})
 	for _, cmd := range [][]string{
 		{"arp", "-a"},
 		{"ndp", "-a"},

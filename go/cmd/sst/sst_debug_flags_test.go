@@ -118,7 +118,7 @@ func TestDebugShortcutSetsLevelAndTrace(t *testing.T) {
 func TestDepthFilterDropsDeeperSpans(t *testing.T) {
 	// Depth=1 should keep first span and drop second
 	t.Setenv("SST_LOG_DEPTH", "1")
-	
+
 	// FIX: Call package-level function
 	sst.ResetFromEnv()
 
@@ -141,7 +141,7 @@ func TestDepthFilterDropsDeeperSpans(t *testing.T) {
 	if !strings.Contains(got, `"message":"first"`) {
 		t.Fatalf("expected first message to be logged; got: %s", got)
 	}
-	// Note: Since StartSpan is currently a no-op shim in logx.go, this specific assertion 
+	// Note: Since StartSpan is currently a no-op shim in logx.go, this specific assertion
 	// might fail if the depth logic isn't fully implemented in the shim.
 	// However, this aligns the code to compile.
 	// If depth filtering is implemented, this check remains valid:
