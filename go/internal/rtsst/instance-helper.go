@@ -174,186 +174,173 @@ func GetLocalPublicKey() (string, error) {
 }
 
 func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *runctlpb.Instance) error {
-    cidataDir := filepath.Join(instanceDir, "cidata")
-    if err := os.MkdirAll(cidataDir, 0755); err != nil {
-        return fmt.Errorf("failed to create cidata dir: %w", err)
-    }
+	cidataDir := filepath.Join(instanceDir, "cidata")
+	if err := os.MkdirAll(cidataDir, 0755); err != nil {
+		return fmt.Errorf("failed to create cidata dir: %w", err)
+	}
 
-    pubKey, err := GetLocalPublicKey()
-    if err != nil {
-        return fmt.Errorf("failed to get user's local public key: %w", err)
-    }
+	pubKey, err := GetLocalPublicKey()
+	if err != nil {
+		return fmt.Errorf("failed to get user's local public key: %w", err)
+	}
 
-    user, err := user.Current()
-    if err != nil {
-        return fmt.Errorf("failed to get current user: %w", err)
-    }
+	user, err := user.Current()
+	if err != nil {
+		return fmt.Errorf("failed to get current user: %w", err)
+	}
 
-    // ---- Prepare mounts ----
-    type mountInfo struct {
-        tag       string
-        guestPath string
-        options   string
-    }
-    var mounts []mountInfo
+	// ---- Prepare mounts ----
+	type mountInfo struct {
+		tag       string
+		guestPath string
+		options   string
+	}
+	var mounts []mountInfo
 
-    for _, shareStr := range inst.SharedDir {
-        parts := strings.Split(shareStr, ":")
-        if len(parts) == 0 || parts[0] == "" {
-            continue
-        }
+	for _, shareStr := range inst.SharedDir {
+		parts := strings.Split(shareStr, ":")
+		if len(parts) == 0 || parts[0] == "" {
+			continue
+		}
 
-        tag := parts[0]
-        guestPath := tag
-        if len(parts) > 1 && parts[1] != "" {
-            guestPath = parts[1]
-        }
+		tag := parts[0]
+		guestPath := tag
+		if len(parts) > 1 && parts[1] != "" {
+			guestPath = parts[1]
+		}
 
-        opts := "rw"
-        if len(parts) > 2 && parts[2] == "ro" {
-            opts = "ro"
-        }
+		opts := "rw"
+		if len(parts) > 2 && parts[2] == "ro" {
+			opts = "ro"
+		}
 
-        mounts = append(mounts, mountInfo{
-            tag:       tag,
-            guestPath: guestPath,
-            options:   opts,
-        })
-    }
+		mounts = append(mounts, mountInfo{
+			tag:       tag,
+			guestPath: guestPath,
+			options:   opts,
+		})
+	}
 
-    // ---- Build user-data ----
-    var sb strings.Builder
+	// ---- Build user-data ----
+	var sb strings.Builder
 
-    sb.WriteString("#cloud-config\n")
-    sb.WriteString("# syntax=yaml\n\n")
+	sb.WriteString("#cloud-config\n")
+	sb.WriteString("# syntax=yaml\n\n")
 
-    fmt.Fprintf(&sb, "hostname: %s\n", inst.Hostname)
-    sb.WriteString("lock_passwd: false\n")
-    sb.WriteString("ssh_pwauth: false\n")
-    sb.WriteString("disable_root: true\n\n")
+	fmt.Fprintf(&sb, "hostname: %s\n", inst.Hostname)
+	sb.WriteString("lock_passwd: false\n")
+	sb.WriteString("ssh_pwauth: false\n")
+	sb.WriteString("disable_root: true\n\n")
 
-    // 1. Install packages first
-    sb.WriteString("packages:\n")
-    sb.WriteString("  - sudo\n")
-    sb.WriteString("  - bash\n\n")
+	// 1. Boot Commands: Fix the GPT Table
+	// This runs before filesystems are mounted read-write, using built-in tools if available.
+	// Most cloud images include sgdisk/partprobe. If missing, this might fail harmlessly on first boot.
+	sb.WriteString("bootcmd:\n")
+	sb.WriteString("  - [ cloud-init-per, once, move-gpt-header, sgdisk, -e, /dev/vda ]\n")
+	sb.WriteString("  - [ cloud-init-per, once, reread-pt, partprobe ]\n")
 
-    // 2. Configure Users
-    sb.WriteString("users:\n")
-    sb.WriteString("  - default\n")
-    fmt.Fprintf(&sb, "  - name: %s\n", user.Username)
-    if user.Name != "" {
-        fmt.Fprintf(&sb, "    gecos: %s\n", user.Name)
-    }
-    sb.WriteString("    sudo: ALL=(ALL) NOPASSWD:ALL\n")
-    sb.WriteString("    shell: /bin/bash\n")
-    if pubKey != "" {
-        sb.WriteString("    ssh_authorized_keys:\n")
-        sb.WriteString("      - " + pubKey + "\n")
-    }
+	// 2. Configure Users
+	sb.WriteString("\nusers:\n")
+	sb.WriteString("  - default\n")
+	fmt.Fprintf(&sb, "  - name: %s\n", user.Username)
+	if user.Name != "" {
+		fmt.Fprintf(&sb, "    gecos: %s\n", user.Name)
+	}
+	sb.WriteString("    sudo: ALL=(ALL) NOPASSWD:ALL\n")
+	sb.WriteString("    shell: /bin/bash\n")
+	if pubKey != "" {
+		sb.WriteString("    ssh_authorized_keys:\n")
+		sb.WriteString("      - " + pubKey + "\n")
+	}
 
-    // 3. Set Passwords
-    sb.WriteString("\nchpasswd:\n")
-    sb.WriteString("  list: |\n")
-    fmt.Fprintf(&sb, "    %s:abcd1234\n", user.Username)
-    sb.WriteString("  expire: False\n")
+	// 3. Set Passwords
+	sb.WriteString("\nchpasswd:\n")
+	sb.WriteString("  list: |\n")
+	fmt.Fprintf(&sb, "    %s:abcd1234\n", user.Username)
+	sb.WriteString("  expire: False\n")
 
-    // 4. Mounts
-    if len(mounts) > 0 {
-        sb.WriteString("\n# Mount virtiofs shares\n")
-        sb.WriteString("mounts:\n")
-        for _, m := range mounts {
-            fmt.Fprintf(
-                &sb,
-                "  - [ \"%s\", \"%s\", \"virtiofs\", \"%s\", \"0\", \"0\" ]\n",
-                m.tag,
-                m.guestPath,
-                m.options,
-            )
-        }
-    }
+	// 4. Mounts
+	if len(mounts) > 0 {
+		sb.WriteString("\n# Mount virtiofs shares\n")
+		sb.WriteString("mounts:\n")
+		for _, m := range mounts {
+			fmt.Fprintf(
+				&sb,
+				"  - [ \"%s\", \"%s\", \"virtiofs\", \"%s\", \"0\", \"0\" ]\n",
+				m.tag,
+				m.guestPath,
+				m.options,
+			)
+		}
+	}
 
-    // 5. runcmd (Using raw strings)
-    sb.WriteString("\nruncmd:\n")
-    
-    // Alpine console fix
-    sb.WriteString("  - |\n")
-    sb.WriteString(`    if [ -f /etc/alpine-release ]; then
-      # Disable the missing serial console in inittab to stop the spam
+	// 5. Run Commands (Polyglot Install + Resize)
+	sb.WriteString("\nruncmd:\n")
+
+	// --- A. Install Resize Tools (Cross-Distro) ---
+	sb.WriteString("  - |\n")
+	sb.WriteString("    # Detect package manager and install resize tools\n")
+	sb.WriteString("    if command -v apt-get >/dev/null; then\n")
+	sb.WriteString("      apt-get update && apt-get install -y cloud-guest-utils gdisk xfsprogs e2fsprogs\n")
+	sb.WriteString("    elif command -v dnf >/dev/null; then\n")
+	sb.WriteString("      dnf install -y cloud-utils-growpart gdisk xfsprogs e2fsprogs\n")
+	sb.WriteString("    elif command -v yum >/dev/null; then\n")
+	sb.WriteString("      yum install -y cloud-utils-growpart gdisk xfsprogs e2fsprogs\n")
+	sb.WriteString("    elif command -v apk >/dev/null; then\n")
+	sb.WriteString("      apk add cloud-utils-growpart gptfdisk xfsprogs e2fsprogs\n")
+	sb.WriteString("    fi\n")
+
+	// --- B. Resize Logic ---
+	sb.WriteString("  - |\n")
+	sb.WriteString("    # Ensure partition is grown\n")
+	sb.WriteString("    growpart /dev/vda 1 || true\n")
+	sb.WriteString("    \n")
+	sb.WriteString("    # Detect filesystem type and resize\n")
+	sb.WriteString("    TYPE=$(blkid -o value -s TYPE /dev/vda1)\n")
+	sb.WriteString("    if [ \"$TYPE\" = \"xfs\" ]; then\n")
+	sb.WriteString("      xfs_growfs /\n")
+	sb.WriteString("    elif [ \"$TYPE\" = \"ext4\" ]; then\n")
+	sb.WriteString("      resize2fs /dev/vda1\n")
+	sb.WriteString("    fi\n")
+
+	// --- C. Alpine setup script ---
+	sb.WriteString("  - |\n")
+	sb.WriteString(fmt.Sprintf(`    if [ -f /etc/alpine-release ]; then
+      mkdir -p /etc/conf.d
+      echo 'TTY="hvc0"' > /etc/conf.d/ttyAMA0
       sed -i 's/^ttyAMA0/#ttyAMA0/' /etc/inittab
-      
-      # Reload init to apply changes immediately
+      apk add --no-cache sudo bash shadow
+      usermod -s /bin/bash %s
       kill -HUP 1
     fi
-`)
+`, user.Username))
 
-    // Ensure mountpoints exist
-    for _, m := range mounts {
-        sb.WriteString("  - |\n")
-        fmt.Fprintf(&sb, "    mkdir -p %s\n", m.guestPath)
-    }
-
-    userData := sb.String()
-
-    // ---- meta-data ----
-    metaData := fmt.Sprintf(
-        "instance-id: %s\nlocal-hostname: %s\n",
-        inst.Hostname,
-        inst.Hostname,
-    )
-
-    // ---- Write files ----
-    if err := os.WriteFile(filepath.Join(cidataDir, "user-data"), []byte(userData), 0644); err != nil {
-        return fmt.Errorf("failed to write user-data: %w", err)
-    }
-
-    if err := os.WriteFile(filepath.Join(cidataDir, "meta-data"), []byte(metaData), 0644); err != nil {
-        return fmt.Errorf("failed to write meta-data: %w", err)
-    }
-
-    log.Info(ctx, "cidata.written", "dir", cidataDir)
-    return nil
-}
-
-func UpdateCIDATAISO(instDir string) error {
-	iso := filepath.Join(instDir, "cidata.iso")
-	src := filepath.Join(instDir, "cidata")
-
-	isoInfo, err := os.Stat(iso)
-	isoTime := time.Time{}
-	if err == nil {
-		isoTime = isoInfo.ModTime()
+	// --- D. Ensure mountpoints ---
+	for _, m := range mounts {
+		sb.WriteString("  - |\n")
+		fmt.Fprintf(&sb, "    mkdir -p %s\n", m.guestPath)
 	}
 
-	needsBuild := false
+	userData := sb.String()
 
-	err = filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if !info.IsDir() && info.ModTime().After(isoTime) {
-			needsBuild = true
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-
-	if !needsBuild {
-		return nil
-	}
-
-	cmd := exec.Command(
-		"hdiutil", "makehybrid",
-		"-o", iso,
-		src,
-		"-joliet", "-iso",
-		"-default-volume-name", "cidata",
+	// ---- meta-data ----
+	metaData := fmt.Sprintf(
+		"instance-id: %s\nlocal-hostname: %s\n",
+		inst.Hostname,
+		inst.Hostname,
 	)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
 
-	return cmd.Run()
+	// ---- Write files ----
+	if err := os.WriteFile(filepath.Join(cidataDir, "user-data"), []byte(userData), 0644); err != nil {
+		return fmt.Errorf("failed to write user-data: %w", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(cidataDir, "meta-data"), []byte(metaData), 0644); err != nil {
+		return fmt.Errorf("failed to write meta-data: %w", err)
+	}
+
+	log.Info(ctx, "cidata.written", "dir", cidataDir)
+	return nil
 }
 
 type Lock struct {
@@ -437,21 +424,50 @@ func EnsureCIDataISO(ctx context.Context, log *sst.Logx, instDir string) error {
 
 	// --- rebuild cidata.iso ---
 	_ = os.Remove(isoPath) // ignore error; hdiutil will fail if it matters
-
-	cmd := exec.Command(
-		"hdiutil", "makehybrid",
-		"-o", isoPath,
-		cidataDir,
-		"-joliet", "-iso",
-		"-default-volume-name", "cidata",
-	)
-
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Error(ctx, "hdiutil makehybrid failed", "output", string(out))
-		return fmt.Errorf("generate cidata.iso: %w", err)
+    if err := UpdateCIDATAISO(instDir); err != nil {
+		log.Error(ctx, "hdiutil/geniso makehybrid failed", "output")
+		return fmt.Errorf("Update cidata.iso: %w", err)
 	}
 
 	log.Info(ctx, "cidata.iso regenerated successfully")
 	return nil
+}
+
+func UpdateCIDATAISO(instDir string) error {
+	iso := filepath.Join(instDir, "cidata.iso")
+	src := filepath.Join(instDir, "cidata")
+
+	// Try macOS tool first
+	if _, err := exec.LookPath("hdiutil"); err == nil {
+		cmd := exec.Command(
+			"hdiutil", "makehybrid",
+			"-o", iso,
+			src,
+			"-joliet", "-iso",
+			"-default-volume-name", "cidata",
+		)
+		// Capture output to prevent log spam unless error
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("hdiutil failed: %v\nOutput: %s", err, string(out))
+		}
+		return nil
+	}
+
+	// Fallback to Linux tool
+	if _, err := exec.LookPath("genisoimage"); err == nil {
+		cmd := exec.Command(
+			"genisoimage",
+			"-output", iso,
+			"-volid", "cidata",
+			"-joliet",
+			"-rock",
+			src,
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("genisoimage failed: %v\nOutput: %s", err, string(out))
+		}
+		return nil
+	}
+
+	return fmt.Errorf("neither 'hdiutil' nor 'genisoimage' found in PATH")
 }

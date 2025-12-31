@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strings"
@@ -22,6 +23,9 @@ var (
 	flagRoot    string
 	flagForce   bool
 	flagVerbose bool
+	
+	// NEW: Flag for instance size
+	flagSize    string 
 )
 
 var rootCmd = &cobra.Command{
@@ -47,7 +51,11 @@ func init() {
 	rootCmd.PersistentFlags().BoolVarP(&flagForce, "force", "f", false, "Overwrite existing image directory")
 
 	rootCmd.AddCommand(pullvmCmd())
-	rootCmd.AddCommand(instanceCmd())
+	
+	// Configure instance command flags
+	instCmd := instanceCmd()
+	instCmd.Flags().StringVarP(&flagSize, "size", "s", "20G", "Target size for the root disk (e.g. 20G, 100GiB)")
+	rootCmd.AddCommand(instCmd)
 }
 
 /* ======================= pullvm (Refactored to Steps) ======================= */
@@ -254,7 +262,7 @@ func pullVMSave(app *pullVMApp) error {
 	return nil
 }
 
-/* ======================= instance (PRESERVED) ======================= */
+/* ======================= instance ======================= */
 
 func instanceCmd() *cobra.Command {
 	return &cobra.Command{
@@ -271,17 +279,14 @@ func createInstance(image, name string) error {
 	ctx := context.Background()
 	log := sst.LogxRoot().Subsystem("mkimage.instance")
 
+	// ... [Image directory resolution logic remains unchanged] ...
 	var imageDir string
-
-	// 1. Check if the argument is a valid path to an existing directory
 	if info, err := os.Stat(image); err == nil && info.IsDir() {
 		imageDir = image
 	} else {
-		// 2. Otherwise, assume it is a name in the default images directory
 		imageDir = filepath.Join(flagRoot, "images", image)
 	}
 
-	// Validate the resolved directory
 	if _, err := os.Stat(imageDir); os.IsNotExist(err) {
 		return fmt.Errorf("image directory not found at: %s", imageDir)
 	}
@@ -307,7 +312,6 @@ func createInstance(image, name string) error {
 		return diags
 	}
 
-	// Load instance.yaml (proto-backed)
 	instanceYaml := &runctlpb.Instance{}
 	instYo := &sst.YamlObject{
 		Path:   filepath.Join(instDir, "instance.yaml"),
@@ -316,78 +320,84 @@ func createInstance(image, name string) error {
 		Msg:    instanceYaml,
 	}
 
-	// Copy base image + kernel + initrd (unchanged)
+	// Copy base image
 	src := filepath.Join(imageDir, imageYaml.RawImage)
 	dst := filepath.Join(instDir, imageYaml.RawImage)
+	
+	log.Info(ctx, "copying root image", "src", src, "dst", dst)
 	if err := rtsst.CopySparse(src, dst); err != nil {
 		return err
 	}
+
+    // --- RESIZE LOGIC ---
+    targetSize, err := rtsst.ParseSize(flagSize)
+    if err != nil {
+        return fmt.Errorf("invalid size format: %w", err)
+    }
+    
+    // Pass imageYaml (loaded from image.yaml) to enforce "RootfsIsLast" check
+	imageRootfsSize, err := rtsst.ParseSize(imageYaml.RootfsSize)
+	if err != nil {
+		return fmt.Errorf("invalid rootfs size format: %w", err)
+	}
+    if (imageYaml.RootfsIsLast && imageRootfsSize < targetSize) {
+		// Log correction here: Use structured key-value pairs
+		log.Info(ctx, "resizing root image", "from_spec", flagSize, "to_bytes", targetSize)
+    	err := os.Truncate(dst, targetSize)
+		if err != nil {
+			return fmt.Errorf("failed to resize image: %w", err)
+		}
+		// 2. Repair the GPT Table immediately
+		// We use 'sgdisk -e' to move the backup header to the new end of the disk.
+		// This ensures the VM sees a valid, healthy partition table on first boot.
+		cmd := exec.Command("sgdisk", "-e", dst)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("failed to fix GPT headers via sgdisk: %v\nOutput: %s", err, string(output))
+		}
+		fmt.Printf("Successfully resized image and repaired GPT headers for %s\n", dst)
+    }
+    // --------------------
 	if err := rtsst.CopyFile(filepath.Join(imageDir, imageYaml.Kernel), filepath.Join(instDir, imageYaml.Kernel)); err != nil {
 		return err
 	}
 	if err := rtsst.CopyFile(filepath.Join(imageDir, imageYaml.Initrd), filepath.Join(instDir, imageYaml.Initrd)); err != nil {
 		return err
 	}
-	mac, err := rtsst.GenerateMAC()
-	if err != nil {
-		return err
-	}
-
+    
+	
+    mac, err := rtsst.GenerateMAC()
+	if err != nil { return err }
 	u, err := user.Current()
-	if err != nil {
-		return err
-	}
+	if err != nil { return err }
 
-	// Create data.img (unchanged)
-	size := int64(30) * 1024 * 1024 * 1024 // 30 GiB
+	size := int64(30) * 1024 * 1024 * 1024 
 	f, err := os.Create(filepath.Join(instDir, "data.img"))
-	if err != nil {
-		return err
-	}
+	if err != nil { return err }
 	defer f.Close()
-	if err := f.Truncate(size); err != nil {
-		return err
-	}
+	if err := f.Truncate(size); err != nil { return err }
 
-	// Populate new schema
 	instanceYaml.ApiVersion = "sst.io/v1"
 	instanceYaml.Kind = "Instance"
 	instanceYaml.Name = name
 	instanceYaml.Hostname = name
-
 	instanceYaml.Gui = false
 	instanceYaml.CpuCount = "4"
 	instanceYaml.MemorySize = "8096"
-	instanceYaml.MemorySizeSuffix = "MiB" // matches runvm default; optional but explicit
-
+	instanceYaml.MemorySizeSuffix = "MiB"
 	instanceYaml.Balloon = false
 	instanceYaml.Bootloader = "linux"
 	instanceYaml.EfiVars = "efi-vars"
-
 	instanceYaml.Kernel = imageYaml.Kernel
 	instanceYaml.Initrd = imageYaml.Initrd
-
-	// Root disk is RW; extra data disk RW; cidata is CDROM (USB mass storage in your runvm)
 	instanceYaml.Rwdisk = []string{
-		imageYaml.RawImage, // the copied root image in instDir
+		imageYaml.RawImage,
 		"data.img",
 	}
-	instanceYaml.Disk = []string{
-		"cidata.iso",
-	}
-
-	// Shared folders: prefer --shared-dir (your unified name); put host:tag or host:tag:ro per your parser.
-	// If you want host path == tag (as your current runvm supports), this is fine too.
+	instanceYaml.Disk = []string{"cidata.iso"}
 	instanceYaml.SharedDir = []string{
 		fmt.Sprintf("%s:%s", "/Users/"+u.Username, "/Users/"+u.Username),
 	}
-
-	// Network: your runvm accepts "aa:bb:...@nat" to set MAC, so store exactly that argv value.
-	instanceYaml.Network = []string{
-		fmt.Sprintf("%s@nat", mac),
-	}
-
-	// Kernel params: one token per line (runctl joins into --params string later)
+	instanceYaml.Network = []string{fmt.Sprintf("%s@nat", mac)}
 	instanceYaml.Params = []string{
 		"console=hvc0",
 		"oops=panic",
@@ -399,17 +409,15 @@ func createInstance(image, name string) error {
 		fmt.Sprintf("rootfstype=%s", imageYaml.RootfsType),
 	}
 
-	// Write instance.yaml
-	if diags := instYo.Save(ctx, log); diags != nil {
-		return diags
-	}
+	if diags := instYo.Save(ctx, log); diags != nil { return diags }
 	if err := rtsst.WriteCIData(ctx, log, instDir, instanceYaml); err != nil {
 		return fmt.Errorf("failed to write cidata: %w", err)
+	} else {
+		log.Info(ctx, "updated cidata.iso", "instDir", instDir)
+	if err := rtsst.UpdateCIDATAISO(instDir); err != nil {
+		return fmt.Errorf("update cidata.iso: %w", err)
 	}
 
-	err = rtsst.UpdateCIDATAISO(instDir)
-	if err != nil {
-		return err
 	}
 
 	return nil

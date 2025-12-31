@@ -349,34 +349,6 @@ struct RunVM: ParsableCommand {
         //
         // Shared folders
         //
-        for _, shareStr := range inst.SharedDir {
-        // Parse the "host:guest:mode" string format
-        parts := strings.Split(shareStr, ":")
-        if len(parts) == 0 {
-            continue
-        }
-
-        // Part 1: Host Path (Required)
-        hostPath := parts[0]
-        
-        // Part 2: Guest Path / Tag (Optional, defaults to Host Path)
-        guestPath := parts[0]
-        if len(parts) > 1 && parts[1] != "" {
-            guestPath = parts[1]
-        }
-
-        // Part 3: Mode (Optional, e.g. "ro")
-        mountOptions := "defaults"
-        if len(parts) > 2 && parts[2] == "ro" {
-            mountOptions = "ro"
-        }
-
-        // Cloud-init 'mounts' module entry
-        // Format: [ "tag_name", "/mount/point", "fstype", "options", "dump", "pass" ]
-        // Note: The Swift code uses the Guest Path as the 'tag' for the shared device.
-        mountEntry := fmt.Sprintf(`- [ "%s", "%s", "virtiofs", "%s", "0", "0" ]`, guestPath, guestPath, mountOptions)
-        mountsConfig = append(mountsConfig, mountEntry)
-    }
         if #available(macOS 12, *) {
             for folder in sharedDirs {
                 let parts = folder.split(separator: ":")
@@ -441,8 +413,10 @@ struct RunVM: ParsableCommand {
         }
 
         // memory balloon
-        let balloonCfg = VZVirtioTraditionalMemoryBalloonDeviceConfiguration()
-        vmCfg.memoryBalloonDevices = [ balloonCfg ]
+        if balloon {
+            let balloonCfg = VZVirtioTraditionalMemoryBalloonDeviceConfiguration()
+            vmCfg.memoryBalloonDevices = [ balloonCfg ]
+        }
 
         vmCfg.entropyDevices = [ VZVirtioEntropyDeviceConfiguration() ]
 

@@ -242,7 +242,7 @@ func TestScenario2_UnifiedPartitionBackupGPT(t *testing.T) {
 	app.methods.DownloadImage = func(a *pullVMApp) error {
 		base := filepath.Base(a.upstreamArg)
 		a.srcImage = filepath.Join(a.imageDir, base)
-		return copyFile(a.upstreamArg, a.srcImage)
+		return rtsst.CopySparse(a.upstreamArg, a.srcImage)
 	}
 
 	// 3. Run

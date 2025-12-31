@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"strconv"
 
 	sst "github.com/swiss-software-tool/runtime-smart/go/internal/sst"
 	mkimagepb "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/mkimage/v1"
@@ -43,7 +44,7 @@ func AnalyseImg(sb *ImageSB) error {
 	}()
 
 	sb.Log.Info(sb.Ctx, "Scanning partitions with lsblk", "device", nbdDev)
-	res, err := sst.ExecShell(sb.Ctx, &sb.Log, "lsblk", "-J", "-b", "-o", "NAME,SIZE,FSTYPE,PARTUUID,TYPE,MAJ:MIN,UUID", nbdDev)
+	res, err := sst.ExecShell(sb.Ctx, &sb.Log, "lsblk", "-J", "-b", "-o", "NAME,START,SIZE,FSTYPE,PARTUUID,TYPE,MAJ:MIN,UUID", nbdDev)
 	if err != nil {
 		return fmt.Errorf("lsblk execution failed: %w", err)
 	}
@@ -55,6 +56,7 @@ func AnalyseImg(sb *ImageSB) error {
 	// 3. Parse JSON Output
 	type BlockDevice struct {
 		Name       string        `json:"name"`
+		Start      uint64        `json:"start"`	
 		Size       uint64        `json:"size"`
 		FSType     string        `json:"fstype"`
 		PartUUID   string        `json:"partuuid"`
@@ -75,6 +77,7 @@ func AnalyseImg(sb *ImageSB) error {
 	// 4. Collect Candidates
 	type candidate struct {
 		Name      string
+		Start     uint64
 		Size      uint64
 		PartUUID  string
 		FsUUID    string
@@ -82,8 +85,10 @@ func AnalyseImg(sb *ImageSB) error {
 		FSType    string
 	}
 	var candidates []candidate
-
+    var maxStart uint64
 	var findCandidates func(devs []BlockDevice)
+	maxStart = 0
+
     findCandidates = func(devs []BlockDevice) {
         for _, d := range devs {
             // ... logging ...
@@ -100,12 +105,16 @@ func AnalyseImg(sb *ImageSB) error {
 
                 c := candidate{
                     Name:      d.Name,
+                    Start:     d.Start,
                     Size:      d.Size,
                     PartUUID:  d.PartUUID,
                     FsUUID:    d.UUID,
                     PartMinor: minor,
                     FSType:    d.FSType,
                 }
+				if c.Start > maxStart {
+					maxStart = c.Start
+				}
                 candidates = append(candidates, c)
                 sb.Log.Info(sb.Ctx, "Found candidate partition",
                     // ... logging args ...
@@ -138,7 +147,14 @@ func AnalyseImg(sb *ImageSB) error {
 	sb.YamlObject.RootfsUuid = rootPart.FsUUID
 	sb.YamlObject.RootfsDevice = "/dev/vda" + rootPart.PartMinor
 	sb.YamlObject.RootfsType = rootPart.FSType
-
+	sb.YamlObject.RootfsSize = fmt.Sprintf("%d%s", rootPart.Size, "B")
+	if rootPart.Start == maxStart {
+		sb.Log.Info(sb.Ctx, "Rootfs is the largest partition", "start", rootPart.Start)
+		sb.YamlObject.RootfsIsLast = true
+	} else {
+		sb.Log.Info(sb.Ctx, "Rootfs is not the largest partition", "start", rootPart.Start)
+		sb.YamlObject.RootfsIsLast = false
+	}
 	sb.Log.Info(sb.Ctx, "Identified Rootfs (Largest)",
 		"part_uuid", sb.YamlObject.RootfsPartUuid,
 		"fs_uuid", sb.YamlObject.RootfsUuid,
@@ -254,6 +270,36 @@ func resolveBootPartitionDevice(img *mkimagepb.ImageYAML) (string, error) {
 		return "/dev/disk/by-partuuid/" + img.BootfsPartUuid, nil
 	}
 	return "", fmt.Errorf("bootfs info missing")
+}
+
+func ParseMemorySizeMiB(sizeStr, suffix string) (uint64, error) {
+	if sizeStr == "" {
+		return 0, fmt.Errorf("memory size is empty")
+	}
+
+	size, err := strconv.ParseUint(sizeStr, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid memory size %q: %w", sizeStr, err)
+	}
+
+	switch strings.ToLower(suffix) {
+	case "", "mib":
+		// already MiB
+		return size, nil
+	case "mb":
+		// decimal MB → MiB
+		return size * 1000 / 1024, nil
+	case "gib":
+		return size * 1024, nil
+	case "gb":
+		return size * 1000 * 1000 / 1024 / 1024, nil
+	case "kib":
+		return size / 1024, nil
+	case "kb":
+		return size * 1000 / 1024 / 1024, nil
+	default:
+		return 0, fmt.Errorf("unknown memory size suffix %q", suffix)
+	}
 }
 
 // ============================================================================

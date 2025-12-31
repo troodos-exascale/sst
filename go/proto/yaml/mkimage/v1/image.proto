@@ -23,9 +23,12 @@ message ImageYAML {
    string rootfs_device = 11;
    string rootfs_uuid = 12;
    string rootfs_type = 13;
-   string bootfs_part_uuid = 14;
-   string bootfs_device = 15;
-   string bootfs_uuid = 16;
-   string bootfs_type = 17;
+   string rootfs_size = 14;
+   bool rootfs_is_last = 15;
+   string bootfs_part_uuid = 16;
+   string bootfs_device = 17;
+   string bootfs_uuid = 18;
+   string bootfs_type = 19;
+   bool bootfs_is_last = 20;
 }
 

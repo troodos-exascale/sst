@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -37,8 +39,13 @@ func CreateSparse(path string, size int64) error {
 	if err != nil {
 		return err
 	}
+	// Use a closure to ensure cleanup on error, but ignoring double-close on success
+	defer func() { _ = f.Close() }()
+
 	if err := f.Truncate(size); err != nil {
-		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
 		return err
 	}
 	return f.Close()
@@ -55,7 +62,8 @@ func CopySparse(srcPath, dstPath string) error {
 	if err != nil {
 		return err
 	}
-	defer dst.Close()
+	// Use a closure to ensure cleanup on error, but ignoring double-close on success
+	defer func() { _ = dst.Close() }()
 
 	buf := make([]byte, 1024*1024) // 1 MiB blocks
 
@@ -89,7 +97,13 @@ func CopySparse(srcPath, dstPath string) error {
 		}
 	}
 
-	return nil
+	// Critical fix: Sync to flush buffers to disk before closing
+	if err := dst.Sync(); err != nil {
+		return err
+	}
+
+	// Critical fix: Check Close() error to catch final flush errors
+	return dst.Close()
 }
 
 func CopyFile(src, dst string) error {
@@ -103,11 +117,19 @@ func CopyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	defer out.Close()
+	defer func() { _ = out.Close() }()
 
-	_, err = io.Copy(out, in)
-	return err
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+
+	// Critical fix: Sync and explicit Close
+	if err := out.Sync(); err != nil {
+		return err
+	}
+	return out.Close()
 }
+
 func SHA256File(path string) (string, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -121,4 +143,59 @@ func SHA256File(path string) (string, error) {
 	}
 
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// ResizeFile changes the size of the named file.
+// If the file is smaller than size, it is extended with sparse zeros.
+func ResizeFile(path string, size int64) error {
+	return os.Truncate(path, size)
+}
+
+// ParseSize parses a size string like "20G", "512MiB", or "1024" (bytes).
+func ParseSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty size")
+	}
+
+	// Find the first non-digit character
+	idx := strings.IndexFunc(s, func(r rune) bool {
+		return r < '0' || r > '9'
+	})
+
+	var numStr, suffix string
+	if idx == -1 {
+		numStr = s
+	} else {
+		numStr = s[:idx]
+		suffix = strings.ToLower(s[idx:])
+	}
+
+	val, err := strconv.ParseInt(numStr, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid number in size '%s': %w", s, err)
+	}
+
+	switch suffix {
+	case "", "b":
+		return val, nil
+	case "k", "kb":
+		return val * 1000, nil
+	case "kib":
+		return val * 1024, nil
+	case "m", "mb":
+		return val * 1000 * 1000, nil
+	case "mib":
+		return val * 1024 * 1024, nil
+	case "g", "gb":
+		return val * 1000 * 1000 * 1000, nil
+	case "gib":
+		return val * 1024 * 1024 * 1024, nil
+	case "t", "tb":
+		return val * 1000 * 1000 * 1000 * 1000, nil
+	case "tib":
+		return val * 1024 * 1024 * 1024 * 1024, nil
+	default:
+		return 0, fmt.Errorf("unknown size suffix '%s'", suffix)
+	}
 }
