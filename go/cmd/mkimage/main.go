@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strings"
@@ -84,6 +83,7 @@ type pullVMMethods struct {
 	DownloadImage    func(*pullVMApp) error
 	ConvertImage     func(*pullVMApp) error
 	AnalyseImage     func(*pullVMApp) error
+	EnlargeRoot 	 func(*pullVMApp) error
 	ExtractArtifacts func(*pullVMApp) error
 	SaveManifest     func(*pullVMApp) error
 }
@@ -94,6 +94,7 @@ var defaultPullVMOps = pullVMMethods{
 	DownloadImage:    pullVMDownload,
 	ConvertImage:     pullVMConvert,
 	AnalyseImage:     pullVMAnalyse,
+	EnlargeRoot:      pullVMEnlargeRoot,
 	ExtractArtifacts: pullVMExtract,
 	SaveManifest:     pullVMSave,
 }
@@ -127,6 +128,12 @@ func runPullVMSteps(app *pullVMApp) error {
 		return app.methods.ConvertImage(app)
 	})
 	app.steps.StepsAdd("analyse partition table", func(c *sst.StepsContext, _ sst.StepState) error {
+		return app.methods.AnalyseImage(app)
+	})
+	app.steps.StepsAdd("enlarge root filesystem", func(c *sst.StepsContext, _ sst.StepState) error {
+		return app.methods.EnlargeRoot(app)
+	})
+	app.steps.StepsAdd("analyse partition table again", func(c *sst.StepsContext, _ sst.StepState) error {
 		return app.methods.AnalyseImage(app)
 	})
 	app.steps.StepsAdd("extract kernel/initrd", func(c *sst.StepsContext, _ sst.StepState) error {
@@ -237,6 +244,103 @@ func pullVMAnalyse(app *pullVMApp) error {
 	return rtsst.AnalyseImg(&app.sb)
 }
 
+func pullVMEnlargeRoot(app *pullVMApp) error {
+	ctx := app.sb.Ctx
+	logx := &app.sb.Log
+
+	imagePath := filepath.Join(app.imageDir, app.rawImageFile)
+
+	targetSize := int64(10737418240)
+	
+	y := app.sb.YamlObject
+	if !y.RootfsIsLast {
+		logx.Info(ctx, "image.resize.skip", "reason", "rootfs not last partition")
+		return nil
+	}
+
+	rootPartNo := partitionIndex(y.RootfsDevice)
+	if rootPartNo == "" {
+		return fmt.Errorf("cannot extract partition number from %q", y.RootfsDevice)
+	}
+
+	fi, err := os.Stat(imagePath)
+	if err != nil {
+		return fmt.Errorf("stat image: %w", err)
+	}
+	if fi.Size() >= targetSize {
+		logx.Info(ctx, "image.resize.skip",
+			"file", imagePath,
+			"current_bytes", fi.Size(),
+			"target_bytes", targetSize,
+		)
+		return nil
+	}
+
+	logx.Info(ctx, "image.resize.start",
+		"file", imagePath,
+		"target_bytes", targetSize,
+		"root_partition", rootPartNo,
+	)
+
+	_, err = sst.ExecShell(ctx, logx, "sh", "-euxc", fmt.Sprintf(`
+image=%q
+partno=%q
+target=%d
+
+fsck_ok() {
+  e2fsck -f -p "$1"
+  rc=$?
+  if [ $rc -le 1 ]; then
+    return 0
+  fi
+  return $rc
+}
+
+# 1) Attach image once, with partitions
+loopdev=$(losetup -f -P --show "$image")
+trap 'losetup -d "$loopdev"' EXIT
+partdev="${loopdev}p${partno}"
+
+# 2) Clean filesystem on ORIGINAL geometry
+fsck_ok "$partdev"
+
+# 3) Grow raw image file
+truncate -s "$target" "$image"
+
+# IMPORTANT: tell kernel the loop device grew
+losetup -c "$loopdev"
+
+# 4) Grow partition table via the loop device
+growpart "$loopdev" "$partno"
+
+# Ensure kernel sees updated partition table
+partprobe "$loopdev" || true
+udevadm settle || true
+
+# 5) Resize filesystem to fill enlarged partition
+resize2fs "$partdev"
+
+# 6) Verify filesystem after resize
+fsck_ok "$partdev"
+`, imagePath, rootPartNo, targetSize))
+
+	if err != nil {
+		return fmt.Errorf("offline root resize failed: %w", err)
+	}
+
+	logx.Info(ctx, "image.resize.done", "file", imagePath)
+	return nil
+}
+
+func partitionIndex(dev string) string {
+	const prefix = "/dev/vda"
+	if !strings.HasPrefix(dev, prefix) {
+		return ""
+	}
+	return strings.TrimPrefix(dev, prefix)
+}
+
+
 func pullVMExtract(app *pullVMApp) error {
 	return rtsst.ExtractKernelAndInitrdFromBootPartition(&app.sb)
 }
@@ -328,34 +432,6 @@ func createInstance(image, name string) error {
 	if err := rtsst.CopySparse(src, dst); err != nil {
 		return err
 	}
-
-    // --- RESIZE LOGIC ---
-    targetSize, err := rtsst.ParseSize(flagSize)
-    if err != nil {
-        return fmt.Errorf("invalid size format: %w", err)
-    }
-    
-    // Pass imageYaml (loaded from image.yaml) to enforce "RootfsIsLast" check
-	imageRootfsSize, err := rtsst.ParseSize(imageYaml.RootfsSize)
-	if err != nil {
-		return fmt.Errorf("invalid rootfs size format: %w", err)
-	}
-    if (imageYaml.RootfsIsLast && imageRootfsSize < targetSize) {
-		// Log correction here: Use structured key-value pairs
-		log.Info(ctx, "resizing root image", "from_spec", flagSize, "to_bytes", targetSize)
-    	err := os.Truncate(dst, targetSize)
-		if err != nil {
-			return fmt.Errorf("failed to resize image: %w", err)
-		}
-		// 2. Repair the GPT Table immediately
-		// We use 'sgdisk -e' to move the backup header to the new end of the disk.
-		// This ensures the VM sees a valid, healthy partition table on first boot.
-		cmd := exec.Command("sgdisk", "-e", dst)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			return fmt.Errorf("failed to fix GPT headers via sgdisk: %v\nOutput: %s", err, string(output))
-		}
-		fmt.Printf("Successfully resized image and repaired GPT headers for %s\n", dst)
-    }
     // --------------------
 	if err := rtsst.CopyFile(filepath.Join(imageDir, imageYaml.Kernel), filepath.Join(instDir, imageYaml.Kernel)); err != nil {
 		return err

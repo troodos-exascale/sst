@@ -277,32 +277,6 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 	// 5. Run Commands (Polyglot Install + Resize)
 	sb.WriteString("\nruncmd:\n")
 
-	// --- A. Install Resize Tools (Cross-Distro) ---
-	sb.WriteString("  - |\n")
-	sb.WriteString("    # Detect package manager and install resize tools\n")
-	sb.WriteString("    if command -v apt-get >/dev/null; then\n")
-	sb.WriteString("      apt-get update && apt-get install -y cloud-guest-utils gdisk xfsprogs e2fsprogs\n")
-	sb.WriteString("    elif command -v dnf >/dev/null; then\n")
-	sb.WriteString("      dnf install -y cloud-utils-growpart gdisk xfsprogs e2fsprogs\n")
-	sb.WriteString("    elif command -v yum >/dev/null; then\n")
-	sb.WriteString("      yum install -y cloud-utils-growpart gdisk xfsprogs e2fsprogs\n")
-	sb.WriteString("    elif command -v apk >/dev/null; then\n")
-	sb.WriteString("      apk add cloud-utils-growpart gptfdisk xfsprogs e2fsprogs\n")
-	sb.WriteString("    fi\n")
-
-	// --- B. Resize Logic ---
-	sb.WriteString("  - |\n")
-	sb.WriteString("    # Ensure partition is grown\n")
-	sb.WriteString("    growpart /dev/vda 1 || true\n")
-	sb.WriteString("    \n")
-	sb.WriteString("    # Detect filesystem type and resize\n")
-	sb.WriteString("    TYPE=$(blkid -o value -s TYPE /dev/vda1)\n")
-	sb.WriteString("    if [ \"$TYPE\" = \"xfs\" ]; then\n")
-	sb.WriteString("      xfs_growfs /\n")
-	sb.WriteString("    elif [ \"$TYPE\" = \"ext4\" ]; then\n")
-	sb.WriteString("      resize2fs /dev/vda1\n")
-	sb.WriteString("    fi\n")
-
 	// --- C. Alpine setup script ---
 	sb.WriteString("  - |\n")
 	sb.WriteString(fmt.Sprintf(`    if [ -f /etc/alpine-release ]; then
