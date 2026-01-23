@@ -299,6 +299,10 @@ func (r *Runctl) Start(name string) error {
 		args = append(args, "--shared-dir", s)
 	}
 
+	// Enable nested virtualization on VZ by default
+	// Aargh - this only works on m3 and later macs
+	// args = append(args, "--nested-virt")
+
 	// Prepare executable shim
 	exePath := filepath.Join(instDir, inst.Name)
 	_ = os.Remove(exePath)
