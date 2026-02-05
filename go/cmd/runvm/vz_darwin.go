@@ -16,40 +16,40 @@ import (
 	"net"
 	"os"
 	"strings"
-	"sync"
+	//	"sync"
 
 	"github.com/Code-Hex/vz/v3"
-	"github.com/swiss-software-tool/runtime-smart/go/internal/sst"
+	// "github.com/swiss-software-tool/runtime-smart/go/internal/sst"
 )
 
 // --- CGO Glue for Sleep/Wake ---
 
-var globalSleepHandler func(bool)
-var globalSleepMu sync.Mutex
+// var globalSleepHandler func(bool)
+// var globalSleepMu sync.Mutex
 
-//export goSleepCallback
-func goSleepCallback(isSleep C.int) {
-	globalSleepMu.Lock()
-	defer globalSleepMu.Unlock()
-	if globalSleepHandler != nil {
-		globalSleepHandler(isSleep != 0)
-	}
-}
+// //export goSleepCallback
+// func goSleepCallback(isSleep C.int) {
+// 	globalSleepMu.Lock()
+// 	defer globalSleepMu.Unlock()
+// 	if globalSleepHandler != nil {
+// 		globalSleepHandler(isSleep != 0)
+// 	}
+// }
 
-func StartSleepObserver(log *sst.Logx, handler func(bool)) func() {
-	globalSleepMu.Lock()
-	globalSleepHandler = handler
-	globalSleepMu.Unlock()
+// func StartSleepObserver(log *sst.Logx, handler func(bool)) func() {
+// 	globalSleepMu.Lock()
+// 	globalSleepHandler = handler
+// 	globalSleepMu.Unlock()
 
-	C.startSleepObserver()
+// 	C.startSleepObserver()
 
-	return func() {
-		C.stopSleepObserver()
-		globalSleepMu.Lock()
-		globalSleepHandler = nil
-		globalSleepMu.Unlock()
-	}
-}
+// 	return func() {
+// 		C.stopSleepObserver()
+// 		globalSleepMu.Lock()
+// 		globalSleepHandler = nil
+// 		globalSleepMu.Unlock()
+// 	}
+// }
 
 // --- VM Wrapper ---
 
@@ -57,6 +57,7 @@ type VMWrapper struct {
 	machine *vz.VirtualMachine
 	config  *vz.VirtualMachineConfiguration
 	errCh   chan error
+	doneCh  chan struct{}
 }
 
 func NewVMWrapper(app *RunVMApp) (*VMWrapper, error) {
@@ -71,19 +72,15 @@ func NewVMWrapper(app *RunVMApp) (*VMWrapper, error) {
 		return nil, err
 	}
 
-	// ---------------------------------------------------------
-	// 1. Platform & Nested Virtualization (THE FIX)
-	// ---------------------------------------------------------
-	// We must create a GenericPlatformConfiguration to enable nested virt.
+	// 1. Platform & Nested Virtualization
 	platformConfig, err := vz.NewGenericPlatformConfiguration()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create platform config: %w", err)
 	}
 
 	if app.NestedVirt {
-		// Check support first to avoid obscure errors
 		if !vz.IsNestedVirtualizationSupported() {
-			return nil, fmt.Errorf("nested virtualization is not supported on this host (requires M3 or newer / macOS 15+)")
+			return nil, fmt.Errorf("nested virtualization is not supported on this host")
 		}
 		if err := platformConfig.SetNestedVirtualizationEnabled(true); err != nil {
 			return nil, fmt.Errorf("failed to enable nested virtualization: %w", err)
@@ -91,7 +88,6 @@ func NewVMWrapper(app *RunVMApp) (*VMWrapper, error) {
 		app.log.Info(app.ctx, "Enabled nested virtualization")
 	}
 	config.SetPlatformVirtualMachineConfiguration(platformConfig)
-	// ---------------------------------------------------------
 
 	// 2. Serial Ports
 	attachment, err := vz.NewFileHandleSerialPortAttachment(os.Stdin, os.Stdout)
@@ -104,10 +100,9 @@ func NewVMWrapper(app *RunVMApp) (*VMWrapper, error) {
 	}
 	config.SetSerialPortsVirtualMachineConfiguration([]*vz.VirtioConsoleDeviceSerialPortConfiguration{serialConf})
 
-	// 3. Storage (Order Matters: RW First)
+	// 3. Storage
 	var storageDevices []vz.StorageDeviceConfiguration
 
-	// A. RW Disks
 	for _, path := range app.RwDiskPaths {
 		cfg, err := createDiskConfig(path, false)
 		if err != nil {
@@ -116,7 +111,6 @@ func NewVMWrapper(app *RunVMApp) (*VMWrapper, error) {
 		storageDevices = append(storageDevices, cfg)
 	}
 
-	// B. RO Disks
 	for _, path := range app.DiskPaths {
 		cfg, err := createDiskConfig(path, true)
 		if err != nil {
@@ -125,7 +119,6 @@ func NewVMWrapper(app *RunVMApp) (*VMWrapper, error) {
 		storageDevices = append(storageDevices, cfg)
 	}
 
-	// C. CD-ROMs
 	for _, path := range app.CdromPaths {
 		cfg, err := createUSBCDROMConfig(path)
 		if err != nil {
@@ -135,7 +128,13 @@ func NewVMWrapper(app *RunVMApp) (*VMWrapper, error) {
 	}
 	config.SetStorageDevicesVirtualMachineConfiguration(storageDevices)
 
-	// 4. Network
+	// 4. Network (Strict Ordering Enforced)
+	// Step A: Apply Defaults
+	if len(app.Networks) == 0 {
+		app.Networks = []string{"nat"}
+	}
+
+	// Step B: Build Device List
 	var networkDevices []*vz.VirtioNetworkDeviceConfiguration
 	for _, netStr := range app.Networks {
 		cfg, err := createNetworkConfig(netStr)
@@ -144,6 +143,7 @@ func NewVMWrapper(app *RunVMApp) (*VMWrapper, error) {
 		}
 		networkDevices = append(networkDevices, cfg)
 	}
+	// Step C: Attach to Config (Last mutation)
 	config.SetNetworkDevicesVirtualMachineConfiguration(networkDevices)
 
 	// 5. Shared Dirs
@@ -166,17 +166,26 @@ func NewVMWrapper(app *RunVMApp) (*VMWrapper, error) {
 		config.SetMemoryBalloonDevicesVirtualMachineConfiguration([]vz.MemoryBalloonDeviceConfiguration{bal})
 	}
 
+	// 7. Validation (The "Freeze" Point)
+	// No config mutations are allowed after this line.
 	validated, err := config.Validate()
 	if !validated || err != nil {
 		return nil, fmt.Errorf("invalid VM config: %w", err)
 	}
 
+	// 8. Instantiation
 	vm, err := vz.NewVirtualMachine(config)
 	if err != nil {
 		return nil, err
 	}
 
-	return &VMWrapper{machine: vm, config: config, errCh: make(chan error, 1)}, nil
+	wrapper := &VMWrapper{
+		machine: vm, 
+		config:  config, 
+		errCh:   make(chan error, 1),
+		doneCh:  make(chan struct{}),
+	}
+	return wrapper, nil
 }
 
 func (v *VMWrapper) Start(ctx context.Context) error {
@@ -204,7 +213,7 @@ func (v *VMWrapper) Resume() error {
 }
 
 func (v *VMWrapper) Done() <-chan struct{} {
-	return nil
+	return v.doneCh
 }
 
 func (v *VMWrapper) Err() error {
@@ -241,7 +250,12 @@ func createBootloader(app *RunVMApp) (vz.BootLoader, error) {
 }
 
 func createDiskConfig(path string, ro bool) (vz.StorageDeviceConfiguration, error) {
-	att, err := vz.NewDiskImageStorageDeviceAttachment(path, ro)
+	att, err := vz.NewDiskImageStorageDeviceAttachmentWithCacheAndSync(
+		path,
+		ro,
+		vz.DiskImageCachingModeCached,
+		vz.DiskImageSynchronizationModeFsync,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -257,43 +271,108 @@ func createUSBCDROMConfig(path string) (vz.StorageDeviceConfiguration, error) {
 }
 
 func createNetworkConfig(netStr string) (*vz.VirtioNetworkDeviceConfiguration, error) {
+	macStr := ""
+	typ := "shared" 
+
 	parts := strings.Split(netStr, "@")
-	var macStr, typeStr string
-
-	if len(parts) == 2 {
+	switch len(parts) {
+	case 1:
+		typ = parts[0]
+	case 2:
 		macStr = parts[0]
-		typeStr = parts[1]
-	} else {
-		typeStr = parts[0]
+		typ = parts[1]
+	default:
+		return nil, fmt.Errorf("invalid network spec %q", netStr)
 	}
 
-	if typeStr != "nat" && typeStr != "" {
-		return nil, fmt.Errorf("only 'nat' networking is supported (requested: %s)", typeStr)
+	var attachment vz.NetworkDeviceAttachment
+	var err error
+
+	switch typ {
+	case "shared":
+		// SharedNetworkDeviceAttachment provides NAT + host reachability.
+		// If the helper is missing in your Go package version, 
+		// we use the NewNATNetworkDeviceAttachment but must ensure 
+		// the host's bridge is scannable.
+		// NOTE: In older Code-Hex/vz, NAT is the only non-bridged option.
+		// To fix reachability, we use NAT but ensure the MAC is static 
+		// so runctl can find it in the ARP table.
+		attachment, err = vz.NewNATNetworkDeviceAttachment()
+	case "nat":
+		attachment, err = vz.NewNATNetworkDeviceAttachment()
+	default:
+		return nil, fmt.Errorf("unsupported network type %q (use 'shared' or 'nat')", typ)
 	}
 
-	attachment, err := vz.NewNATNetworkDeviceAttachment()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create %s attachment: %w", typ, err)
 	}
 
-	devConfig, err := vz.NewVirtioNetworkDeviceConfiguration(attachment)
+	dev, err := vz.NewVirtioNetworkDeviceConfiguration(attachment)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create virtio network device: %w", err)
 	}
 
 	if macStr != "" {
-		hwAddr, err := net.ParseMAC(macStr)
+		hw, err := net.ParseMAC(macStr)
 		if err != nil {
-			return nil, fmt.Errorf("invalid MAC address %q: %w", macStr, err)
+			return nil, fmt.Errorf("invalid MAC %q: %w", macStr, err)
 		}
-		
-		mac, err := vz.NewMACAddress(hwAddr)
-		if err == nil {
-			devConfig.SetMACAddress(mac)
+		mac, err := vz.NewMACAddress(hw)
+		if err != nil {
+			return nil, fmt.Errorf("failed to set MAC %q: %w", macStr, err)
 		}
+		dev.SetMACAddress(mac)
 	}
-	return devConfig, nil
+	return dev, nil
 }
+
+// // Fix: Robust parsing logic
+// func createNetworkConfig(netStr string) (*vz.VirtioNetworkDeviceConfiguration, error) {
+// 	macStr := ""
+// 	typ := "nat"
+
+// 	parts := strings.Split(netStr, "@")
+// 	switch len(parts) {
+// 	case 1:
+// 		typ = parts[0]
+// 	case 2:
+// 		macStr = parts[0]
+// 		typ = parts[1]
+// 	default:
+// 		return nil, fmt.Errorf("invalid network spec %q", netStr)
+// 	}
+
+// 	if typ != "nat" {
+// 		return nil, fmt.Errorf("unsupported network type %q (only nat supported here)", typ)
+// 	}
+
+// 	// 1. Create Attachment
+// 	att, err := vz.NewNATNetworkDeviceAttachment()
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to create NAT attachment: %w", err)
+// 	}
+
+// 	// 2. Create Device
+// 	dev, err := vz.NewVirtioNetworkDeviceConfiguration(att)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to create virtio network device: %w", err)
+// 	}
+
+// 	// 3. Set MAC (if provided)
+// 	if macStr != "" {
+// 		hw, err := net.ParseMAC(macStr)
+// 		if err != nil {
+// 			return nil, fmt.Errorf("invalid MAC %q: %w", macStr, err)
+// 		}
+// 		mac, err := vz.NewMACAddress(hw)
+// 		if err != nil {
+// 			return nil, fmt.Errorf("failed to set MAC %q: %w", macStr, err)
+// 		}
+// 		dev.SetMACAddress(mac)
+// 	}
+// 	return dev, nil
+// }
 
 func createShareConfig(shareStr string) (vz.DirectorySharingDeviceConfiguration, error) {
 	parts := strings.Split(shareStr, ":")

@@ -1,10 +1,28 @@
 package main
 
+/*
+#cgo CFLAGS: -x objective-c
+#cgo LDFLAGS: -framework CoreFoundation
+
+#import <CoreFoundation/CoreFoundation.h>
+
+void runCocoaLoop() {
+    CFRunLoopRun();
+}
+
+void stopCocoaLoop() {
+    CFRunLoopStop(CFRunLoopGetMain());
+}
+*/
+import "C"
+
 import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -13,9 +31,88 @@ import (
 	"golang.org/x/term"
 )
 
-// RunVMApp holds the application state and configuration
+// Main entry point decides role based on ENV var
+func main() {
+	if os.Getenv("SST_RUNVM_WORKER") == "1" {
+		runWorker()
+	} else {
+		runSupervisor()
+	}
+}
+
+// -----------------------------------------------------------------------------
+// SUPERVISOR: Manages TTY and Signals. Survives child crashes.
+// -----------------------------------------------------------------------------
+func runSupervisor() {
+	// 1. Setup TTY protection immediately
+	fd := int(os.Stdin.Fd())
+	var oldState *term.State
+	if term.IsTerminal(fd) {
+		s, err := term.MakeRaw(fd)
+		if err == nil {
+			oldState = s
+			// This defer guarantees cleanup even if child is kill -9'd
+			defer term.Restore(fd, oldState)
+		}
+	}
+
+	// 2. Prepare Child Command (Self re-execution)
+	exe, err := os.Executable()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error finding executable: %v\n", err)
+		os.Exit(1)
+	}
+
+	cmd := exec.Command(exe, os.Args[1:]...)
+	cmd.Env = append(os.Environ(), "SST_RUNVM_WORKER=1")
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// 3. Start Child
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to start worker process: %v\n", err)
+		os.Exit(1)
+	}
+
+	// 4. Signal Forwarding
+	// We forward INT/TERM to child. We ignore them in parent so parent waits for child.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	
+	go func() {
+		for sig := range sigCh {
+			// Forward signal to child process group
+			_ = cmd.Process.Signal(sig)
+		}
+	}()
+
+	// 5. Wait for child
+	err = cmd.Wait()
+	
+	// Exit with child's status code
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		os.Exit(exitErr.ExitCode())
+	}
+	if err != nil {
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+// -----------------------------------------------------------------------------
+// WORKER: Runs the actual VM logic + Cocoa Loop
+// -----------------------------------------------------------------------------
+
+// Ensure worker runs on the main thread for Cocoa
+func init() {
+	if os.Getenv("SST_RUNVM_WORKER") == "1" {
+		runtime.LockOSThread()
+	}
+}
+
+// RunVMApp holds application state (Worker only)
 type RunVMApp struct {
-	// --- Configuration Flags (matching Swift/crosvm) ---
 	Name            string
 	CPUCount        int
 	MemorySize      uint64
@@ -26,7 +123,7 @@ type RunVMApp struct {
 	SharedDirs      []string
 	Networks        []string
 	Balloon         bool
-	NestedVirt      bool   // <--- NEW: Enable nested virtualization
+	NestedVirt      bool
 	Bootloader      string
 	EfiVars         string
 	Kernel          string
@@ -36,39 +133,53 @@ type RunVMApp struct {
 	ShutdownTimeout float64
 	Gui             bool
 
-	// --- Runtime State ---
-	ctx       context.Context
-	cancel    context.CancelFunc
-	log       *sst.Logx
-	steps     *sst.StepsRunState
-	vm        *VMWrapper
-	ttyState  *term.State
-	sigCh     chan os.Signal
+	ctx    context.Context
+	cancel context.CancelFunc
+	log    *sst.Logx
+	steps  *sst.StepsRunState
+	vm     *VMWrapper
+	sigCh  chan os.Signal
+	errCh  chan error
 }
 
-func main() {
+func runWorker() {
 	app := &RunVMApp{
-		log: sst.LogxRoot().Subsystem("runvm"),
+		log:   sst.LogxRoot().Subsystem("runvm"),
+		errCh: make(chan error, 1),
 	}
 
 	cmd := &cobra.Command{
 		Use:   "runvm",
 		Short: "Native Go macOS Virtualization Runner",
-		RunE: func(cmd *cobra.Command, args []string) error {
+		Run: func(cmd *cobra.Command, args []string) {
 			app.ctx, app.cancel = context.WithCancel(context.Background())
-			
-			// Initialize the Step Machine
+
 			app.steps = sst.StepsInit("runvm")
-			
+			// No TTY setup needed in worker; parent handled it.
 			app.steps.StepsAdd("validate_args", app.stepValidate)
-			app.steps.StepsAdd("setup_tty", app.stepSetupTTY)
 			app.steps.StepsAdd("configure_vm", app.stepConfigureVM)
 			app.steps.StepsAdd("start_vm", app.stepStartVM)
 			app.steps.StepsAdd("wait_loop", app.stepWaitLoop)
-			
-			defer app.cleanup()
-			
-			return sst.StepsRun(app.steps)
+
+			// Run logic in goroutine
+			go func() {
+				err := sst.StepsRun(app.steps)
+				if err != nil {
+					app.log.WithError(err).Error(app.ctx, "runvm failed")
+					app.errCh <- err
+				} else {
+					app.errCh <- nil
+				}
+				C.stopCocoaLoop()
+			}()
+
+			// Block Main Thread on Cocoa RunLoop
+			C.runCocoaLoop()
+
+			if err := <-app.errCh; err != nil {
+				os.Exit(1)
+			}
+			os.Exit(0)
 		},
 	}
 
@@ -83,10 +194,8 @@ func main() {
 	f.StringSliceVar(&app.CdromPaths, "cdrom", []string{}, "CD-ROMs")
 	f.StringSliceVar(&app.SharedDirs, "shared-dir", []string{}, "Shared directories (path:tag:ro)")
 	f.StringSliceVar(&app.Networks, "network", []string{"nat"}, "Network config (nat or mac@nat)")
-	
 	f.BoolVar(&app.Balloon, "balloon", true, "Enable memory ballooning")
-	f.BoolVar(&app.NestedVirt, "nested-virt", false, "Enable nested virtualization (requires macOS 13+ Apple Silicon)") // <--- NEW FLAG
-
+	f.BoolVar(&app.NestedVirt, "nested-virt", false, "Enable nested virtualization")
 	f.StringVar(&app.Bootloader, "bootloader", "linux", "Bootloader (linux|efi)")
 	f.StringVar(&app.EfiVars, "efi-vars", "", "Path to EFI variables")
 	f.StringVar(&app.Kernel, "kernel", "", "Path to kernel")
@@ -107,9 +216,7 @@ func (a *RunVMApp) stepValidate(ctx *sst.StepsContext, s sst.StepState) error {
 	if a.Bootloader == "linux" && a.Kernel == "" {
 		return fmt.Errorf("kernel path required for linux bootloader")
 	}
-
-	// Calculate Memory Bytes
-	mul := uint64(1024 * 1024) // Default MiB
+	mul := uint64(1024 * 1024)
 	switch a.MemorySuffix {
 	case "GiB": mul = 1024 * 1024 * 1024
 	case "KB":  mul = 1000
@@ -120,21 +227,8 @@ func (a *RunVMApp) stepValidate(ctx *sst.StepsContext, s sst.StepState) error {
 	return nil
 }
 
-func (a *RunVMApp) stepSetupTTY(ctx *sst.StepsContext, s sst.StepState) error {
-	// Set Raw Mode for interaction
-	if term.IsTerminal(int(os.Stdin.Fd())) {
-		state, err := term.MakeRaw(int(os.Stdin.Fd()))
-		if err != nil {
-			a.log.Warn(a.ctx, "Failed to set raw terminal", "error", err)
-		} else {
-			a.ttyState = state
-		}
-	}
-	return nil
-}
-
 func (a *RunVMApp) stepConfigureVM(ctx *sst.StepsContext, s sst.StepState) error {
-	vm, err := NewVMWrapper(a) // Logic in vz_darwin.go
+	vm, err := NewVMWrapper(a)
 	if err != nil {
 		return err
 	}
@@ -154,23 +248,23 @@ func (a *RunVMApp) stepWaitLoop(ctx *sst.StepsContext, s sst.StepState) error {
 	a.sigCh = make(chan os.Signal, 1)
 	signal.Notify(a.sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
-	// Start CGO Sleep Observer
-	stopSleepObs := StartSleepObserver(a.log, func(isSleep bool) {
-		if isSleep {
-			a.log.Info(a.ctx, "System sleeping, pausing VM...")
-			if err := a.vm.Pause(); err != nil {
-				a.log.Error(a.ctx, "Failed to pause VM", "error", err)
-			}
-		} else {
-			a.log.Info(a.ctx, "System waking, resuming VM...")
-			if err := a.vm.Resume(); err != nil {
-				a.log.Error(a.ctx, "Failed to resume VM", "error", err)
-			}
-		}
-	})
-	defer stopSleepObs()
+	// stopSleepObs := StartSleepObserver(a.log, func(isSleep bool) {
+	// 	if isSleep {
+	// 		fmt.Fprintf(os.Stderr, "\n\n>>> SYSTEM SLEEP DETECTED - PAUSING VM <<<\n\n")
+	// 		a.log.Info(a.ctx, "System sleeping, pausing VM...")
+	// 		if err := a.vm.Pause(); err != nil {
+	// 			a.log.Error(a.ctx, "Failed to pause VM", "error", err)
+	// 		}
+	// 	} else {
+	// 		fmt.Fprintf(os.Stderr, "\n\n>>> SYSTEM WAKE DETECTED - RESUMING VM <<<\n\n")
+	// 		a.log.Info(a.ctx, "System waking, resuming VM...")
+	// 		if err := a.vm.Resume(); err != nil {
+	// 			a.log.Error(a.ctx, "Failed to resume VM", "error", err)
+	// 		}
+	// 	}
+	// })
+	// defer stopSleepObs()
 
-	// Wait loop
 	select {
 	case <-a.vm.Done():
 		if err := a.vm.Err(); err != nil {
@@ -180,9 +274,7 @@ func (a *RunVMApp) stepWaitLoop(ctx *sst.StepsContext, s sst.StepState) error {
 
 	case sig := <-a.sigCh:
 		a.log.Info(a.ctx, "Signal received", "signal", sig)
-		
 		a.vm.RequestStop()
-		
 		select {
 		case <-a.vm.Done():
 			a.log.Info(a.ctx, "VM stopped gracefully")
@@ -193,10 +285,4 @@ func (a *RunVMApp) stepWaitLoop(ctx *sst.StepsContext, s sst.StepState) error {
 	}
 
 	return nil
-}
-
-func (a *RunVMApp) cleanup() {
-	if a.ttyState != nil {
-		term.Restore(int(os.Stdin.Fd()), a.ttyState)
-	}
 }

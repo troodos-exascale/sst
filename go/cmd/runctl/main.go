@@ -4,15 +4,17 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"   // Added
+	"os/signal" // Added
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
-	"golang.org/x/term"
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	rtsst "github.com/swiss-software-tool/runtime-smart/go/internal/rtsst"
 	sst "github.com/swiss-software-tool/runtime-smart/go/internal/sst"
@@ -299,8 +301,7 @@ func (r *Runctl) Start(name string) error {
 		args = append(args, "--shared-dir", s)
 	}
 
-	// Enable nested virtualization on VZ by default
-	// Aargh - this only works on m3 and later macs
+	// Enable nested virtualization by default (supported libraries permitting)
 	// args = append(args, "--nested-virt")
 
 	// Prepare executable shim
@@ -310,16 +311,14 @@ func (r *Runctl) Start(name string) error {
 		return err
 	}
 
-    // --- Terminal Safety Net ---
-    // Save terminal state before handing control to the raw-mode VM
-    fd := int(os.Stdin.Fd())
-    if term.IsTerminal(fd) {
-        state, err := term.GetState(fd)
-        if err == nil {
-            // Restore terminal no matter what happens (panic, error, or child kill -9)
-            defer term.Restore(fd, state)
-        }
-    }
+	// --- Terminal Safety Net ---
+	fd := int(os.Stdin.Fd())
+	if term.IsTerminal(fd) {
+		state, err := term.GetState(fd)
+		if err == nil {
+			defer term.Restore(fd, state)
+		}
+	}
 
 	lockPath := rtsst.LockFilePath(inst.Name)
 	lock, err := rtsst.CreateLock(lockPath)
@@ -328,21 +327,49 @@ func (r *Runctl) Start(name string) error {
 	}
 	defer lock.Remove()
 
-	_, err = sst.Exec(r.Ctx, r.Log, sst.ExecRequest{
-		Cmd:  "./" + inst.Name,
-		Args: args,
-		Dir:  instDir,
-		Mode: sst.ExecForeground,
-	})
-	if err != nil {
-		r.Log.Diagnose(
-			r.Ctx,
-			"RUNVM_FAILED",
-			"runvm exited with failure",
-			"instance", inst.Name,
-			"error", err.Error(),
-		)
-		return err
+	// --- EXECUTION WITH SIGNAL FORWARDING ---
+	// We run the command manually to intercept signals destined for the lock-holding process
+	// and forward them to the actual VM child process.
+
+	cmd := exec.CommandContext(r.Ctx, "./"+inst.Name, args...)
+	cmd.Dir = instDir
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	// 1. Setup Signal Channel
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start VM process: %w", err)
+	}
+
+	// 2. Forward Signals to Child
+	go func() {
+		for sig := range sigCh {
+			// Forward the signal to the runvm process
+			_ = cmd.Process.Signal(sig)
+		}
+	}()
+
+	// 3. Wait for Child Exit
+	if err := cmd.Wait(); err != nil {
+		// Verify if it was a clean exit (exit code 0 is success)
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if exitErr.ExitCode() != 0 {
+				r.Log.Diagnose(
+					r.Ctx,
+					"RUNVM_FAILED",
+					"runvm exited with failure",
+					"instance", inst.Name,
+					"exit_code", exitErr.ExitCode(),
+				)
+				return err
+			}
+		} else {
+			return err
+		}
 	}
 
 	r.Log.Info(r.Ctx, "instance exited cleanly", "instance", inst.Name)
@@ -353,42 +380,41 @@ func (r *Runctl) Stop(name string) error {
 	lp := rtsst.LockFilePath(name)
 	info, err := rtsst.ReadLock(lp)
 	if err != nil {
-        // If we can't read the lock, assume it's already stopped
+		// If we can't read the lock, assume it's already stopped
 		return nil
 	}
 
 	if !rtsst.IsPidAlive(info.Pid) {
-        // Process is already gone
+		// Process is already gone
 		return nil
 	}
 
-    r.Log.Info(r.Ctx, "sending SIGTERM", "instance", name, "pid", info.Pid)
+	r.Log.Info(r.Ctx, "sending SIGTERM", "instance", name, "pid", info.Pid)
 	if err := syscall.Kill(info.Pid, syscall.SIGTERM); err != nil {
-        return err
-    }
+		return err
+	}
 
-    // --- Synchronous Wait ---
-    // Poll for up to 10 seconds for the process to actually exit.
-    // This prevents the "storage invalid" race condition on restart.
-    timeout := time.After(10 * time.Second)
-    ticker := time.NewTicker(100 * time.Millisecond)
-    defer ticker.Stop()
+	// --- Synchronous Wait ---
+	// Poll for up to 10 seconds for the process to actually exit.
+	// This prevents the "storage invalid" race condition on restart.
+	timeout := time.After(10 * time.Second)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
 
-    for {
-        select {
-        case <-timeout:
-            r.Log.Warn(r.Ctx, "instance did not stop gracefully, sending SIGKILL", "pid", info.Pid)
-            _ = syscall.Kill(info.Pid, syscall.SIGKILL)
-            return nil // We forced it, so we consider it stopped
-        case <-ticker.C:
-            if !rtsst.IsPidAlive(info.Pid) {
-                r.Log.Info(r.Ctx, "instance stopped", "instance", name)
-                return nil
-            }
-        }
-    }
+	for {
+		select {
+		case <-timeout:
+			r.Log.Warn(r.Ctx, "instance did not stop gracefully, sending SIGKILL", "pid", info.Pid)
+			_ = syscall.Kill(info.Pid, syscall.SIGKILL)
+			return nil // We forced it, so we consider it stopped
+		case <-ticker.C:
+			if !rtsst.IsPidAlive(info.Pid) {
+				r.Log.Info(r.Ctx, "instance stopped", "instance", name)
+				return nil
+			}
+		}
+	}
 }
-
 
 func (r *Runctl) Resume(name string) error {
 	lp := rtsst.LockFilePath(name)
@@ -471,49 +497,73 @@ func (r *Runctl) List() error {
 /* ======================= network helper ======================= */
 
 // instanceIP attempts to find the IP address for a given MAC address.
+// It retries for up to 30 seconds to allow for slow DHCP assignments.
 func instanceIP(ctx context.Context, log *sst.Logx, mac string) (string, error) {
 	mac = strings.ToLower(mac)
+	targetNormalized := normalizeMAC(mac)
+
 	log.Info(ctx, "Resolving IP", "mac", mac)
 
-	// 1. Refresh ARP cache via Broadcast Ping
-	// We ping the broadcast address to force neighbors to announce themselves.
-	// This ensures the ARP table is populated even if the VM is idle.
+	// We loop for up to 30 seconds
+	ctxTimeout, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	// Initial attempt immediately
+	if ip, ok := attemptResolveIP(ctxTimeout, log, targetNormalized); ok {
+		log.Info(ctx, "IP found", "ip", ip, "mac", mac)
+		return ip, nil
+	}
+
+	for {
+		select {
+		case <-ctxTimeout.Done():
+			return "", fmt.Errorf("timeout resolving IP for MAC %s (DHCP is too slow or failed)", mac)
+		case <-ticker.C:
+			if ip, ok := attemptResolveIP(ctxTimeout, log, targetNormalized); ok {
+				log.Info(ctx, "IP found", "ip", ip, "mac", mac)
+				return ip, nil
+			}
+		}
+	}
+}
+
+// Helper to perform a single Ping+ARP check cycle
+func attemptResolveIP(ctx context.Context, log *sst.Logx, targetMAC string) (string, bool) {
 	pingArgs := []string{"-c", "1", "-W", "1"}
+
+	// 1. Generate Traffic (Broadcast Ping)
 	if runtime.GOOS == "darwin" {
-		// Try specific gateway ping on macOS (vmnet framework usually uses .1)
+		// macOS: Ping gateway and subnet broadcast
+		// Ignore errors, we just want to tickle the ARP table
 		_, _ = sst.Exec(ctx, log, sst.ExecRequest{
-			Cmd:  "ping",
-			Args: append(pingArgs, "192.168.64.1"),
-			Mode: sst.ExecCaptured,
+			Cmd: "ping", Args: append(pingArgs, "192.168.64.1"), Mode: sst.ExecCaptured,
+		})
+		_, _ = sst.Exec(ctx, log, sst.ExecRequest{
+			Cmd: "ping", Args: append(pingArgs, "192.168.64.255"), Mode: sst.ExecCaptured,
+		})
+	} else {
+		// Linux/Standard Broadcast
+		_, _ = sst.Exec(ctx, log, sst.ExecRequest{
+			Cmd: "ping", Args: append(pingArgs, "255.255.255.255"), Mode: sst.ExecCaptured,
 		})
 	}
-	// Broadcast ping (works on many Linux setups + macOS)
-	// We ignore errors because some networks block broadcast pings.
-	_, _ = sst.Exec(ctx, log, sst.ExecRequest{
-		Cmd:  "ping",
-		Args: append(pingArgs, "255.255.255.255"),
-		Mode: sst.ExecCaptured,
-	})
 
 	// 2. Read ARP Table
 	entries, err := getARPTable(ctx, log)
 	if err != nil {
-		return "", fmt.Errorf("failed to read arp table: %w", err)
+		return "", false
 	}
 
-	// 3. Search with Normalization
-	// We normalize both the target MAC and the table entry to handle
-	// cases where the OS drops leading zeros (e.g. 0:36 vs 00:36).
-	targetNormalized := normalizeMAC(mac)
-
+	// 3. Search
 	for ip, entryMac := range entries {
-		if normalizeMAC(entryMac) == targetNormalized {
-			log.Info(ctx, "IP found", "ip", ip, "mac", mac)
-			return ip, nil
+		if normalizeMAC(entryMac) == targetMAC {
+			return ip, true
 		}
 	}
-
-	return "", fmt.Errorf("no IP found for MAC %s", mac)
+	return "", false
 }
 
 // getARPTable returns a map of IP -> MAC from the system's ARP cache.
