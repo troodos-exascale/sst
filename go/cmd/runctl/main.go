@@ -196,8 +196,7 @@ func (r *Runctl) setupHostCmd() *cobra.Command {
 	}
 }
 
-// SetupLinuxNetwork provisions the TAP device, NAT routing, and DHCP.
-// It must be run as root.
+
 func (r *Runctl) SetupLinuxNetwork() error {
 	if runtime.GOOS != "linux" {
 		r.Log.Info(r.Ctx, "setup-host is a no-op on non-Linux platforms")
@@ -233,11 +232,16 @@ func (r *Runctl) SetupLinuxNetwork() error {
 		iptables -A FORWARD -i sst_tap -o "$HOST_DEV" -j ACCEPT
 	fi
 
-	# 3. EXPLICIT DNSMASQ CONFIG
+# 3. EXPLICIT DNSMASQ CONFIG (Using PID file instead of pgrep)
 	if command -v dnsmasq &>/dev/null; then
-		if ! pgrep -f "dnsmasq.*sst_tap" &>/dev/null; then
+		PIDFILE=/var/run/sst_tap_dnsmasq.pid
+		if [ ! -f "$PIDFILE" ] || ! kill -0 $(cat "$PIDFILE") 2>/dev/null; then
 			dnsmasq --conf-file=/dev/null \
+			--user=root \
+			--pid-file=$PIDFILE \
+			--dhcp-leasefile=/var/run/sst_tap_dnsmasq.leases \
 			--port=0 \
+			--interface=sst_tap \
 			--listen-address=192.168.10.1 \
 			--bind-interfaces \
 			--dhcp-range=192.168.10.50,192.168.10.200,12h \
@@ -250,6 +254,7 @@ func (r *Runctl) SetupLinuxNetwork() error {
 	_, err := sst.ExecShell(r.Ctx, r.Log, "bash", "-c", script)
 	return err
 }
+
 
 func (r *Runctl) stopCmd() *cobra.Command {
 	return &cobra.Command{
@@ -352,9 +357,10 @@ func (r *Runctl) sshCmd() *cobra.Command {
 			// Exec syscall replaces the runctl process with ssh
 			sshArgs := []string{
 				"ssh",
+				"-i", filepath.Join(u.HomeDir, ".ssh", "id_ed25519"),
 				"-o", "StrictHostKeyChecking=no",
 				"-o", "UserKnownHostsFile=/dev/null",
-				"-o", "LogLevel=ERROR", // Suppress the permanent warning about adding to known_hosts
+				"-o", "LogLevel=ERROR",
 				fmt.Sprintf("%s@%s", u.Username, ip),
 			}
 			
@@ -363,32 +369,78 @@ func (r *Runctl) sshCmd() *cobra.Command {
 	}
 }
 
-// resolveIP scans the host's ARP cache to find the IP associated with a MAC address.
+
+// resolveIP scans DHCP leases and ARP caches to find the IP associated with a MAC address.
 func (r *Runctl) resolveIP(mac string) (string, error) {
-	// macOS arp format: ? (192.168.64.2) at 52:54:ab:bf:5d:78 on bridge100 ifscope [bridge]
-	// Linux arp format: ? (192.168.10.150) at 52:54:ab:bf:5d:78 [ether] on sst_tap
-	
-	// Normalize MAC for reliable matching
 	mac = strings.ToLower(mac)
 
-	out, err := exec.Command("arp", "-a").Output()
-	if err != nil {
-		return "", fmt.Errorf("failed to read arp table: %w", err)
+	// macOS 'arp' and 'bootpd' drop leading zeros (e.g., "09" becomes "9")
+	var macOSMacParts []string
+	for _, p := range strings.Split(mac, ":") {
+		trimmed := strings.TrimLeft(p, "0")
+		if trimmed == "" {
+			trimmed = "0"
+		}
+		macOSMacParts = append(macOSMacParts, trimmed)
 	}
+	macOSMac := strings.Join(macOSMacParts, ":")
 
-	lines := strings.Split(string(out), "\n")
-	for _, line := range lines {
-		if strings.Contains(strings.ToLower(line), mac) {
-			// Extract IP from between parentheses e.g. "(192.168.64.2)"
-			start := strings.Index(line, "(")
-			end := strings.Index(line, ")")
-			if start != -1 && end != -1 && end > start {
-				return line[start+1 : end], nil
+	// 1. Linux: Check our explicit dnsmasq lease file
+	if data, err := os.ReadFile("/var/run/sst_tap_dnsmasq.leases"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			parts := strings.Fields(line)
+			// dnsmasq format: <expiry> <mac> <ip> <hostname> <client_id>
+			if len(parts) >= 3 && strings.ToLower(parts[1]) == mac {
+				return parts[2], nil
 			}
 		}
 	}
 
-	return "", fmt.Errorf("MAC not found in ARP cache")
+	// 2. macOS: Check native bootpd DHCP leases
+	if data, err := os.ReadFile("/var/db/dhcpd_leases"); err == nil {
+		var lastIP string
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "ip_address=") {
+				lastIP = strings.TrimPrefix(line, "ip_address=")
+			} else if strings.HasPrefix(line, "hw_address=") {
+				lowerLine := strings.ToLower(line)
+				if strings.Contains(lowerLine, mac) || strings.Contains(lowerLine, macOSMac) {
+					return lastIP, nil
+				}
+			}
+		}
+	}
+
+	// 3. Linux: Fallback to modern 'ip neigh'
+	if out, err := exec.Command("ip", "neigh").Output(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.Contains(strings.ToLower(line), mac) {
+				parts := strings.Fields(line)
+				// ip neigh format: 192.168.10.85 dev sst_tap lladdr 52:54:... REACHABLE
+				if len(parts) >= 1 {
+					return parts[0], nil
+				}
+			}
+		}
+	}
+
+	// 4. macOS / Legacy Linux: Fallback to 'arp -a'
+	if out, err := exec.Command("arp", "-a").Output(); err == nil {
+		for _, line := range strings.Split(string(out), "\n") {
+			lowerLine := strings.ToLower(line)
+			if strings.Contains(lowerLine, mac) || strings.Contains(lowerLine, macOSMac) {
+				// arp -a format: ? (192.168.64.2) at 52:54:b2:b3:b9:9 on bridge100 ifscope [bridge]
+				start := strings.Index(line, "(")
+				end := strings.Index(line, ")")
+				if start != -1 && end != -1 && end > start {
+					return line[start+1 : end], nil
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("MAC %s not found in DHCP leases or ARP cache", mac)
 }
 
 
