@@ -99,8 +99,12 @@ func (r *Runctl) Start(name string) error {
 		"--mem", strconv.FormatUint(memMiB, 10),
 	}
 
-	for _, net := range inst.Network {
-		args = append(args, "--net", net)
+	for _, netStr := range inst.Network {
+		// e.g., converts user's "52:54:ef:cb:89:2c@nat" to standard crosvm
+		parts := strings.Split(netStr, "@")
+		mac := parts[0]
+		// UNCONDITIONAL: Both Mac wrapper and Linux native get the exact same string
+		args = append(args, "--net", fmt.Sprintf("mac=%s,tap-name=sst_tap", mac))
 	}
 
 	for _, d := range inst.Rwdisk {
@@ -121,8 +125,9 @@ func (r *Runctl) Start(name string) error {
 		if len(inst.Params) > 0 {
 			args = append(args, "--params", strings.Join(inst.Params, " "))
 		}
-		args = append(args, inst.Kernel)
+		args = append(args, inst.Kernel) // Positional kernel argument at the end
 	}
+	
 
 	// --- BINARY DETECTION ---
 	var bin string

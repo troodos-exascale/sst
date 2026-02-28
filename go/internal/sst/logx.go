@@ -7,13 +7,14 @@ import (
 	"golang.org/x/term"
 	"io"
 	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 )
 
 // ============================================================================
-// Levels
+// Levels & Colors
 // ============================================================================
 
 type Level string
@@ -23,6 +24,14 @@ const (
 	LevelInfo  Level = "info"
 	LevelWarn  Level = "warn"
 	LevelError Level = "error"
+)
+
+const (
+	colorReset  = "\033[0m"
+	colorRed    = "\033[31m"
+	colorYellow = "\033[33m"
+	colorBlue   = "\033[36m" // Cyan-ish for better visibility
+	colorGray   = "\033[90m"
 )
 
 // ============================================================================
@@ -59,8 +68,6 @@ func LogxRoot() *Logx {
 	return l
 }
 
-// NewWithWriter creates a logger that writes JSON to the provided writer.
-// Useful for testing.
 func NewWithWriter(w io.Writer) *Logx {
 	return &Logx{
 		fields:  map[string]interface{}{},
@@ -159,9 +166,7 @@ func SafeExit(ctx context.Context, log *Logx, code int) {
 // ============================================================================
 
 func (l *Logx) emit(level Level, msg string, kv ...interface{}) {
-	// Simple environment check for log level
 	envLevel := os.Getenv("SST_LOG_LEVEL")
-	// FIX: Default to Info if not set
 	if envLevel == "" {
 		envLevel = "info"
 	}
@@ -175,7 +180,6 @@ func (l *Logx) emit(level Level, msg string, kv ...interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	// Merge fields temporarily for this emit
 	finalFields := make(map[string]interface{}, len(l.fields)+len(kv)/2)
 	for k, v := range l.fields {
 		finalFields[k] = v
@@ -198,14 +202,15 @@ func (l *Logx) emit(level Level, msg string, kv ...interface{}) {
 		ev[k] = v
 	}
 
-	// JSON output (machine)
-	if l.outJSON != nil {
-		_ = json.NewEncoder(l.outJSON).Encode(ev)
-	}
-
-	// Pretty output (human)
+	// Output Routing: 
+	// If it's a TTY, print the beautiful string.
+	// If it's a pipe/file, print the strict JSON.
 	if l.isTTY && l.outTTY != nil {
 		l.emitPretty(level, msg, finalFields)
+	} else if l.outJSON != nil {
+		b, _ := json.Marshal(ev)
+		// Append \r\n explicitly to protect against raw mode pipes
+		fmt.Fprintf(l.outJSON, "%s\r\n", string(b))
 	}
 }
 
@@ -229,45 +234,97 @@ func (l *Logx) emitPretty(level Level, msg string, fields map[string]interface{}
 		return
 	}
 	l.lastPretty = line
-	fmt.Fprintln(l.outTTY, line)
+	// Explicit CR + LF ensures no staircasing in raw terminal mode
+	fmt.Fprintf(l.outTTY, "%s\r\n", line)
 }
 
 func formatPretty(sub string, level Level, msg string, f map[string]interface{}) string {
-	prefix := ""
+	var sb strings.Builder
+
+	// 1. Time
+	sb.WriteString(colorGray)
+	sb.WriteString(time.Now().Format("15:04:05.000 "))
+	sb.WriteString(colorReset)
+
+	// 2. Level
+	lvlStr := fmt.Sprintf("%-5s", strings.ToUpper(string(level)))
+	switch level {
+	case LevelError: sb.WriteString(colorRed + lvlStr + colorReset)
+	case LevelWarn:  sb.WriteString(colorYellow + lvlStr + colorReset)
+	case LevelInfo:  sb.WriteString(colorBlue + lvlStr + colorReset)
+	case LevelDebug: sb.WriteString(colorGray + lvlStr + colorReset)
+	default:         sb.WriteString(lvlStr)
+	}
+	sb.WriteString(" ")
+
+	// 3. Subsystem
 	if sub != "" {
-		prefix = "[" + sub + "] "
+		sb.WriteString(colorGray + "[" + sub + "] " + colorReset)
 	}
 
+	// Extract standard error strings so we can indent them at the bottom
+	var stderrStr string
+	if s, ok := f["stderr"].(string); ok && s != "" {
+		stderrStr = s
+		delete(f, "stderr")
+	}
+
+	// 4. Message (with special overrides handling \r\n safely)
 	switch msg {
 	case "image.convert":
-		return fmt.Sprintf("%sconverting image → raw\n  %v → %v",
-			prefix, f["from"], f["to"])
+		sb.WriteString(fmt.Sprintf("converting image → raw\r\n  %v → %v", f["from"], f["to"]))
+		delete(f, "from")
+		delete(f, "to")
 	case "exec.start":
-		return fmt.Sprintf("%s$ %v", prefix, f["cmdline"])
+		sb.WriteString(fmt.Sprintf("$ %v", f["cmdline"]))
+		delete(f, "cmdline")
 	case "exec.ok":
 		if d, ok := f["duration_ms"]; ok {
-			return fmt.Sprintf("%s✓ done (%v ms)", prefix, d)
+			sb.WriteString(fmt.Sprintf("✓ done (%v ms)", d))
+			delete(f, "duration_ms")
+		} else {
+			sb.WriteString("✓ done")
 		}
-		return prefix + "✓ done"
+	default:
+		if level == LevelError {
+			sb.WriteString(colorRed + "✗ " + msg + colorReset)
+		} else {
+			sb.WriteString(msg)
+		}
 	}
 
-	if level == LevelError {
-		if s, ok := f["stderr"].(string); ok && s != "" {
-			return fmt.Sprintf("%s✗ %s\n%s",
-				prefix, msg, indent(s))
+	// 5. Append remaining structured context (sorted for stability)
+	if len(f) > 0 {
+		var keys []string
+		for k := range f {
+			keys = append(keys, k)
 		}
-		return fmt.Sprintf("%s✗ %s", prefix, msg)
+		sort.Strings(keys)
+
+		sb.WriteString(colorGray + " |")
+		for _, k := range keys {
+			sb.WriteString(fmt.Sprintf(" %s=%v", k, f[k]))
+		}
+		sb.WriteString(colorReset)
 	}
 
-	return prefix + msg
+	// 6. Append multi-line errors cleanly
+	if stderrStr != "" {
+		sb.WriteString("\r\n" + colorRed + indent(stderrStr) + colorReset)
+	}
+
+	return sb.String()
 }
 
+// indent ensures multi-line strings maintain carriage returns
 func indent(s string) string {
 	lines := strings.Split(s, "\n")
 	for i := range lines {
-		lines[i] = "  " + lines[i]
+		// Strip existing CRs to prevent doubling, then format
+		lines[i] = "  " + strings.TrimRight(lines[i], "\r")
 	}
-	return strings.Join(lines, "\n")
+	// Re-join with strict CR+LF
+	return strings.Join(lines, "\r\n")
 }
 
 func ResetFromEnv() {}

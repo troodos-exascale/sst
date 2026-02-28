@@ -60,7 +60,7 @@ type VMWrapper struct {
 	doneCh  chan struct{}
 }
 
-func NewVMWrapper(app *RunVMApp) (*VMWrapper, error) {
+func NewVMWrapper(app *CrosvmApp) (*VMWrapper, error) {
 	// 0. Bootloader
 	bootLoader, err := createBootloader(app)
 	if err != nil {
@@ -227,7 +227,7 @@ func (v *VMWrapper) Err() error {
 
 // --- Helpers ---
 
-func createBootloader(app *RunVMApp) (vz.BootLoader, error) {
+func createBootloader(app *CrosvmApp) (vz.BootLoader, error) {
 	if app.Bootloader == "linux" {
 		return vz.NewLinuxBootLoader(
 			app.Kernel,
@@ -272,47 +272,38 @@ func createUSBCDROMConfig(path string) (vz.StorageDeviceConfiguration, error) {
 
 func createNetworkConfig(netStr string) (*vz.VirtioNetworkDeviceConfiguration, error) {
 	macStr := ""
-	typ := "shared" 
 
-	parts := strings.Split(netStr, "@")
-	switch len(parts) {
-	case 1:
-		typ = parts[0]
-	case 2:
-		macStr = parts[0]
-		typ = parts[1]
-	default:
-		return nil, fmt.Errorf("invalid network spec %q", netStr)
+	// Parse standard crosvm format (e.g. "mac=52:54:00:11:22:33,tap-name=sst_tap")
+	parts := strings.Split(netStr, ",")
+	for _, p := range parts {
+		kv := strings.SplitN(p, "=", 2)
+		if len(kv) == 2 {
+			if kv[0] == "mac" {
+				macStr = kv[1]
+			}
+			// tap-name is intentionally ignored on macOS; 
+			// Virtualization.framework natively routes via shared/NAT.
+		} else if len(kv) == 1 && kv[0] != "" {
+            // Fallback for edge cases where just a mac or type is passed
+            if strings.Contains(kv[0], ":") {
+                macStr = kv[0]
+            }
+        }
 	}
 
-	var attachment vz.NetworkDeviceAttachment
-	var err error
-
-	switch typ {
-	case "shared":
-		// SharedNetworkDeviceAttachment provides NAT + host reachability.
-		// If the helper is missing in your Go package version, 
-		// we use the NewNATNetworkDeviceAttachment but must ensure 
-		// the host's bridge is scannable.
-		// NOTE: In older Code-Hex/vz, NAT is the only non-bridged option.
-		// To fix reachability, we use NAT but ensure the MAC is static 
-		// so runctl can find it in the ARP table.
-		attachment, err = vz.NewNATNetworkDeviceAttachment()
-	case "nat":
-		attachment, err = vz.NewNATNetworkDeviceAttachment()
-	default:
-		return nil, fmt.Errorf("unsupported network type %q (use 'shared' or 'nat')", typ)
-	}
-
+	// 1. Create Attachment (Native macOS NAT)
+	attachment, err := vz.NewNATNetworkDeviceAttachment()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create %s attachment: %w", typ, err)
+		return nil, fmt.Errorf("failed to create NAT attachment: %w", err)
 	}
 
+	// 2. Create Device
 	dev, err := vz.NewVirtioNetworkDeviceConfiguration(attachment)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create virtio network device: %w", err)
 	}
 
+	// 3. Set MAC (if provided)
 	if macStr != "" {
 		hw, err := net.ParseMAC(macStr)
 		if err != nil {
@@ -324,6 +315,7 @@ func createNetworkConfig(netStr string) (*vz.VirtioNetworkDeviceConfiguration, e
 		}
 		dev.SetMACAddress(mac)
 	}
+	
 	return dev, nil
 }
 

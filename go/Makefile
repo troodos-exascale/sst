@@ -25,13 +25,13 @@ tidy: generate
 
 # 4. Final: Build the binaries using the validated module graph
 build: tidy
-	@# Loop through standard binaries for the current OS/ARCH
-	@for b in $(BINS); do \
+	@set -e; \
+	for b in $(BINS); do \
 		echo "--> Building $$b for ${OS}/${ARCH}..."; \
 		GOOS=${OS} GOARCH=${ARCH} go build -o build/${OS}/${ARCH}/$$b ./cmd/$$b ; \
 	done
-	@# ONLY build and sign crosvm if on macOS (darwin)
-	@if [ "${OS}" = "darwin" ]; then \
+	@set -e; \
+	if [ "${OS}" = "darwin" ]; then \
 		echo "--> Building crosvm for darwin/${ARCH}..."; \
 		go build -o build/darwin/${ARCH}/crosvm ./cmd/crosvm ; \
 		if [ -f $(ENTITLEMENTS) ]; then \
@@ -42,7 +42,7 @@ build: tidy
 			exit 1; \
 		fi \
 	else \
-		echo "--> Skipping crosvm build (not on macOS)"; \
+		echo "--> Skipping macOS crosvm wrapper build (using native Linux crosvm)"; \
 	fi
 
 install: build
