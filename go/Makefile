@@ -22,7 +22,7 @@ build: generate
 		echo "--> Building $$b for ${OS}/${ARCH}..."; \
 		GOOS=${OS} GOARCH=${ARCH} go build -o build/${OS}/${ARCH}/$$b ./cmd/$$b ; \
 	done
-	@# (1) Only build and sign runvm if on macOS (darwin)
+	@# ONLY build and sign runvm if on macOS (darwin)
 	@if [ "${OS}" = "darwin" ]; then \
 		echo "--> Building runvm for darwin/${ARCH}..."; \
 		go build -o build/darwin/${ARCH}/runvm ./cmd/runvm ; \
@@ -33,6 +33,18 @@ build: generate
 			echo "ERROR: Entitlements file $(ENTITLEMENTS) not found!"; \
 			exit 1; \
 		fi \
+	else \
+		echo "--> Skipping runvm build (not on macOS)"; \
+	fi
+
+install: build
+	@for b in $(BINS); do \
+		sudo install -m 755 build/${OS}/${ARCH}/$$b /usr/local/bin/$$b ; \
+	done
+	@# ONLY install runvm if on macOS (darwin)
+	@if [ "${OS}" = "darwin" ]; then \
+		echo "--> Installing runvm..."; \
+		sudo install -m 755 build/darwin/${ARCH}/runvm /usr/local/bin/runvm ; \
 	fi
 
 # (2) Helper to build for both platforms into separate directories
@@ -41,13 +53,6 @@ build-all: generate
 	@$(MAKE) OS=linux ARCH=arm64 build
 	@$(MAKE) OS=darwin ARCH=arm64 build
 
-install: build
-	@for b in $(BINS); do \
-		sudo install -m 755 build/${OS}/${ARCH}/$$b /usr/local/bin/$$b ; \
-	done
-	@if [ "${OS}" = "darwin" ]; then \
-		sudo install -m 755 build/darwin/${ARCH}/runvm /usr/local/bin/runvm ; \
-	fi
 
 check-entitlement:
 	@if [ "${OS}" = "darwin" ]; then \
