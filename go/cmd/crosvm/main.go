@@ -1,5 +1,3 @@
-package main
-
 /*
 #cgo CFLAGS: -x objective-c
 #cgo LDFLAGS: -framework CoreFoundation
@@ -33,7 +31,7 @@ import (
 
 // Main entry point decides role based on ENV var
 func main() {
-	if os.Getenv("SST_RUNVM_WORKER") == "1" {
+	if os.Getenv("SST_CROSVM_WORKER") == "1" {
 		runWorker()
 	} else {
 		runSupervisor()
@@ -64,7 +62,7 @@ func runSupervisor() {
 	}
 
 	cmd := exec.Command(exe, os.Args[1:]...)
-	cmd.Env = append(os.Environ(), "SST_RUNVM_WORKER=1")
+	cmd.Env = append(os.Environ(), "SST_CROSVM_WORKER=1")
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -106,13 +104,13 @@ func runSupervisor() {
 
 // Ensure worker runs on the main thread for Cocoa
 func init() {
-	if os.Getenv("SST_RUNVM_WORKER") == "1" {
+	if os.Getenv("SST_CROSVM_WORKER") == "1" {
 		runtime.LockOSThread()
 	}
 }
 
-// RunVMApp holds application state (Worker only)
-type RunVMApp struct {
+// CrosvmApp holds application state (Worker only)
+type CrosvmApp struct {
 	Name            string
 	CPUCount        int
 	MemorySize      uint64
@@ -143,18 +141,18 @@ type RunVMApp struct {
 }
 
 func runWorker() {
-	app := &RunVMApp{
-		log:   sst.LogxRoot().Subsystem("runvm"),
+	app := &CrosvmApp{
+		log:   sst.LogxRoot().Subsystem("crosvm"),
 		errCh: make(chan error, 1),
 	}
 
 	cmd := &cobra.Command{
-		Use:   "runvm",
+		Use:   "crosvm",
 		Short: "Native Go macOS Virtualization Runner",
 		Run: func(cmd *cobra.Command, args []string) {
 			app.ctx, app.cancel = context.WithCancel(context.Background())
 
-			app.steps = sst.StepsInit("runvm")
+			app.steps = sst.StepsInit("crosvm")
 			// No TTY setup needed in worker; parent handled it.
 			app.steps.StepsAdd("validate_args", app.stepValidate)
 			app.steps.StepsAdd("configure_vm", app.stepConfigureVM)
@@ -165,7 +163,7 @@ func runWorker() {
 			go func() {
 				err := sst.StepsRun(app.steps)
 				if err != nil {
-					app.log.WithError(err).Error(app.ctx, "runvm failed")
+					app.log.WithError(err).Error(app.ctx, "crosvm failed")
 					app.errCh <- err
 				} else {
 					app.errCh <- nil
@@ -212,7 +210,7 @@ func runWorker() {
 
 // --- Step Implementations ---
 
-func (a *RunVMApp) stepValidate(ctx *sst.StepsContext, s sst.StepState) error {
+func (a *CrosvmApp) stepValidate(ctx *sst.StepsContext, s sst.StepState) error {
 	if a.Bootloader == "linux" && a.Kernel == "" {
 		return fmt.Errorf("kernel path required for linux bootloader")
 	}
@@ -227,7 +225,7 @@ func (a *RunVMApp) stepValidate(ctx *sst.StepsContext, s sst.StepState) error {
 	return nil
 }
 
-func (a *RunVMApp) stepConfigureVM(ctx *sst.StepsContext, s sst.StepState) error {
+func (a *CrosvmApp) stepConfigureVM(ctx *sst.StepsContext, s sst.StepState) error {
 	vm, err := NewVMWrapper(a)
 	if err != nil {
 		return err
@@ -236,7 +234,7 @@ func (a *RunVMApp) stepConfigureVM(ctx *sst.StepsContext, s sst.StepState) error
 	return nil
 }
 
-func (a *RunVMApp) stepStartVM(ctx *sst.StepsContext, s sst.StepState) error {
+func (a *CrosvmApp) stepStartVM(ctx *sst.StepsContext, s sst.StepState) error {
 	if err := a.vm.Start(a.ctx); err != nil {
 		return fmt.Errorf("failed to start VM: %w", err)
 	}
@@ -244,7 +242,7 @@ func (a *RunVMApp) stepStartVM(ctx *sst.StepsContext, s sst.StepState) error {
 	return nil
 }
 
-func (a *RunVMApp) stepWaitLoop(ctx *sst.StepsContext, s sst.StepState) error {
+func (a *CrosvmApp) stepWaitLoop(ctx *sst.StepsContext, s sst.StepState) error {
 	a.sigCh = make(chan os.Signal, 1)
 	signal.Notify(a.sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
 
