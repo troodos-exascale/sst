@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"os/user"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -47,6 +48,7 @@ func main() {
 		rc.resumeCmd(),
 		rc.listCmd(),
 		rc.sshCmd(),
+		rc.setupHostCmd(), // Added host network setup command
 	)
 
 	if err := rootCmd.Execute(); err != nil {
@@ -90,9 +92,6 @@ func (r *Runctl) Start(name string) error {
 
 	_ = rtsst.EnsureCIDataISO(r.Ctx, r.Log, instDir)
 
-	// Ensure Host networking is ready on Linux
-	r.setupLinuxNetwork()
-
 	memMiB, _ := rtsst.ParseMemorySizeMiB(inst.MemorySize, inst.MemorySizeSuffix)
 
 	// --- CROSVM ALIGNED ARGUMENTS ---
@@ -108,12 +107,11 @@ func (r *Runctl) Start(name string) error {
 		args = append(args, "--net", fmt.Sprintf("mac=%s,tap-name=sst_tap", mac))
 	}
 
-	// FIX 1: Use modern --block syntax and include BOTH read-write and read-only disks
 	for _, d := range inst.Rwdisk {
 		args = append(args, "--block", fmt.Sprintf("path=%s,ro=false", d))
 	}
 	for _, d := range inst.Disk {
-		args = append(args, "--block", fmt.Sprintf("path=%s,ro=true", d)) // This mounts cidata.iso!
+		args = append(args, "--block", fmt.Sprintf("path=%s,ro=true", d))
 	}
 
 	for _, s := range inst.SharedDir {
@@ -185,42 +183,60 @@ func (r *Runctl) Start(name string) error {
 	return cmd.Wait()
 }
 
+func (r *Runctl) setupHostCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "setup-host",
+		Short: "Provision host networking and routing (requires root)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if os.Geteuid() != 0 {
+				return fmt.Errorf("setup-host must be run as root (e.g. via sudo)")
+			}
+			return r.SetupLinuxNetwork()
+		},
+	}
+}
 
-// FIX 2: Idempotent Linux Network + DHCP Provisioning
-func (r *Runctl) setupLinuxNetwork() {
+// SetupLinuxNetwork provisions the TAP device, NAT routing, and DHCP.
+// It must be run as root.
+func (r *Runctl) SetupLinuxNetwork() error {
 	if runtime.GOOS != "linux" {
-		return
+		r.Log.Info(r.Ctx, "setup-host is a no-op on non-Linux platforms")
+		return nil
 	}
 
 	script := `
 	set -eu
-	USER=$(whoami)
-	ip link show sst_tap &>/dev/null || sudo ip tuntap add mode tap user $USER vnet_hdr sst_tap
-	ip addr show sst_tap | grep -q "192.168.10.1/24" || sudo ip addr add 192.168.10.1/24 dev sst_tap
-	sudo ip link set sst_tap up
-	sudo sysctl -w net.ipv4.ip_forward=1 > /dev/null
+	# Grab the real user who invoked sudo, default to current user
+	TARGET_USER=${SUDO_USER:-$(whoami)}
+	
+	echo "Configuring TAP device for user: $TARGET_USER"
+
+	ip link show sst_tap &>/dev/null || ip tuntap add mode tap user "$TARGET_USER" vnet_hdr sst_tap
+	ip addr show sst_tap | grep -q "192.168.10.1/24" || ip addr add 192.168.10.1/24 dev sst_tap
+	ip link set sst_tap up
+	sysctl -w net.ipv4.ip_forward=1 > /dev/null
 
 	# 1. ALLOW DHCP/DNS INPUT FROM VM TO HOST
-	sudo iptables -C INPUT -i sst_tap -j ACCEPT 2>/dev/null || \
-	sudo iptables -I INPUT -i sst_tap -j ACCEPT
+	iptables -C INPUT -i sst_tap -j ACCEPT 2>/dev/null || \
+	iptables -I INPUT -i sst_tap -j ACCEPT
 
 	# 2. SETUP NAT FORWARDING
 	HOST_DEV=$(ip route get 8.8.8.8 | awk '{print $5}' | head -n 1)
 	if [ -n "$HOST_DEV" ]; then
-		sudo iptables -t nat -C POSTROUTING -o "$HOST_DEV" -j MASQUERADE 2>/dev/null || \
-		sudo iptables -t nat -A POSTROUTING -o "$HOST_DEV" -j MASQUERADE
+		iptables -t nat -C POSTROUTING -o "$HOST_DEV" -j MASQUERADE 2>/dev/null || \
+		iptables -t nat -A POSTROUTING -o "$HOST_DEV" -j MASQUERADE
 		
-		sudo iptables -C FORWARD -i "$HOST_DEV" -o sst_tap -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-		sudo iptables -A FORWARD -i "$HOST_DEV" -o sst_tap -m state --state RELATED,ESTABLISHED -j ACCEPT
+		iptables -C FORWARD -i "$HOST_DEV" -o sst_tap -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+		iptables -A FORWARD -i "$HOST_DEV" -o sst_tap -m state --state RELATED,ESTABLISHED -j ACCEPT
 		
-		sudo iptables -C FORWARD -i sst_tap -o "$HOST_DEV" -j ACCEPT 2>/dev/null || \
-		sudo iptables -A FORWARD -i sst_tap -o "$HOST_DEV" -j ACCEPT
+		iptables -C FORWARD -i sst_tap -o "$HOST_DEV" -j ACCEPT 2>/dev/null || \
+		iptables -A FORWARD -i sst_tap -o "$HOST_DEV" -j ACCEPT
 	fi
 
 	# 3. EXPLICIT DNSMASQ CONFIG
 	if command -v dnsmasq &>/dev/null; then
 		if ! pgrep -f "dnsmasq.*sst_tap" &>/dev/null; then
-			sudo dnsmasq --conf-file=/dev/null \
+			dnsmasq --conf-file=/dev/null \
 			--port=0 \
 			--listen-address=192.168.10.1 \
 			--bind-interfaces \
@@ -231,10 +247,9 @@ func (r *Runctl) setupLinuxNetwork() {
 		fi
 	fi
 	`
-	_, _ = sst.ExecShell(r.Ctx, r.Log, "bash", "-c", script)
+	_, err := sst.ExecShell(r.Ctx, r.Log, "bash", "-c", script)
+	return err
 }
-
-
 
 func (r *Runctl) stopCmd() *cobra.Command {
 	return &cobra.Command{
@@ -296,18 +311,86 @@ func (r *Runctl) listCmd() *cobra.Command {
 	}
 }
 
+
 func (r *Runctl) sshCmd() *cobra.Command {
 	return &cobra.Command{
-		Use: "ssh <name>",
-		Args: cobra.ExactArgs(1),
+		Use:   "ssh <name>",
+		Short: "SSH into a running instance",
+		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			inst, _ := r.loadInstance(args[0])
-			if len(inst.Network) == 0 { return fmt.Errorf("no network") }
-			// Logic to resolve IP and exec SSH would go here
-			return nil
+			instName := args[0]
+			inst, err := r.loadInstance(instName)
+			if err != nil {
+				return fmt.Errorf("failed to load instance: %w", err)
+			}
+			if len(inst.Network) == 0 {
+				return fmt.Errorf("instance has no network configured")
+			}
+
+			// Extract the MAC address from the YAML (format: "mac@nat" or just "mac")
+			mac := strings.Split(inst.Network[0], "@")[0]
+			
+			// Resolve the IP from the MAC address
+			ip, err := r.resolveIP(mac)
+			if err != nil {
+				return fmt.Errorf("could not resolve IP for instance %s (MAC: %s): %w\nWait a few seconds after boot or ensure it acquired a DHCP lease", instName, mac, err)
+			}
+
+			// Get the current user to use as the default SSH login
+			u, err := user.Current()
+			if err != nil {
+				return err
+			}
+
+			sshBin, err := exec.LookPath("ssh")
+			if err != nil {
+				return fmt.Errorf("ssh binary not found in PATH")
+			}
+
+			fmt.Printf("Connecting to %s@%s...\n", u.Username, ip)
+
+			// Exec syscall replaces the runctl process with ssh
+			sshArgs := []string{
+				"ssh",
+				"-o", "StrictHostKeyChecking=no",
+				"-o", "UserKnownHostsFile=/dev/null",
+				"-o", "LogLevel=ERROR", // Suppress the permanent warning about adding to known_hosts
+				fmt.Sprintf("%s@%s", u.Username, ip),
+			}
+			
+			return syscall.Exec(sshBin, sshArgs, os.Environ())
 		},
 	}
 }
+
+// resolveIP scans the host's ARP cache to find the IP associated with a MAC address.
+func (r *Runctl) resolveIP(mac string) (string, error) {
+	// macOS arp format: ? (192.168.64.2) at 52:54:ab:bf:5d:78 on bridge100 ifscope [bridge]
+	// Linux arp format: ? (192.168.10.150) at 52:54:ab:bf:5d:78 [ether] on sst_tap
+	
+	// Normalize MAC for reliable matching
+	mac = strings.ToLower(mac)
+
+	out, err := exec.Command("arp", "-a").Output()
+	if err != nil {
+		return "", fmt.Errorf("failed to read arp table: %w", err)
+	}
+
+	lines := strings.Split(string(out), "\n")
+	for _, line := range lines {
+		if strings.Contains(strings.ToLower(line), mac) {
+			// Extract IP from between parentheses e.g. "(192.168.64.2)"
+			start := strings.Index(line, "(")
+			end := strings.Index(line, ")")
+			if start != -1 && end != -1 && end > start {
+				return line[start+1 : end], nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("MAC not found in ARP cache")
+}
+
 
 func (r *Runctl) instanceDir(name string) string { return rtsst.InstanceDir(name) }
 

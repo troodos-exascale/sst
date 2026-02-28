@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -70,7 +71,9 @@ type CrosvmApp struct {
 	CPUCount        int
 	MemorySize      uint64
 	MemorySuffix    string
-	RwDiskPaths     []string
+	Blocks          []string // Added for new --block flag
+	RwDiskPaths     []string // Kept internal for vz_darwin
+	DiskPaths       []string // Kept internal for vz_darwin
 	SharedDirs      []string
 	Networks        []string
 	Kernel          string
@@ -79,9 +82,7 @@ type CrosvmApp struct {
 	ShutdownTimeout float64
 	Gui             bool
 
-	// --- Restored Fields for vz_darwin.go ---
 	NestedVirt      bool
-	DiskPaths       []string
 	CdromPaths      []string
 	Balloon         bool
 	Bootloader      string
@@ -103,8 +104,8 @@ func runWorker() {
 
 	rootCmd := &cobra.Command{
 		Use:           "crosvm",
-		SilenceUsage:  true, // PREVENTS the staircase usage dump on error
-		SilenceErrors: true, // We handle errors ourselves
+		SilenceUsage:  true,
+		SilenceErrors: true,
 	}
 	
 	runCmd := &cobra.Command{
@@ -129,7 +130,6 @@ func runWorker() {
 			}()
 			C.runCocoaLoop()
 
-			// Check for errors after the loop stops
 			select {
 			case err := <-app.errCh:
 				return err
@@ -140,23 +140,22 @@ func runWorker() {
 	}
 
 	f := runCmd.Flags()
-	// --- STRICT CROSVM ALIGNMENT ---
 	f.StringVar(&app.Name, "name", "vm", "Instance name")
 	f.IntVar(&app.CPUCount, "cpus", 1, "CPU count")
 	f.Uint64Var(&app.MemorySize, "mem", 512, "Memory size (MiB)")
-	f.StringSliceVar(&app.RwDiskPaths, "rwdisk", []string{}, "RW disks")
+	
+	// NEW: Replaced rwdisk and disk with block
+	f.StringSliceVar(&app.Blocks, "block", []string{}, "Block devices (path=...,ro=...)")
+	
 	f.StringSliceVar(&app.Networks, "net", []string{"nat"}, "Network config")
 	f.StringSliceVar(&app.SharedDirs, "shared-dir", []string{}, "Shared directories")
 	
-	// --- RESTORED EXTENDED FLAGS (vz_darwin.go support) ---
 	f.BoolVar(&app.NestedVirt, "nested-virt", false, "Enable nested virtualization")
-	f.StringSliceVar(&app.DiskPaths, "disk", []string{}, "Read-only disks")
 	f.StringSliceVar(&app.CdromPaths, "cdrom", []string{}, "CD-ROMs")
 	f.BoolVar(&app.Balloon, "balloon", true, "Enable memory ballooning")
 	f.StringVar(&app.Bootloader, "bootloader", "linux", "Bootloader (linux|efi)")
 	f.StringVar(&app.EfiVars, "efi-vars", "", "Path to EFI variables")
 
-	// --- STANDARD RUNTIME FLAGS ---
 	f.StringVar(&app.Initrd, "initrd", "", "Initrd path")
 	f.StringVar(&app.Params, "params", "", "Cmdline")
 	f.BoolVar(&app.Gui, "gui", false, "Show GUI window")
@@ -164,7 +163,6 @@ func runWorker() {
 	
 	rootCmd.AddCommand(runCmd)
 	if err := rootCmd.Execute(); err != nil {
-		// Print error safely for raw terminals
 		fmt.Fprintf(os.Stderr, "Error: %v\r\n", err)
 		os.Exit(1)
 	}
@@ -172,6 +170,35 @@ func runWorker() {
 
 func (a *CrosvmApp) stepValidate(ctx *sst.StepsContext, s sst.StepState) error {
 	a.MemorySize = a.MemorySize * 1024 * 1024
+
+	// Translate standard crosvm --block flag back into legacy slices for macOS Virtualization
+	for _, blk := range a.Blocks {
+		parts := strings.Split(blk, ",")
+		path := ""
+		ro := false
+
+		for _, p := range parts {
+			kv := strings.SplitN(p, "=", 2)
+			if len(kv) == 2 {
+				if kv[0] == "path" {
+					path = kv[1]
+				} else if kv[0] == "ro" {
+					ro = (kv[1] == "true")
+				}
+			} else if len(kv) == 1 && path == "" {
+				path = kv[0] // fallback for bare paths
+			}
+		}
+
+		if path != "" {
+			if ro {
+				a.DiskPaths = append(a.DiskPaths, path)
+			} else {
+				a.RwDiskPaths = append(a.RwDiskPaths, path)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -187,10 +214,25 @@ func (a *CrosvmApp) stepStartVM(ctx *sst.StepsContext, s sst.StepState) error {
 }
 
 func (a *CrosvmApp) stepWaitLoop(ctx *sst.StepsContext, s sst.StepState) error {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+
+	// Block indefinitely until the VM exits naturally, or we receive a signal
 	select {
 	case <-a.vm.Done():
 		return a.vm.Err()
-	case <-time.After(time.Duration(a.ShutdownTimeout) * time.Second):
-		return nil
+	case sig := <-sigCh:
+		a.log.Info(a.ctx, "Received signal, requesting graceful shutdown", "signal", sig)
+		_ = a.vm.RequestStop()
+
+		// NOW we apply the 120-second graceful shutdown timeout
+		select {
+		case <-a.vm.Done():
+			return a.vm.Err()
+		case <-time.After(time.Duration(a.ShutdownTimeout) * time.Second):
+			a.log.Warn(a.ctx, "Graceful shutdown timed out, forcing stop")
+			_ = a.vm.Stop()
+			return fmt.Errorf("shutdown timeout exceeded")
+		}
 	}
 }

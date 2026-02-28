@@ -16,40 +16,9 @@ import (
 	"net"
 	"os"
 	"strings"
-	//	"sync"
 
 	"github.com/Code-Hex/vz/v3"
-	// "github.com/swiss-software-tool/runtime-smart/go/internal/sst"
 )
-
-// --- CGO Glue for Sleep/Wake ---
-
-// var globalSleepHandler func(bool)
-// var globalSleepMu sync.Mutex
-
-// //export goSleepCallback
-// func goSleepCallback(isSleep C.int) {
-// 	globalSleepMu.Lock()
-// 	defer globalSleepMu.Unlock()
-// 	if globalSleepHandler != nil {
-// 		globalSleepHandler(isSleep != 0)
-// 	}
-// }
-
-// func StartSleepObserver(log *sst.Logx, handler func(bool)) func() {
-// 	globalSleepMu.Lock()
-// 	globalSleepHandler = handler
-// 	globalSleepMu.Unlock()
-
-// 	C.startSleepObserver()
-
-// 	return func() {
-// 		C.stopSleepObserver()
-// 		globalSleepMu.Lock()
-// 		globalSleepHandler = nil
-// 		globalSleepMu.Unlock()
-// 	}
-// }
 
 // --- VM Wrapper ---
 
@@ -129,12 +98,10 @@ func NewVMWrapper(app *CrosvmApp) (*VMWrapper, error) {
 	config.SetStorageDevicesVirtualMachineConfiguration(storageDevices)
 
 	// 4. Network (Strict Ordering Enforced)
-	// Step A: Apply Defaults
 	if len(app.Networks) == 0 {
 		app.Networks = []string{"nat"}
 	}
 
-	// Step B: Build Device List
 	var networkDevices []*vz.VirtioNetworkDeviceConfiguration
 	for _, netStr := range app.Networks {
 		cfg, err := createNetworkConfig(netStr)
@@ -143,7 +110,6 @@ func NewVMWrapper(app *CrosvmApp) (*VMWrapper, error) {
 		}
 		networkDevices = append(networkDevices, cfg)
 	}
-	// Step C: Attach to Config (Last mutation)
 	config.SetNetworkDevicesVirtualMachineConfiguration(networkDevices)
 
 	// 5. Shared Dirs
@@ -166,8 +132,7 @@ func NewVMWrapper(app *CrosvmApp) (*VMWrapper, error) {
 		config.SetMemoryBalloonDevicesVirtualMachineConfiguration([]vz.MemoryBalloonDeviceConfiguration{bal})
 	}
 
-	// 7. Validation (The "Freeze" Point)
-	// No config mutations are allowed after this line.
+	// 7. Validation
 	validated, err := config.Validate()
 	if !validated || err != nil {
 		return nil, fmt.Errorf("invalid VM config: %w", err)
@@ -281,29 +246,23 @@ func createNetworkConfig(netStr string) (*vz.VirtioNetworkDeviceConfiguration, e
 			if kv[0] == "mac" {
 				macStr = kv[1]
 			}
-			// tap-name is intentionally ignored on macOS; 
-			// Virtualization.framework natively routes via shared/NAT.
 		} else if len(kv) == 1 && kv[0] != "" {
-            // Fallback for edge cases where just a mac or type is passed
             if strings.Contains(kv[0], ":") {
                 macStr = kv[0]
             }
         }
 	}
 
-	// 1. Create Attachment (Native macOS NAT)
 	attachment, err := vz.NewNATNetworkDeviceAttachment()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create NAT attachment: %w", err)
 	}
 
-	// 2. Create Device
 	dev, err := vz.NewVirtioNetworkDeviceConfiguration(attachment)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create virtio network device: %w", err)
 	}
 
-	// 3. Set MAC (if provided)
 	if macStr != "" {
 		hw, err := net.ParseMAC(macStr)
 		if err != nil {
@@ -318,53 +277,6 @@ func createNetworkConfig(netStr string) (*vz.VirtioNetworkDeviceConfiguration, e
 	
 	return dev, nil
 }
-
-// // Fix: Robust parsing logic
-// func createNetworkConfig(netStr string) (*vz.VirtioNetworkDeviceConfiguration, error) {
-// 	macStr := ""
-// 	typ := "nat"
-
-// 	parts := strings.Split(netStr, "@")
-// 	switch len(parts) {
-// 	case 1:
-// 		typ = parts[0]
-// 	case 2:
-// 		macStr = parts[0]
-// 		typ = parts[1]
-// 	default:
-// 		return nil, fmt.Errorf("invalid network spec %q", netStr)
-// 	}
-
-// 	if typ != "nat" {
-// 		return nil, fmt.Errorf("unsupported network type %q (only nat supported here)", typ)
-// 	}
-
-// 	// 1. Create Attachment
-// 	att, err := vz.NewNATNetworkDeviceAttachment()
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to create NAT attachment: %w", err)
-// 	}
-
-// 	// 2. Create Device
-// 	dev, err := vz.NewVirtioNetworkDeviceConfiguration(att)
-// 	if err != nil {
-// 		return nil, fmt.Errorf("failed to create virtio network device: %w", err)
-// 	}
-
-// 	// 3. Set MAC (if provided)
-// 	if macStr != "" {
-// 		hw, err := net.ParseMAC(macStr)
-// 		if err != nil {
-// 			return nil, fmt.Errorf("invalid MAC %q: %w", macStr, err)
-// 		}
-// 		mac, err := vz.NewMACAddress(hw)
-// 		if err != nil {
-// 			return nil, fmt.Errorf("failed to set MAC %q: %w", macStr, err)
-// 		}
-// 		dev.SetMACAddress(mac)
-// 	}
-// 	return dev, nil
-// }
 
 func createShareConfig(shareStr string) (vz.DirectorySharingDeviceConfiguration, error) {
 	parts := strings.Split(shareStr, ":")
