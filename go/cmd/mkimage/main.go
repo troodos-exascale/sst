@@ -471,7 +471,7 @@ func createInstance(image, name string) error {
 	}
 	instanceYaml.Disk = []string{"cidata.iso"}
 	instanceYaml.SharedDir = []string{
-		fmt.Sprintf("%s:%s", "/Users/"+u.Username, "/Users/"+u.Username),
+		fmt.Sprintf("%s:%s", u.HomeDir, u.HomeDir),
 	}
 	instanceYaml.Network = []string{fmt.Sprintf("%s@nat", mac)}
 	instanceYaml.Params = []string{

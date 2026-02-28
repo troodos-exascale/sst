@@ -69,7 +69,7 @@ func NewRunctl() *Runctl {
 func (r *Runctl) startCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "start <name>",
-		Short: "Start an instance (crosvm-aligned)",
+		Short: "Start an instance",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return r.Start(args[0])
@@ -90,6 +90,9 @@ func (r *Runctl) Start(name string) error {
 
 	_ = rtsst.EnsureCIDataISO(r.Ctx, r.Log, instDir)
 
+	// Ensure Host networking is ready on Linux
+	r.setupLinuxNetwork()
+
 	memMiB, _ := rtsst.ParseMemorySizeMiB(inst.MemorySize, inst.MemorySizeSuffix)
 
 	// --- CROSVM ALIGNED ARGUMENTS ---
@@ -100,15 +103,17 @@ func (r *Runctl) Start(name string) error {
 	}
 
 	for _, netStr := range inst.Network {
-		// e.g., converts user's "52:54:ef:cb:89:2c@nat" to standard crosvm
 		parts := strings.Split(netStr, "@")
 		mac := parts[0]
-		// UNCONDITIONAL: Both Mac wrapper and Linux native get the exact same string
 		args = append(args, "--net", fmt.Sprintf("mac=%s,tap-name=sst_tap", mac))
 	}
 
+	// FIX 1: Use modern --block syntax and include BOTH read-write and read-only disks
 	for _, d := range inst.Rwdisk {
-		args = append(args, "--rwdisk", d)
+		args = append(args, "--block", fmt.Sprintf("path=%s,ro=false", d))
+	}
+	for _, d := range inst.Disk {
+		args = append(args, "--block", fmt.Sprintf("path=%s,ro=true", d)) // This mounts cidata.iso!
 	}
 
 	for _, s := range inst.SharedDir {
@@ -125,21 +130,25 @@ func (r *Runctl) Start(name string) error {
 		if len(inst.Params) > 0 {
 			args = append(args, "--params", strings.Join(inst.Params, " "))
 		}
-		args = append(args, inst.Kernel) // Positional kernel argument at the end
-	}
-	
-
-	// --- BINARY DETECTION ---
-	var bin string
-	if runtime.GOOS == "darwin" {
-		bin = "./" + inst.Name
-	} else {
-		bin = "crosvm"
+		args = append(args, inst.Kernel)
 	}
 
-	r.Log.Info(r.Ctx, "starting aligned vmm", "bin", bin, "instance", name)
+	// --- SHIM FOR PROCESS VISIBILITY ---
+	exePath := filepath.Join(instDir, inst.Name)
+	_ = os.Remove(exePath)
 
-	cmd := exec.CommandContext(r.Ctx, bin, args...)
+	crosvmPath, err := exec.LookPath("crosvm")
+	if err != nil {
+		crosvmPath = "/usr/local/bin/crosvm"
+	}
+
+	if err := os.Symlink(crosvmPath, exePath); err != nil {
+		return fmt.Errorf("failed to create process shim symlink: %w", err)
+	}
+
+	r.Log.Info(r.Ctx, "starting aligned vmm", "bin", "./"+inst.Name, "target", crosvmPath)
+
+	cmd := exec.CommandContext(r.Ctx, "./"+inst.Name, args...)
 	cmd.Dir = instDir
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -175,6 +184,57 @@ func (r *Runctl) Start(name string) error {
 
 	return cmd.Wait()
 }
+
+
+// FIX 2: Idempotent Linux Network + DHCP Provisioning
+func (r *Runctl) setupLinuxNetwork() {
+	if runtime.GOOS != "linux" {
+		return
+	}
+
+	script := `
+	set -eu
+	USER=$(whoami)
+	ip link show sst_tap &>/dev/null || sudo ip tuntap add mode tap user $USER vnet_hdr sst_tap
+	ip addr show sst_tap | grep -q "192.168.10.1/24" || sudo ip addr add 192.168.10.1/24 dev sst_tap
+	sudo ip link set sst_tap up
+	sudo sysctl -w net.ipv4.ip_forward=1 > /dev/null
+
+	# 1. ALLOW DHCP/DNS INPUT FROM VM TO HOST
+	sudo iptables -C INPUT -i sst_tap -j ACCEPT 2>/dev/null || \
+	sudo iptables -I INPUT -i sst_tap -j ACCEPT
+
+	# 2. SETUP NAT FORWARDING
+	HOST_DEV=$(ip route get 8.8.8.8 | awk '{print $5}' | head -n 1)
+	if [ -n "$HOST_DEV" ]; then
+		sudo iptables -t nat -C POSTROUTING -o "$HOST_DEV" -j MASQUERADE 2>/dev/null || \
+		sudo iptables -t nat -A POSTROUTING -o "$HOST_DEV" -j MASQUERADE
+		
+		sudo iptables -C FORWARD -i "$HOST_DEV" -o sst_tap -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+		sudo iptables -A FORWARD -i "$HOST_DEV" -o sst_tap -m state --state RELATED,ESTABLISHED -j ACCEPT
+		
+		sudo iptables -C FORWARD -i sst_tap -o "$HOST_DEV" -j ACCEPT 2>/dev/null || \
+		sudo iptables -A FORWARD -i sst_tap -o "$HOST_DEV" -j ACCEPT
+	fi
+
+	# 3. EXPLICIT DNSMASQ CONFIG
+	if command -v dnsmasq &>/dev/null; then
+		if ! pgrep -f "dnsmasq.*sst_tap" &>/dev/null; then
+			sudo dnsmasq --conf-file=/dev/null \
+			--port=0 \
+			--listen-address=192.168.10.1 \
+			--bind-interfaces \
+			--dhcp-range=192.168.10.50,192.168.10.200,12h \
+			--dhcp-option=option:router,192.168.10.1 \
+			--dhcp-option=option:dns-server,8.8.8.8 \
+			--except-interface=lo --clear-on-reload
+		fi
+	fi
+	`
+	_, _ = sst.ExecShell(r.Ctx, r.Log, "bash", "-c", script)
+}
+
+
 
 func (r *Runctl) stopCmd() *cobra.Command {
 	return &cobra.Command{
