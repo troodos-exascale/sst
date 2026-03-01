@@ -42,19 +42,25 @@ ls -lh "${SST_RUNTIMEDIR}/images/alpine-test/"
 [ -f "${SST_RUNTIMEDIR}/images/alpine-test/alpine-test.qcow2" ] || { echo "Missing .qcow2"; exit 1; }
 [ -f "${SST_RUNTIMEDIR}/images/alpine-test/alpine-test.tar" ] || { echo "Missing .tar"; exit 1; }
 
+echo "==> 2.5 Testing emitted OCI/Docker archive with podman..."
+podman load -i "${SST_RUNTIMEDIR}/images/alpine-test/alpine-test.tar"
+GREETING=$(podman run --rm alpine-test:latest cat /root/hello.txt)
+if [ "$GREETING" != "hello world" ]; then
+    echo "OCI image test failed! Expected 'hello world', got '${GREETING}'"
+    exit 1
+fi
+echo "OCI image loaded and executed perfectly in Podman!"
+
 echo "==> 3. Creating instance (as normal user)..."
-# Notice: No --efi flag. This strictly enforces direct Linux kernel boot extraction.
 mkimage instance alpine-test inst1
 
 echo "==> 4. Setting up host networking (requires sudo)..."
 sudo -E "${REPO_ROOT}/go/build/linux/amd64/runctl" setup-host
 
 echo "==> 5. Starting VM in background (as normal user)..."
-# This will now successfully boot the real Alpine kernel!
 runctl start inst1 &
 VM_PID=$!
 
-# Give the VM a few seconds to boot and establish itself
 sleep 3
 echo "==> Running instances:"
 runctl list

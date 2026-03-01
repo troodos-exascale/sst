@@ -2,9 +2,12 @@ package rtsst
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/swiss-software-tool/runtime-smart/go/internal/sst"
@@ -192,6 +195,14 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 			}
 		case "oci":
 			ociPath := filepath.Join(b.ImageOutput, b.Name+".tar")
+			
+			tmpDir, err := os.MkdirTemp("", "sst-oci-*")
+			if err != nil {
+				return fmt.Errorf("failed to create oci temp dir: %w", err)
+			}
+			defer os.RemoveAll(tmpDir)
+
+			layerTar := filepath.Join(tmpDir, "layer.tar")
 			tarReq := sst.ExecRequest{
 				Cmd: "tar",
 				Args: []string{
@@ -200,21 +211,84 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 					"--owner=0",
 					"--group=0",
 					"--numeric-owner",
-					"-cf", ociPath,
+					"-cf", layerTar,
 					"-C", b.RootDir,
 					".",
 				},
 				Mode: sst.ExecCaptured,
 			}
-			// FIX: Check explicitly for exit code 1 (tar warnings) and ignore them
 			res, err := sst.Exec(ctx, b.Log, tarReq)
 			if err != nil {
 				if res != nil && res.ExitCode == 1 {
 					b.Log.Warn(ctx, "tar returned exit code 1 (warnings), treating as success", "stderr", res.Stderr)
 				} else {
-					return fmt.Errorf("failed to create oci tarball: %w", err)
+					return fmt.Errorf("failed to create layer tarball: %w", err)
 				}
 			}
+
+			// Hash the layer tarball to generate the config diff_ids
+			layerHash, err := SHA256File(layerTar)
+			if err != nil {
+				return fmt.Errorf("failed to hash layer.tar: %w", err)
+			}
+
+			// Generate a minimal, deterministic Docker v2 config
+			configContent := fmt.Sprintf(`{
+  "architecture": "%s",
+  "os": "linux",
+  "config": {
+    "Env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
+  },
+  "rootfs": {
+    "type": "layers",
+    "diff_ids": ["sha256:%s"]
+  },
+  "history": [{"created": "1970-01-01T00:00:00Z", "created_by": "sst mkimage"}]
+}`, runtime.GOARCH, layerHash)
+
+			h := sha256.New()
+			h.Write([]byte(configContent))
+			configHash := hex.EncodeToString(h.Sum(nil))
+			configFile := configHash + ".json"
+
+			if err := os.WriteFile(filepath.Join(tmpDir, configFile), []byte(configContent), 0644); err != nil {
+				return err
+			}
+
+			// Generate the manifest linking the config and layer
+			manifestContent := fmt.Sprintf(`[
+  {
+    "Config": "%s",
+    "RepoTags": ["%s:latest"],
+    "Layers": ["layer.tar"]
+  }
+]`, configFile, b.Name)
+
+			if err := os.WriteFile(filepath.Join(tmpDir, "manifest.json"), []byte(manifestContent), 0644); err != nil {
+				return err
+			}
+
+			// Tar up the layout to create the final Docker-compatible archive
+			tarReq2 := sst.ExecRequest{
+				Cmd: "tar",
+				Args: []string{
+					"--sort=name",
+					"--mtime=@0",
+					"--owner=0",
+					"--group=0",
+					"--numeric-owner",
+					"-cf", ociPath,
+					"-C", tmpDir,
+					"manifest.json",
+					configFile,
+					"layer.tar",
+				},
+				Mode: sst.ExecCaptured,
+			}
+			if _, err := sst.Exec(ctx, b.Log, tarReq2); err != nil {
+				return fmt.Errorf("failed to create final docker archive: %w", err)
+			}
+
 		default:
 			b.Log.Warn(ctx, "unsupported EMIT format", "format", emit)
 		}
