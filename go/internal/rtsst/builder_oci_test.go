@@ -12,17 +12,18 @@ import (
 )
 
 func TestOCIWorkflowWithPodman(t *testing.T) {
-	// Fix: os.LookupEnv returns (string, bool). Check the boolean 'found'.
 	_, found := os.LookupEnv("PATH")
 	if !found {
 		t.Skip("PATH not found in environment")
 	}
 
 	log := sst.LogxRoot()
-	// Use 'alpine' as a tiny test container
-	builder := NewBuilder(log, nil, "Dockerfile.test")
+	tmp := t.TempDir() // Use an isolated temp dir for tests
+
+	// FIX: Added the 4th parameter (RuntimeDir) to NewBuilder
+	builder := NewBuilder(log, nil, "Dockerfile.test", tmp)
 	builder.BaseImage = "alpine:latest"
-	builder.VMOUT = "test-vm"
+	builder.Name = "test-vm" // FIX: Replaced VMOUT
 	
 	err := builder.ResolveOCIPaths()
 	require.NoError(t, err)
@@ -30,7 +31,6 @@ func TestOCIWorkflowWithPodman(t *testing.T) {
 	ctx := context.Background()
 	
 	// Step 1: Fetch via Skopeo
-	// Note: This may still skip if skopeo is not installed on the host
 	err = builder.FetchOCI(ctx)
 	if err != nil {
 		t.Skipf("skopeo fetch failed (is skopeo installed?): %v", err)
@@ -40,7 +40,6 @@ func TestOCIWorkflowWithPodman(t *testing.T) {
 	err = builder.VerifyWithPodman(ctx)
 	assert.NoError(t, err)
 	
-	// Cleanup staging area after test
-	home, _ := os.UserHomeDir()
-	os.RemoveAll(filepath.Join(home, ".runtimes", "oci", "alpine:latest"))
+	// Cleanup staging area after test (no longer strictly necessary since tmp is destroyed, but good practice)
+	os.RemoveAll(filepath.Join(tmp, "oci", "alpine:latest"))
 }

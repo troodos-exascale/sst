@@ -2,12 +2,15 @@ package main
 
 import (
 	"fmt"
-	"strings" // Added missing import
+	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/swiss-software-tool/runtime-smart/go/internal/rtsst"
 	"github.com/swiss-software-tool/runtime-smart/go/internal/sst"
 )
+
+var buildArgs []string
 
 var buildCmd = &cobra.Command{
 	Use:   "build <dockerfile>",
@@ -16,16 +19,34 @@ var buildCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dockerfile := args[0]
 		log := sst.LogxRoot().Subsystem("mkimage.build")
-		builder := rtsst.NewBuilder(log, nil, dockerfile)
 		
-		// 1. Initial Parse to discover instructions
+		// Use flagRoot or SST_RUNTIMEDIR to configure Builder
+		runtimeDir := flagRoot
+		if runtimeDir == "" {
+			runtimeDir = rtsst.RuntimeDir()
+		}
+
+		builder := rtsst.NewBuilder(log, nil, dockerfile, runtimeDir)
+		
+		for _, arg := range buildArgs {
+			parts := strings.SplitN(arg, "=", 2)
+			if len(parts) == 2 {
+				builder.BuildArgs[parts[0]] = parts[1]
+			} else {
+				builder.BuildArgs[parts[0]] = os.Getenv(parts[0])
+			}
+		}
+
 		if err := builder.Parse(cmd.Context()); err != nil {
+			return err
+		}
+		
+		if err := builder.PreProcess(cmd.Context()); err != nil {
 			return err
 		}
 
 		runner := sst.StepsInit("mkimage.build")
 		
-		// 2. Setup staging and OCI retrieval
 		runner.StepsAdd("prepare workspace", func(ctx *sst.StepsContext, _ sst.StepState) error {
 			return builder.ResolveOCIPaths()
 		})
@@ -36,18 +57,14 @@ var buildCmd = &cobra.Command{
 			return builder.UnpackOCI(cmd.Context())
 		})
 
-		// 3. Dynamically register instructions as individual steps
 		for i, inst := range builder.Instructions {
-			instruction := inst // capture for closure
-			// Use strings.Split to show only the first line of multiline blocks in the step name
+			instruction := inst
 			stepName := fmt.Sprintf("%s %d: %s", instruction.Type, i+1, strings.Split(instruction.Args, "\n")[0])
-			
 			runner.StepsAdd(stepName, func(ctx *sst.StepsContext, _ sst.StepState) error {
 				return builder.ExecuteSingleInstruction(cmd.Context(), instruction)
 			})
 		}
 
-		// 4. Final conversion to VM image
 		runner.StepsAdd("finalize vm output", func(ctx *sst.StepsContext, _ sst.StepState) error {
 			return builder.FinalizeVM(cmd.Context())
 		})
@@ -57,5 +74,6 @@ var buildCmd = &cobra.Command{
 }
 
 func init() {
+	buildCmd.Flags().StringSliceVar(&buildArgs, "build-arg", nil, "Set build-time variables (e.g., DEBARCH=amd64)")
 	rootCmd.AddCommand(buildCmd)
 }

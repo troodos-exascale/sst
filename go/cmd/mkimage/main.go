@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"os"
 	"os/user"
+    "time"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
 
@@ -23,8 +23,8 @@ var (
 	flagForce   bool
 	flagVerbose bool
 	
-	// NEW: Flag for instance size
 	flagSize    string 
+	flagEfi     bool
 )
 
 var rootCmd = &cobra.Command{
@@ -42,42 +42,31 @@ func main() {
 }
 
 func init() {
-	home, _ := os.UserHomeDir()
-	defaultRoot := filepath.Join(home, ".runtimes")
-
-	rootCmd.PersistentFlags().StringVarP(&flagRoot, "dir", "d", defaultRoot, "Runtime root directory")
+	// FIX: Leave default empty so we can dynamically resolve SST_RUNTIMEDIR at runtime
+	rootCmd.PersistentFlags().StringVarP(&flagRoot, "dir", "d", "", "Runtime root directory (default: $SST_RUNTIMEDIR or ~/.runtimes)")
 	rootCmd.PersistentFlags().BoolVarP(&flagVerbose, "verbose", "v", false, "Verbose logging")
 	rootCmd.PersistentFlags().BoolVarP(&flagForce, "force", "f", false, "Overwrite existing image directory")
 
 	rootCmd.AddCommand(pullvmCmd())
 	
-	// Configure instance command flags
 	instCmd := instanceCmd()
 	instCmd.Flags().StringVarP(&flagSize, "size", "s", "20G", "Target size for the root disk (e.g. 20G, 100GiB)")
+	instCmd.Flags().BoolVar(&flagEfi, "efi", false, "Use EFI bootloader instead of direct Linux kernel boot")
 	rootCmd.AddCommand(instCmd)
 }
 
 /* ======================= pullvm (Refactored to Steps) ======================= */
 
-// pullVMApp holds the state for the pullvm operation
 type pullVMApp struct {
-	// Inputs
-	upstreamArg string
-
-	// State
+	upstreamArg  string
 	sb           rtsst.ImageSB
 	imageDir     string
 	srcImage     string
 	rawImageFile string
-
-	// Behavior / Mockable Methods
-	methods pullVMMethods
-
-	// Framework
-	steps *sst.StepsRunState
+	methods      pullVMMethods
+	steps        *sst.StepsRunState
 }
 
-// pullVMMethods defines the operations for the step machine
 type pullVMMethods struct {
 	SetupEnvironment func(*pullVMApp) error
 	DownloadImage    func(*pullVMApp) error
@@ -88,7 +77,6 @@ type pullVMMethods struct {
 	SaveManifest     func(*pullVMApp) error
 }
 
-// Default implementation of methods
 var defaultPullVMOps = pullVMMethods{
 	SetupEnvironment: pullVMSetupEnv,
 	DownloadImage:    pullVMDownload,
@@ -114,53 +102,29 @@ func pullvmCmd() *cobra.Command {
 	}
 }
 
-// runPullVMSteps wires the steps together
 func runPullVMSteps(app *pullVMApp) error {
 	app.steps = sst.StepsInit("mkimage.pullvm")
-
-	app.steps.StepsAdd("setup environment", func(c *sst.StepsContext, _ sst.StepState) error {
-		return app.methods.SetupEnvironment(app)
-	})
-	app.steps.StepsAdd("download image", func(c *sst.StepsContext, _ sst.StepState) error {
-		return app.methods.DownloadImage(app)
-	})
-	app.steps.StepsAdd("convert image", func(c *sst.StepsContext, _ sst.StepState) error {
-		return app.methods.ConvertImage(app)
-	})
-	app.steps.StepsAdd("analyse partition table", func(c *sst.StepsContext, _ sst.StepState) error {
-		return app.methods.AnalyseImage(app)
-	})
-	app.steps.StepsAdd("enlarge root filesystem", func(c *sst.StepsContext, _ sst.StepState) error {
-		return app.methods.EnlargeRoot(app)
-	})
-	app.steps.StepsAdd("analyse partition table again", func(c *sst.StepsContext, _ sst.StepState) error {
-		return app.methods.AnalyseImage(app)
-	})
-	app.steps.StepsAdd("extract kernel/initrd", func(c *sst.StepsContext, _ sst.StepState) error {
-		return app.methods.ExtractArtifacts(app)
-	})
-	app.steps.StepsAdd("save manifest", func(c *sst.StepsContext, _ sst.StepState) error {
-		return app.methods.SaveManifest(app)
-	})
-
+	app.steps.StepsAdd("setup environment", func(c *sst.StepsContext, _ sst.StepState) error { return app.methods.SetupEnvironment(app) })
+	app.steps.StepsAdd("download image", func(c *sst.StepsContext, _ sst.StepState) error { return app.methods.DownloadImage(app) })
+	app.steps.StepsAdd("convert image", func(c *sst.StepsContext, _ sst.StepState) error { return app.methods.ConvertImage(app) })
+	app.steps.StepsAdd("analyse partition table", func(c *sst.StepsContext, _ sst.StepState) error { return app.methods.AnalyseImage(app) })
+	app.steps.StepsAdd("enlarge root filesystem", func(c *sst.StepsContext, _ sst.StepState) error { return app.methods.EnlargeRoot(app) })
+	app.steps.StepsAdd("analyse partition table again", func(c *sst.StepsContext, _ sst.StepState) error { return app.methods.AnalyseImage(app) })
+	app.steps.StepsAdd("extract kernel/initrd", func(c *sst.StepsContext, _ sst.StepState) error { return app.methods.ExtractArtifacts(app) })
+	app.steps.StepsAdd("save manifest", func(c *sst.StepsContext, _ sst.StepState) error { return app.methods.SaveManifest(app) })
 	return sst.StepsRun(app.steps)
 }
-
-// --- Step Implementations ---
 
 func pullVMSetupEnv(app *pullVMApp) error {
 	app.sb.Ctx = context.Background()
 	app.sb.Log = *sst.LogxRoot().Subsystem("mkimage.pullvm")
 	app.sb.YamlObject = &mkimagepb.ImageYAML{}
 
-	// Resolve runtime dir
-	home, _ := os.UserHomeDir()
+	// FIX: Use the centralized RuntimeDir resolver
 	if flagRoot != "" {
 		app.sb.SstRuntimeDir = flagRoot
-	} else if env := os.Getenv("SST_RUNTIMEDIR"); env != "" {
-		app.sb.SstRuntimeDir = env
 	} else {
-		app.sb.SstRuntimeDir = filepath.Join(home, ".runtimes")
+		app.sb.SstRuntimeDir = rtsst.RuntimeDir()
 	}
 
 	imagesRoot := filepath.Join(app.sb.SstRuntimeDir, "images")
@@ -186,44 +150,22 @@ func pullVMConvert(app *pullVMApp) error {
 	imageName := strings.TrimSuffix(base, filepath.Ext(base))
 
 	sha, err := rtsst.SHA256File(app.srcImage)
-	if err != nil {
-		return err
-	}
+	if err != nil { return err }
 
 	app.rawImageFile = imageName + ".raw"
 	rawImagePath := filepath.Join(app.imageDir, app.rawImageFile)
 
-	// NEW LOGIC: Detect format by content, not extension
 	isQcow, err := rtsst.IsQcow2(app.srcImage)
-	if err != nil {
-		return fmt.Errorf("failed to detect image format: %w", err)
-	}
+	if err != nil { return fmt.Errorf("failed to detect image format: %w", err) }
 
 	if isQcow {
-		app.sb.Log.Info(app.sb.Ctx, "image.convert",
-			"from", app.srcImage,
-			"to", rawImagePath,
-			"format", "raw",
-			"detected_type", "qcow2",
-		)
-
-		if _, err := sst.ExecShell(
-			app.sb.Ctx,
-			&app.sb.Log,
-			"qemu-img",
-			"convert",
-			"-O", "raw",
-			app.srcImage,
-			rawImagePath,
-		); err != nil {
+		app.sb.Log.Info(app.sb.Ctx, "image.convert", "from", app.srcImage, "to", rawImagePath, "format", "raw", "detected_type", "qcow2")
+		if _, err := sst.ExecShell(app.sb.Ctx, &app.sb.Log, "qemu-img", "convert", "-O", "raw", app.srcImage, rawImagePath); err != nil {
 			return fmt.Errorf("failed to convert qcow2 to raw: %w", err)
 		}
 	} else {
-		// Assume raw already
 		if app.srcImage != rawImagePath {
-			if err := os.Rename(app.srcImage, rawImagePath); err != nil {
-				return err
-			}
+			if err := os.Rename(app.srcImage, rawImagePath); err != nil { return err }
 		}
 	}
 
@@ -247,9 +189,7 @@ func pullVMAnalyse(app *pullVMApp) error {
 func pullVMEnlargeRoot(app *pullVMApp) error {
 	ctx := app.sb.Ctx
 	logx := &app.sb.Log
-
 	imagePath := filepath.Join(app.imageDir, app.rawImageFile)
-
 	targetSize := int64(10737418240)
 	
 	y := app.sb.YamlObject
@@ -259,28 +199,16 @@ func pullVMEnlargeRoot(app *pullVMApp) error {
 	}
 
 	rootPartNo := partitionIndex(y.RootfsDevice)
-	if rootPartNo == "" {
-		return fmt.Errorf("cannot extract partition number from %q", y.RootfsDevice)
-	}
+	if rootPartNo == "" { return fmt.Errorf("cannot extract partition number from %q", y.RootfsDevice) }
 
 	fi, err := os.Stat(imagePath)
-	if err != nil {
-		return fmt.Errorf("stat image: %w", err)
-	}
+	if err != nil { return fmt.Errorf("stat image: %w", err) }
 	if fi.Size() >= targetSize {
-		logx.Info(ctx, "image.resize.skip",
-			"file", imagePath,
-			"current_bytes", fi.Size(),
-			"target_bytes", targetSize,
-		)
+		logx.Info(ctx, "image.resize.skip", "file", imagePath, "current_bytes", fi.Size(), "target_bytes", targetSize)
 		return nil
 	}
 
-	logx.Info(ctx, "image.resize.start",
-		"file", imagePath,
-		"target_bytes", targetSize,
-		"root_partition", rootPartNo,
-	)
+	logx.Info(ctx, "image.resize.start", "file", imagePath, "target_bytes", targetSize, "root_partition", rootPartNo)
 
 	_, err = sst.ExecShell(ctx, logx, "sh", "-euxc", fmt.Sprintf(`
 image=%q
@@ -290,56 +218,33 @@ target=%d
 fsck_ok() {
   e2fsck -f -p "$1"
   rc=$?
-  if [ $rc -le 1 ]; then
-    return 0
-  fi
+  if [ $rc -le 1 ]; then return 0; fi
   return $rc
 }
 
-# 1) Attach image once, with partitions
 loopdev=$(losetup -f -P --show "$image")
 trap 'losetup -d "$loopdev"' EXIT
 partdev="${loopdev}p${partno}"
-
-# 2) Clean filesystem on ORIGINAL geometry
 fsck_ok "$partdev"
-
-# 3) Grow raw image file
 truncate -s "$target" "$image"
-
-# IMPORTANT: tell kernel the loop device grew
 losetup -c "$loopdev"
-
-# 4) Grow partition table via the loop device
 growpart "$loopdev" "$partno"
-
-# Ensure kernel sees updated partition table
 partprobe "$loopdev" || true
 udevadm settle || true
-
-# 5) Resize filesystem to fill enlarged partition
 resize2fs "$partdev"
-
-# 6) Verify filesystem after resize
 fsck_ok "$partdev"
 `, imagePath, rootPartNo, targetSize))
 
-	if err != nil {
-		return fmt.Errorf("offline root resize failed: %w", err)
-	}
-
+	if err != nil { return fmt.Errorf("offline root resize failed: %w", err) }
 	logx.Info(ctx, "image.resize.done", "file", imagePath)
 	return nil
 }
 
 func partitionIndex(dev string) string {
 	const prefix = "/dev/vda"
-	if !strings.HasPrefix(dev, prefix) {
-		return ""
-	}
+	if !strings.HasPrefix(dev, prefix) { return "" }
 	return strings.TrimPrefix(dev, prefix)
 }
-
 
 func pullVMExtract(app *pullVMApp) error {
 	return rtsst.ExtractKernelAndInitrdFromBootPartition(&app.sb)
@@ -352,17 +257,8 @@ func pullVMSave(app *pullVMApp) error {
 		Kind:   "Image",
 		Msg:    app.sb.YamlObject,
 	}
-
-	if diags := yo.Save(app.sb.Ctx, &app.sb.Log); diags != nil {
-		return diags
-	}
-
-	if flagVerbose {
-		app.sb.Log.Info(app.sb.Ctx, "image.created",
-			"name", app.sb.YamlObject.Name,
-			"dir", app.imageDir,
-		)
-	}
+	if diags := yo.Save(app.sb.Ctx, &app.sb.Log); diags != nil { return diags }
+	if flagVerbose { app.sb.Log.Info(app.sb.Ctx, "image.created", "name", app.sb.YamlObject.Name, "dir", app.imageDir) }
 	return nil
 }
 
@@ -383,12 +279,16 @@ func createInstance(image, name string) error {
 	ctx := context.Background()
 	log := sst.LogxRoot().Subsystem("mkimage.instance")
 
-	// ... [Image directory resolution logic remains unchanged] ...
+	runtimeRoot := flagRoot
+	if runtimeRoot == "" {
+		runtimeRoot = rtsst.RuntimeDir()
+	}
+
 	var imageDir string
 	if info, err := os.Stat(image); err == nil && info.IsDir() {
 		imageDir = image
 	} else {
-		imageDir = filepath.Join(flagRoot, "images", image)
+		imageDir = filepath.Join(runtimeRoot, "images", image)
 	}
 
 	if _, err := os.Stat(imageDir); os.IsNotExist(err) {
@@ -401,9 +301,7 @@ func createInstance(image, name string) error {
 		return fmt.Errorf("instance %s exists; use --force to overwrite", name)
 	}
 	_ = os.RemoveAll(instDir)
-	if err := os.MkdirAll(instDir, 0755); err != nil {
-		return err
-	}
+	if err := os.MkdirAll(instDir, 0755); err != nil { return err }
 
 	imageYaml := &mkimagepb.ImageYAML{}
 	imgYo := &sst.YamlObject{
@@ -412,9 +310,7 @@ func createInstance(image, name string) error {
 		Kind:   "Image",
 		Msg:    imageYaml,
 	}
-	if diags := imgYo.Load(ctx, log); diags != nil {
-		return diags
-	}
+	if diags := imgYo.Load(ctx, log); diags != nil { return diags }
 
 	instanceYaml := &runctlpb.Instance{}
 	instYo := &sst.YamlObject{
@@ -429,19 +325,23 @@ func createInstance(image, name string) error {
 	dst := filepath.Join(instDir, imageYaml.RawImage)
 	
 	log.Info(ctx, "copying root image", "src", src, "dst", dst)
-	if err := rtsst.CopySparse(src, dst); err != nil {
-		return err
-	}
-    // --------------------
-	if err := rtsst.CopyFile(filepath.Join(imageDir, imageYaml.Kernel), filepath.Join(instDir, imageYaml.Kernel)); err != nil {
-		return err
-	}
-	if err := rtsst.CopyFile(filepath.Join(imageDir, imageYaml.Initrd), filepath.Join(instDir, imageYaml.Initrd)); err != nil {
-		return err
+	if err := rtsst.CopySparse(src, dst); err != nil { return err }
+	
+	if !flagEfi {
+		if imageYaml.Kernel == "" {
+			return fmt.Errorf("STRICT: No kernel was extracted from the base image '%s'. A kernel must be installed in the Dockerfile to use the direct 'linux' bootloader (required for early console). If you intend to use an embedded bootloader like GRUB, use the --efi flag", image)
+		}
+		if err := rtsst.CopyFile(filepath.Join(imageDir, imageYaml.Kernel), filepath.Join(instDir, imageYaml.Kernel)); err != nil {
+			return err
+		}
+		if imageYaml.Initrd != "" {
+			if err := rtsst.CopyFile(filepath.Join(imageDir, imageYaml.Initrd), filepath.Join(instDir, imageYaml.Initrd)); err != nil {
+				return err
+			}
+		}
 	}
     
-	
-    mac, err := rtsst.GenerateMAC()
+	mac, err := rtsst.GenerateMAC()
 	if err != nil { return err }
 	u, err := user.Current()
 	if err != nil { return err }
@@ -461,10 +361,26 @@ func createInstance(image, name string) error {
 	instanceYaml.MemorySize = "8096"
 	instanceYaml.MemorySizeSuffix = "MiB"
 	instanceYaml.Balloon = false
-	instanceYaml.Bootloader = "linux"
+	
+	if !flagEfi {
+		instanceYaml.Bootloader = "linux"
+		instanceYaml.Kernel = imageYaml.Kernel
+		instanceYaml.Initrd = imageYaml.Initrd
+		instanceYaml.Params = []string{
+			"console=hvc0",
+			"oops=panic",
+			"panic=10",
+			"sysrq_always_enabled=1",
+			"loglevel=4",
+			"cpuidle.off=1",
+			fmt.Sprintf("root=%s", imageYaml.RootfsDevice),
+			fmt.Sprintf("rootfstype=%s", imageYaml.RootfsType),
+		}
+	} else {
+		instanceYaml.Bootloader = "efi"
+	}
+	
 	instanceYaml.EfiVars = "efi-vars"
-	instanceYaml.Kernel = imageYaml.Kernel
-	instanceYaml.Initrd = imageYaml.Initrd
 	instanceYaml.Rwdisk = []string{
 		imageYaml.RawImage,
 		"data.img",
@@ -474,26 +390,15 @@ func createInstance(image, name string) error {
 		fmt.Sprintf("%s:%s", u.HomeDir, u.HomeDir),
 	}
 	instanceYaml.Network = []string{fmt.Sprintf("%s@nat", mac)}
-	instanceYaml.Params = []string{
-		"console=hvc0",
-		"oops=panic",
-		"panic=10",
-		"sysrq_always_enabled=1",
-		"loglevel=4",
-		"cpuidle.off=1",
-		fmt.Sprintf("root=%s", imageYaml.RootfsDevice),
-		fmt.Sprintf("rootfstype=%s", imageYaml.RootfsType),
-	}
 
 	if diags := instYo.Save(ctx, log); diags != nil { return diags }
 	if err := rtsst.WriteCIData(ctx, log, instDir, instanceYaml); err != nil {
 		return fmt.Errorf("failed to write cidata: %w", err)
 	} else {
 		log.Info(ctx, "updated cidata.iso", "instDir", instDir)
-	if err := rtsst.UpdateCIDATAISO(instDir); err != nil {
-		return fmt.Errorf("update cidata.iso: %w", err)
-	}
-
+		if err := rtsst.UpdateCIDATAISO(instDir); err != nil {
+			return fmt.Errorf("update cidata.iso: %w", err)
+		}
 	}
 
 	return nil

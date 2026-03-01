@@ -83,6 +83,7 @@ func AnalyseImg(sb *ImageSB) error {
 		FsUUID    string
 		PartMinor string
 		FSType    string
+		Type      string
 	}
 	var candidates []candidate
     var maxStart uint64
@@ -91,17 +92,15 @@ func AnalyseImg(sb *ImageSB) error {
 
     findCandidates = func(devs []BlockDevice) {
         for _, d := range devs {
-            // ... logging ...
-
-            // 1. Check if THIS device is a candidate
-            if d.Type == "part" && (d.FSType == "ext4" || d.FSType == "xfs") {
-                // Safely parse MajorMinor only when we know we need it
-                parts := strings.Split(d.MajorMinor, ":")
-                if len(parts) < 2 {
-                    sb.Log.Warn(sb.Ctx, "Skipping partition with invalid maj:min", "name", d.Name)
-                    continue
-                }
-                minor := parts[1]
+            // 1. Check if THIS device is a candidate (Support pure disk or partitioned disk)
+            if (d.Type == "part" || d.Type == "disk") && (d.FSType == "ext4" || d.FSType == "xfs" || d.FSType == "ext2") {
+                minor := ""
+                if d.Type == "part" {
+					parts := strings.Split(d.MajorMinor, ":")
+					if len(parts) >= 2 {
+						minor = parts[1]
+					}
+				}
 
                 c := candidate{
                     Name:      d.Name,
@@ -111,19 +110,20 @@ func AnalyseImg(sb *ImageSB) error {
                     FsUUID:    d.UUID,
                     PartMinor: minor,
                     FSType:    d.FSType,
+					Type:      d.Type,
                 }
 				if c.Start > maxStart {
 					maxStart = c.Start
 				}
                 candidates = append(candidates, c)
                 sb.Log.Info(sb.Ctx, "Found candidate partition",
-                    // ... logging args ...
+                    "name", c.Name,
+					"fstype", c.FSType,
+					"type", c.Type,
                 )
             }
 
             // 2. RECURSE UNCONDITIONALLY
-            // We must look at children regardless of whether the parent
-            // was a candidate (e.g. we must look inside 'disk' to find 'part')
             if len(d.Children) > 0 {
                 findCandidates(d.Children)
             }
@@ -133,8 +133,7 @@ func AnalyseImg(sb *ImageSB) error {
 	findCandidates(output.BlockDevices)
 
 	if len(candidates) == 0 {
-		// Log the full structure for debugging context before failing
-		return fmt.Errorf("heuristic failed: no ext4 or xfs partitions found in %s", rawImage)
+		return fmt.Errorf("heuristic failed: no ext2/ext4/xfs filesystems found in %s", rawImage)
 	}
 
 	// 5. Apply Heuristics
@@ -145,20 +144,26 @@ func AnalyseImg(sb *ImageSB) error {
 	rootPart := candidates[0]
 	sb.YamlObject.RootfsPartUuid = rootPart.PartUUID
 	sb.YamlObject.RootfsUuid = rootPart.FsUUID
-	sb.YamlObject.RootfsDevice = "/dev/vda" + rootPart.PartMinor
+	if rootPart.Type == "part" && rootPart.PartMinor != "" {
+		sb.YamlObject.RootfsDevice = "/dev/vda" + rootPart.PartMinor
+	} else {
+		sb.YamlObject.RootfsDevice = "/dev/vda" // Raw unpartitioned disk
+	}
 	sb.YamlObject.RootfsType = rootPart.FSType
 	sb.YamlObject.RootfsSize = fmt.Sprintf("%d%s", rootPart.Size, "B")
+	
 	if rootPart.Start == maxStart {
-		sb.Log.Info(sb.Ctx, "Rootfs is the largest partition", "start", rootPart.Start)
+		sb.Log.Info(sb.Ctx, "Rootfs is the last block device layout", "start", rootPart.Start)
 		sb.YamlObject.RootfsIsLast = true
 	} else {
-		sb.Log.Info(sb.Ctx, "Rootfs is not the largest partition", "start", rootPart.Start)
+		sb.Log.Info(sb.Ctx, "Rootfs is not the last block device layout", "start", rootPart.Start)
 		sb.YamlObject.RootfsIsLast = false
 	}
+	
 	sb.Log.Info(sb.Ctx, "Identified Rootfs (Largest)",
 		"part_uuid", sb.YamlObject.RootfsPartUuid,
 		"fs_uuid", sb.YamlObject.RootfsUuid,
-		"rootfs_device", "/dev/vda"+sb.YamlObject.RootfsDevice,
+		"rootfs_device", sb.YamlObject.RootfsDevice,
 		"fstype", sb.YamlObject.RootfsType,
 		"size_bytes", rootPart.Size,
 	)
@@ -167,7 +172,11 @@ func AnalyseImg(sb *ImageSB) error {
 		bootPart := candidates[len(candidates)-1]
 		sb.YamlObject.BootfsPartUuid = bootPart.PartUUID
 		sb.YamlObject.BootfsType = bootPart.FSType
-		sb.YamlObject.BootfsDevice = "/dev/vda" + bootPart.PartMinor
+		if bootPart.Type == "part" && bootPart.PartMinor != "" {
+			sb.YamlObject.BootfsDevice = "/dev/vda" + bootPart.PartMinor
+		} else {
+			sb.YamlObject.BootfsDevice = "/dev/vda"
+		}
 		sb.YamlObject.BootfsUuid = bootPart.FsUUID
 		sb.Log.Info(sb.Ctx, "Identified Bootfs (Smallest)",
 			"part_uuid", sb.YamlObject.BootfsPartUuid,
@@ -177,12 +186,11 @@ func AnalyseImg(sb *ImageSB) error {
 			"size_bytes", bootPart.Size,
 		)
 	} else {
-		// FIX: Explicitly map Bootfs to Rootfs when single partition
 		sb.YamlObject.BootfsPartUuid = rootPart.PartUUID
 		sb.YamlObject.BootfsType = rootPart.FSType
 		sb.YamlObject.BootfsUuid = rootPart.FsUUID
-		sb.YamlObject.BootfsDevice = "/dev/vda" + rootPart.PartMinor
-		sb.Log.Info(sb.Ctx, "Only one Linux partition found; assuming /boot is part of rootfs",
+		sb.YamlObject.BootfsDevice = sb.YamlObject.RootfsDevice
+		sb.Log.Info(sb.Ctx, "Only one Linux block device found; assuming /boot is part of rootfs",
 			"bootfs_uuid", sb.YamlObject.BootfsPartUuid)
 	}
 
@@ -195,10 +203,7 @@ func ExtractKernelAndInitrdFromBootPartition(sb *ImageSB) error {
 	rawImage := filepath.Join(sb.SstRuntimeDir, "images", sb.YamlObject.Name, sb.YamlObject.RawImage)
 	bootfsPartUuid := sb.YamlObject.BootfsPartUuid
 
-	if bootfsPartUuid == "" {
-		return fmt.Errorf("bootfs_part_uuid is empty; run AnalyseImg first")
-	}
-
+	// If no PartUUID exists (because it's a raw disk), we fall back to mounting the raw device directly
 	sb.Log.Info(sb.Ctx, "kernel.extract.start",
 		"image", rawImage,
 		"bootfs_part_uuid", bootfsPartUuid,
@@ -221,7 +226,7 @@ func ExtractKernelAndInitrdFromBootPartition(sb *ImageSB) error {
 	}()
 
 	// 2. Resolve Partition Device
-	partDev, err := resolveBootPartitionDevice(sb.YamlObject)
+	partDev, err := resolveBootPartitionDevice(sb.YamlObject, nbdDev)
 	if err != nil {
 		return err
 	}
@@ -263,13 +268,13 @@ func ExtractKernelAndInitrdFromBootPartition(sb *ImageSB) error {
 }
 
 // resolveBootPartitionDevice determines the device path.
-// It prioritizes the PartUUID found during analysis.
-func resolveBootPartitionDevice(img *mkimagepb.ImageYAML) (string, error) {
+// It prioritizes the PartUUID found during analysis, falling back to the raw nbd device for pure disks.
+func resolveBootPartitionDevice(img *mkimagepb.ImageYAML, nbdDev string) (string, error) {
 	if img.BootfsPartUuid != "" {
-		// udev usually creates these links; attachNBD calls `udevadm settle` to ensure they exist.
 		return "/dev/disk/by-partuuid/" + img.BootfsPartUuid, nil
 	}
-	return "", fmt.Errorf("bootfs info missing")
+	// If there's no PartUUID, it's likely a raw unpartitioned filesystem mapped directly to the NBD root
+	return nbdDev, nil
 }
 
 func ParseMemorySizeMiB(sizeStr, suffix string) (uint64, error) {
@@ -388,8 +393,6 @@ func unmountPartition(ctx context.Context, log *sst.Logx, dir string) error {
 	return err
 }
 
-// go/internal/rtsst/diskimgops.go
-
 func scanPartitionForArtifacts(mnt string) (string, string, bool) {
 	search := []string{
 		mnt,
@@ -454,6 +457,7 @@ func scanPartitionForArtifacts(mnt string) (string, string, bool) {
 	}
 	return "", "", false
 }
+
 func copyArtifacts(srcKernel, srcInitrd, destDir string) (string, string, error) {
 	kernelName := filepath.Base(srcKernel)
 	initrdName := filepath.Base(srcInitrd)
@@ -484,7 +488,6 @@ func copyArtifacts(srcKernel, srcInitrd, destDir string) (string, string, error)
 }
 
 // IsQcow2 checks if the file at path is a QCOW2 image by reading the first 4 magic bytes.
-// This replaces unreliable file extension checks.
 func IsQcow2(path string) (bool, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -492,13 +495,10 @@ func IsQcow2(path string) (bool, error) {
 	}
 	defer f.Close()
 
-	// The QCOW2 magic string is "QFI\xfb"
-	// Reference: https://gitlab.com/qemu-project/qemu/-/blob/master/docs/interop/qcow2.txt
 	magic := []byte{'Q', 'F', 'I', 0xfb}
 	buf := make([]byte, 4)
 
 	if _, err := io.ReadFull(f, buf); err != nil {
-		// If file is smaller than 4 bytes, it's definitely not QCOW2
 		if err == io.EOF || err == io.ErrUnexpectedEOF {
 			return false, nil
 		}

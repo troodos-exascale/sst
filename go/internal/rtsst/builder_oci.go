@@ -11,28 +11,20 @@ import (
 	"github.com/swiss-software-tool/runtime-smart/go/internal/sst"
 )
 
-// sanitizeName replaces colons and other problematic chars for filesystem paths
 func sanitizeName(s string) string {
 	return strings.ReplaceAll(s, ":", "_")
 }
 
-// ResolveOCIPaths sets up the staging directories under .runtimes
 func (b *BuildApp) ResolveOCIPaths() error {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return err
-	}
-	
-	// Sanitize the base image name for the directory path
 	safeBase := sanitizeName(b.BaseImage)
-	b.OCIStaging = filepath.Join(home, ".runtimes", "oci", safeBase)
-	b.RootDir = filepath.Join(home, ".runtimes", "build", b.VMOUT, "rootfs")
+	b.OCIStaging = filepath.Join(b.RuntimeDir, "oci", safeBase)
+	b.RootDir = filepath.Join(b.RuntimeDir, "build", b.Name, "rootfs") // UPDATED: use b.Name
 	
 	b.Log.Info(context.Background(), "resolved paths", "oci_staging", b.OCIStaging, "rootfs", b.RootDir)
 	return os.MkdirAll(b.OCIStaging, 0755)
 }
 
-// FetchOCI pulls the image using skopeo into a local OCI layout
+// ... (FetchOCI, VerifyWithPodman, UnpackOCI remain the same, they use b.OCIStaging and b.RootDir) ...
 func (b *BuildApp) FetchOCI(ctx context.Context) error {
 	indexFile := filepath.Join(b.OCIStaging, "index.json")
 	if _, err := os.Stat(indexFile); err == nil {
@@ -42,23 +34,19 @@ func (b *BuildApp) FetchOCI(ctx context.Context) error {
 
 	b.Log.Info(ctx, "fetching OCI base image", "image", b.BaseImage, "target", b.OCIStaging)
 	
-	// We use the raw b.BaseImage for the docker:// source, but the sanitized path for oci:
 	_, err := sst.ExecShell(ctx, b.Log, "skopeo", "copy", 
-		"--src-tls-verify=false", // Optional: useful in some VM environments
+		"--src-tls-verify=false",
 		"docker://"+b.BaseImage, 
 		"oci:"+b.OCIStaging)
 	return err
 }
 
-// VerifyWithPodman runs a simple check using the OCI layout
 func (b *BuildApp) VerifyWithPodman(ctx context.Context) error {
 	b.Log.Info(ctx, "verifying image with podman", "image", b.BaseImage)
-	// Podman also needs the oci: prefix to point to our sanitized directory
 	_, err := sst.ExecShell(ctx, b.Log, "podman", "run", "--rm", "oci:"+b.OCIStaging, "ls", "/")
 	return err
 }
 
-// UnpackOCI flattens OCI layers into a single filesystem directory
 func (b *BuildApp) UnpackOCI(ctx context.Context) error {
 	b.Log.Info(ctx, "unpacking and flattening OCI layers", "target", b.RootDir)
 	
@@ -66,7 +54,6 @@ func (b *BuildApp) UnpackOCI(ctx context.Context) error {
 		return err
 	}
 
-	// 1. Load Index to find the Manifest digest
 	indexPath := filepath.Join(b.OCIStaging, "index.json")
 	data, err := os.ReadFile(indexPath)
 	if err != nil { 
@@ -80,7 +67,6 @@ func (b *BuildApp) UnpackOCI(ctx context.Context) error {
 		return fmt.Errorf("invalid or empty OCI index at %s", indexPath)
 	}
 
-	// 2. Load Manifest to get layer digests in sequential order
 	mDigest := strings.TrimPrefix(index.Manifests[0].Digest, "sha256:")
 	mPath := filepath.Join(b.OCIStaging, "blobs", "sha256", mDigest)
 	mData, err := os.ReadFile(mPath)
@@ -95,14 +81,12 @@ func (b *BuildApp) UnpackOCI(ctx context.Context) error {
 		return fmt.Errorf("failed to parse manifest: %w", err) 
 	}
 
-	// 3. Extract layers sequentially
 	for i, layer := range manifest.Layers {
 		lDigest := strings.TrimPrefix(layer.Digest, "sha256:")
 		lPath := filepath.Join(b.OCIStaging, "blobs", "sha256", lDigest)
 		
 		b.Log.Info(ctx, "extracting layer", "index", i, "digest", layer.Digest)
 		
-		// Use tar -xf. Sequential execution flattens the image into RootDir
 		_, err := sst.ExecShell(ctx, b.Log, "tar", "-C", b.RootDir, "-xf", lPath)
 		if err != nil {
 			b.Log.Warn(ctx, "failed to extract layer blob (it may be metadata)", "digest", layer.Digest)

@@ -6,7 +6,7 @@ ARCH := $(shell go env GOARCH)
 OS := $(shell go env GOOS)
 ENTITLEMENTS := cmd/crosvm/crosvm.entitlements
 
-.PHONY: build install clean generate tidy download
+.PHONY: build install clean generate tidy download vet test
 
 # 1. First: Download all known dependencies without validating imports
 download:
@@ -23,7 +23,17 @@ tidy: generate
 	@echo "--> Tidying Go modules..."
 	go mod tidy
 
-# 4. Final: Build the binaries using the validated module graph
+# 4. Vet: Examine Go source code and report suspicious constructs
+vet: tidy
+	@echo "--> Vetting Go code..."
+	go vet ./...
+
+# 5. Test: Run unit tests across the module
+test: tidy
+	@echo "--> Running tests..."
+	go test -v ./...
+
+# 6. Final: Build the binaries using the validated module graph
 build: tidy
 	@set -e; \
 	for b in $(BINS); do \

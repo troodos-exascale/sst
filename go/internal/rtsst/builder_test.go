@@ -14,7 +14,7 @@ func TestDockerfileParser(t *testing.T) {
 RUN: |
     apt-get update
     apt-get install -y linux-image-cloud-amd64
-VMOUT: base-boot-debian`
+NAME: base-boot-debian` // FIX: Use NAME instead of VMOUT
 
 	tmpfile, err := os.CreateTemp("", "Dockerfile.*")
 	assert.NoError(t, err)
@@ -25,12 +25,18 @@ VMOUT: base-boot-debian`
 	tmpfile.Close()
 
 	log := sst.LogxRoot()
-	builder := NewBuilder(log, nil, tmpfile.Name())
+	
+	// FIX: Provide a dummy RuntimeDir
+	builder := NewBuilder(log, nil, tmpfile.Name(), "/tmp/dummy-runtimes")
+	
 	err = builder.Parse(context.Background())
-
 	assert.NoError(t, err)
+
+	err = builder.PreProcess(context.Background())
+	assert.NoError(t, err)
+
 	assert.Equal(t, "debian:bookworm-slim", builder.BaseImage)
-	assert.Equal(t, "base-boot-debian", builder.VMOUT)
+	assert.Equal(t, "base-boot-debian", builder.Name) // FIX: Assert against Name
 	
 	foundRun := false
 	for _, inst := range builder.Instructions {

@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	sst "github.com/swiss-software-tool/runtime-smart/go/internal/sst"
-	"github.com/swiss-software-tool/runtime-smart/go/proto/yaml/runctl/v1"
+	runctlpb "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/runctl/v1"
 	"os"
 	"os/exec"
 	"os/user"
@@ -18,11 +18,33 @@ import (
 )
 
 func Home() string {
+	if h := os.Getenv("HOME"); h != "" {
+		return h
+	}
 	u, err := user.Current()
 	if err != nil {
 		panic(err)
 	}
 	return u.HomeDir
+}
+
+func RuntimeDir() string {
+	if env := os.Getenv("SST_RUNTIMEDIR"); env != "" {
+		return env
+	}
+	return filepath.Join(Home(), ".runtimes")
+}
+
+func InstanceRoot() string {
+	return filepath.Join(RuntimeDir(), "instances")
+}
+
+func InstanceDir(name string) string {
+	return filepath.Join(InstanceRoot(), name)
+}
+
+func LockFilePath(name string) string {
+	return filepath.Join(InstanceDir(name), "lockfile")
 }
 
 type LockInfo struct {
@@ -66,18 +88,6 @@ func WriteLock(path, name string, pid int) error {
 	return os.WriteFile(path, []byte(content), 0644)
 }
 
-func InstanceRoot() string {
-	return filepath.Join(Home(), ".runtimes", "instances")
-}
-
-func InstanceDir(name string) string {
-	return filepath.Join(InstanceRoot(), name)
-}
-
-func LockFilePath(name string) string {
-	return filepath.Join(InstanceDir(name), "lockfile")
-}
-
 func EnsureInstanceNotBusy(name string) error {
 	lp := LockFilePath(name)
 	_, err := os.Stat(lp)
@@ -105,7 +115,6 @@ func IsPidAlive(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	// Send signal 0 → check existence without affecting the process.
 	err := syscall.Kill(pid, 0)
 	return err == nil
 }
@@ -142,8 +151,6 @@ func GenerateMAC() (string, error) {
 		buf[0], buf[1], buf[2], buf[3], buf[4], buf[5]), nil
 }
 
-// GetLocalPublicKey attempts to find a valid SSH public key in the current user's ~/.ssh directory.
-// It checks standard key names in priority order (ed25519, rsa, ecdsa, dsa).
 func GetLocalPublicKey() (string, error) {
 	u, err := user.Current()
 	if err != nil {
@@ -152,7 +159,6 @@ func GetLocalPublicKey() (string, error) {
 
 	sshDir := filepath.Join(u.HomeDir, ".ssh")
 
-	// Priority order matches standard ssh preferences
 	pubCandidates := []string{
 		filepath.Join(sshDir, "id_ed25519.pub"),
 		filepath.Join(sshDir, "id_rsa.pub"),
@@ -170,7 +176,9 @@ func GetLocalPublicKey() (string, error) {
 		}
 	}
 
-	return "", fmt.Errorf("no usable SSH public key found in %s", sshDir)
+	// FIX: Do not throw a fatal error if the user has no SSH keys.
+	// Return empty string so cloud-init generation gracefully skips the SSH section.
+	return "", nil
 }
 
 func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *runctlpb.Instance) error {
@@ -189,7 +197,6 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 		return fmt.Errorf("failed to get current user: %w", err)
 	}
 
-	// ---- Prepare mounts ----
 	type mountInfo struct {
 		tag       string
 		guestPath string
@@ -221,7 +228,6 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 		})
 	}
 
-	// ---- Build user-data ----
 	var sb strings.Builder
 
 	sb.WriteString("#cloud-config\n")
@@ -232,14 +238,10 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 	sb.WriteString("ssh_pwauth: false\n")
 	sb.WriteString("disable_root: true\n\n")
 
-	// 1. Boot Commands: Fix the GPT Table
-	// This runs before filesystems are mounted read-write, using built-in tools if available.
-	// Most cloud images include sgdisk/partprobe. If missing, this might fail harmlessly on first boot.
 	sb.WriteString("bootcmd:\n")
 	sb.WriteString("  - [ cloud-init-per, once, move-gpt-header, sgdisk, -e, /dev/vda ]\n")
 	sb.WriteString("  - [ cloud-init-per, once, reread-pt, partprobe ]\n")
 
-	// 2. Configure Users
 	sb.WriteString("\nusers:\n")
 	sb.WriteString("  - default\n")
 	fmt.Fprintf(&sb, "  - name: %s\n", user.Username)
@@ -253,13 +255,11 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 		sb.WriteString("      - " + pubKey + "\n")
 	}
 
-	// 3. Set Passwords
 	sb.WriteString("\nchpasswd:\n")
 	sb.WriteString("  list: |\n")
 	fmt.Fprintf(&sb, "    %s:abcd1234\n", user.Username)
 	sb.WriteString("  expire: False\n")
 
-	// 4. Mounts
 	if len(mounts) > 0 {
 		sb.WriteString("\n# Mount virtiofs shares\n")
 		sb.WriteString("mounts:\n")
@@ -274,10 +274,8 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 		}
 	}
 
-	// 5. Run Commands (Polyglot Install + Resize)
 	sb.WriteString("\nruncmd:\n")
 
-	// --- C. Alpine setup script ---
 	sb.WriteString("  - |\n")
 	sb.WriteString(fmt.Sprintf(`    if [ -f /etc/alpine-release ]; then
       mkdir -p /etc/conf.d
@@ -289,7 +287,6 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
     fi
 `, user.Username))
 
-	// --- D. Ensure mountpoints ---
 	for _, m := range mounts {
 		sb.WriteString("  - |\n")
 		fmt.Fprintf(&sb, "    mkdir -p %s\n", m.guestPath)
@@ -297,14 +294,12 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 
 	userData := sb.String()
 
-	// ---- meta-data ----
 	metaData := fmt.Sprintf(
 		"instance-id: %s\nlocal-hostname: %s\n",
 		inst.Hostname,
 		inst.Hostname,
 	)
 
-	// ---- Write files ----
 	if err := os.WriteFile(filepath.Join(cidataDir, "user-data"), []byte(userData), 0644); err != nil {
 		return fmt.Errorf("failed to write user-data: %w", err)
 	}
@@ -321,8 +316,6 @@ type Lock struct {
 	Path string
 }
 
-// CreateLock attempts to create a lock file exclusively.
-// Returns an error if the lock already exists.
 func CreateLock(lockPath string) (*Lock, error) {
 	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if err != nil {
@@ -339,23 +332,16 @@ func CreateLock(lockPath string) (*Lock, error) {
 	return &Lock{Path: lockPath}, nil
 }
 
-// Remove deletes the lock file.
 func (l *Lock) Remove() {
 	_ = os.Remove(l.Path)
 }
 
-// EnsureCIDataISO ensures that cidata.iso exists and is up to date.
-// If user-data or meta-data is newer than the ISO, it regenerates the ISO
-// and writes a new instance-id into meta-data so cloud-init re-runs.
-//
-// The instance-id is human-readable and collision-free.
 func EnsureCIDataISO(ctx context.Context, log *sst.Logx, instDir string) error {
 	cidataDir := filepath.Join(instDir, "cidata")
 	isoPath := filepath.Join(instDir, "cidata.iso")
 	userDataPath := filepath.Join(cidataDir, "user-data")
 	metaDataPath := filepath.Join(cidataDir, "meta-data")
 
-	// --- decide whether rebuild is needed ---
 	needsRebuild := false
 
 	isoInfo, err := os.Stat(isoPath)
@@ -379,8 +365,6 @@ func EnsureCIDataISO(ctx context.Context, log *sst.Logx, instDir string) error {
 		return nil
 	}
 
-	// --- write fresh meta-data with new instance-id ---
-	// Cloud-init accepts any string; use readable + monotonic format.
 	instanceID := "iid-" + time.Now().UTC().Format("2006-01-02-15-04-05.000000000")
 	hostname := filepath.Base(instDir)
 
@@ -396,8 +380,7 @@ func EnsureCIDataISO(ctx context.Context, log *sst.Logx, instDir string) error {
 
 	log.Info(ctx, "Updated instance-id", "instance_id", instanceID)
 
-	// --- rebuild cidata.iso ---
-	_ = os.Remove(isoPath) // ignore error; hdiutil will fail if it matters
+	_ = os.Remove(isoPath)
     if err := UpdateCIDATAISO(instDir); err != nil {
 		log.Error(ctx, "hdiutil/geniso makehybrid failed", "output")
 		return fmt.Errorf("Update cidata.iso: %w", err)
@@ -420,7 +403,6 @@ func UpdateCIDATAISO(instDir string) error {
 			"-joliet", "-iso",
 			"-default-volume-name", "cidata",
 		)
-		// Capture output to prevent log spam unless error
 		if out, err := cmd.CombinedOutput(); err != nil {
 			return fmt.Errorf("hdiutil failed: %v\nOutput: %s", err, string(out))
 		}
