@@ -140,7 +140,7 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 	}
 
 	rawImagePath := filepath.Join(b.ImageOutput, b.Name+".raw")
-	b.Log.Info(ctx, "creating deterministic ext2 foundation", "path", rawImagePath)
+	b.Log.Info(ctx, "creating deterministic ext4 foundation", "path", rawImagePath)
 
 	if err := CreateSparse(rawImagePath, 4*1024*1024*1024); err != nil {
 		return err
@@ -150,7 +150,7 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 	req := sst.ExecRequest{
 		Cmd: "mke2fs",
 		Args: []string{
-			"-t", "ext2",
+			"-t", "ext4", // FIX: Changed from ext2 to ext4 so AnalyseImg detects it
 			"-d", b.RootDir,
 			"-U", fixedUUID,
 			"-E", "hash_seed=" + fixedUUID,
@@ -167,7 +167,7 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 
 	sb := &ImageSB{
 		Ctx: ctx,
-		Log: b.Log, // FIX: Pass pointer directly, do not dereference
+		Log: b.Log, 
 		YamlObject: &mkimagepb.ImageYAML{
 			Name:     b.Name,
 			RawImage: b.Name + ".raw",

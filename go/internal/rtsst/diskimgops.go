@@ -20,7 +20,7 @@ import (
 // ImageSB is the state bag for image operations.
 type ImageSB struct {
 	Ctx           context.Context
-	Log           *sst.Logx // FIX: Use pointer to avoid copying Mutex
+	Log           *sst.Logx
 	YamlObject    *mkimagepb.ImageYAML
 	SstRuntimeDir string
 }
@@ -31,7 +31,6 @@ func AnalyseImg(sb *ImageSB) error {
 
 	sb.Log.Info(sb.Ctx, "Attaching image to NBD for analysis", "image", rawImage)
 
-	// FIX: sb.Log is now a pointer, pass it directly
 	nbdDev, err := attachNBD(sb.Ctx, sb.Log, rawImage)
 	if err != nil {
 		return fmt.Errorf("failed to attach nbd device: %w", err)
@@ -87,19 +86,27 @@ func AnalyseImg(sb *ImageSB) error {
 
     findCandidates = func(devs []BlockDevice) {
         for _, d := range devs {
-            if d.Type == "part" && (d.FSType == "ext4" || d.FSType == "xfs") {
+			// FIX: Accept both "part" (partitioned) and "disk" (partitionless) devices
+            if (d.Type == "part" || d.Type == "disk") && (d.FSType == "ext4" || d.FSType == "ext2" || d.FSType == "xfs") {
                 parts := strings.Split(d.MajorMinor, ":")
                 if len(parts) < 2 {
                     sb.Log.Warn(sb.Ctx, "Skipping partition with invalid maj:min", "name", d.Name)
                     continue
                 }
                 minor := parts[1]
+				
+				// For partitionless disks (like our builder outputs), there is no partition UUID.
+				// We fall back to the filesystem UUID so kernel extraction has a stable identifier to mount.
+				pUuid := d.PartUUID
+				if pUuid == "" {
+					pUuid = d.UUID
+				}
 
                 c := candidate{
                     Name:      d.Name,
                     Start:     d.Start,
                     Size:      d.Size,
-                    PartUUID:  d.PartUUID,
+                    PartUUID:  pUuid,
                     FsUUID:    d.UUID,
                     PartMinor: minor,
                     FSType:    d.FSType,
@@ -199,7 +206,7 @@ func ExtractKernelAndInitrdFromBootPartition(sb *ImageSB) error {
 		}
 	}()
 
-	partDev, err := resolveBootPartitionDevice(sb.YamlObject)
+	partDev, err := resolveBootPartitionDevice(sb.YamlObject, nbdDev)
 	if err != nil {
 		return err
 	}
@@ -236,8 +243,16 @@ func ExtractKernelAndInitrdFromBootPartition(sb *ImageSB) error {
 	return nil
 }
 
-func resolveBootPartitionDevice(img *mkimagepb.ImageYAML) (string, error) {
+// resolveBootPartitionDevice attempts to resolve the partition device.
+// For partitionless block devices, it returns the raw NBD device itself.
+func resolveBootPartitionDevice(img *mkimagepb.ImageYAML, nbdDev string) (string, error) {
 	if img.BootfsPartUuid != "" {
+		// If it's a partitionless disk, the BootfsPartUuid was set to the filesystem UUID.
+		// In an NBD context, udev rules for UUID mapping are notoriously flaky and slow. 
+		// Since we only have one partition right now anyway, if it matches the fs_uuid, just return the raw dev.
+		if img.BootfsPartUuid == img.BootfsUuid {
+			return nbdDev, nil
+		}
 		return "/dev/disk/by-partuuid/" + img.BootfsPartUuid, nil
 	}
 	return "", fmt.Errorf("bootfs info missing")
@@ -286,6 +301,11 @@ func attachNBD(ctx context.Context, log *sst.Logx, image string) (string, error)
 	partitionDetected := false
 
 	for i := 0; i < 20; i++ {
+		// Also accept the raw device itself if it has a filesystem (partitionless)
+		if out, err := sst.ExecShell(ctx, log, "blkid", dev); err == nil && len(out.Stdout) > 0 {
+			partitionDetected = true
+			break
+		}
 		if _, err := os.Stat(dev + "p1"); err == nil {
 			partitionDetected = true
 			break
