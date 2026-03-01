@@ -1,4 +1,3 @@
-//go:build darwin 
 package main
 
 /*
@@ -72,7 +71,7 @@ type CrosvmApp struct {
 	CPUCount        int
 	MemorySize      uint64
 	MemorySuffix    string
-	Blocks          []string // Added for new --block flag
+	Blocks          []string
 	RwDiskPaths     []string // Kept internal for vz_darwin
 	DiskPaths       []string // Kept internal for vz_darwin
 	SharedDirs      []string
@@ -86,8 +85,13 @@ type CrosvmApp struct {
 	NestedVirt      bool
 	CdromPaths      []string
 	Balloon         bool
+	
+	// Internal inferred state
 	Bootloader      string
 	EfiVars         string
+
+	// Ignored upstream flags (prevent wrapper crash if runctl sends them)
+	dummyBios       string
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -113,9 +117,11 @@ func runWorker() {
 		Use:   "run",
 		Short: "macOS VMM (crosvm-aligned flags)",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			// Extract positional kernel argument if present
 			if len(args) > 0 && app.Kernel == "" {
 				app.Kernel = args[0]
 			}
+			
 			app.ctx, app.cancel = context.WithCancel(context.Background())
 			app.steps = sst.StepsInit("crosvm")
 			app.steps.StepsAdd("validate", app.stepValidate)
@@ -145,17 +151,17 @@ func runWorker() {
 	f.IntVar(&app.CPUCount, "cpus", 1, "CPU count")
 	f.Uint64Var(&app.MemorySize, "mem", 512, "Memory size (MiB)")
 	
-	// NEW: Replaced rwdisk and disk with block
 	f.StringSliceVar(&app.Blocks, "block", []string{}, "Block devices (path=...,ro=...)")
-	
 	f.StringSliceVar(&app.Networks, "net", []string{"nat"}, "Network config")
 	f.StringSliceVar(&app.SharedDirs, "shared-dir", []string{}, "Shared directories")
 	
 	f.BoolVar(&app.NestedVirt, "nested-virt", false, "Enable nested virtualization")
 	f.StringSliceVar(&app.CdromPaths, "cdrom", []string{}, "CD-ROMs")
 	f.BoolVar(&app.Balloon, "balloon", true, "Enable memory ballooning")
-	f.StringVar(&app.Bootloader, "bootloader", "linux", "Bootloader (linux|efi)")
-	f.StringVar(&app.EfiVars, "efi-vars", "", "Path to EFI variables")
+	
+	// FIX: Align EFI flags with upstream crosvm
+	f.StringVar(&app.EfiVars, "pflash", "", "Path to EFI variables (upstream pflash equivalent)")
+	f.StringVar(&app.dummyBios, "bios", "", "BIOS/UEFI payload (ignored on macOS, VZ provides its own)")
 
 	f.StringVar(&app.Initrd, "initrd", "", "Initrd path")
 	f.StringVar(&app.Params, "params", "", "Cmdline")
@@ -171,6 +177,17 @@ func runWorker() {
 
 func (a *CrosvmApp) stepValidate(ctx *sst.StepsContext, s sst.StepState) error {
 	a.MemorySize = a.MemorySize * 1024 * 1024
+
+	// FIX: Auto-detect bootloader type based on kernel arg presence.
+	// This perfectly matches upstream behavior without needing a custom --bootloader flag.
+	if a.Kernel == "" {
+		a.Bootloader = "efi"
+		if a.EfiVars == "" {
+			a.EfiVars = "efi-vars.fd" // Safe default
+		}
+	} else {
+		a.Bootloader = "linux"
+	}
 
 	// Translate standard crosvm --block flag back into legacy slices for macOS Virtualization
 	for _, blk := range a.Blocks {

@@ -18,10 +18,9 @@ import (
 )
 
 // ImageSB is the state bag for image operations.
-// It is defined here so it can be passed to rtsst functions.
 type ImageSB struct {
 	Ctx           context.Context
-	Log           sst.Logx
+	Log           *sst.Logx // FIX: Use pointer to avoid copying Mutex
 	YamlObject    *mkimagepb.ImageYAML
 	SstRuntimeDir string
 }
@@ -32,28 +31,26 @@ func AnalyseImg(sb *ImageSB) error {
 
 	sb.Log.Info(sb.Ctx, "Attaching image to NBD for analysis", "image", rawImage)
 
-	nbdDev, err := attachNBD(sb.Ctx, &sb.Log, rawImage)
+	// FIX: sb.Log is now a pointer, pass it directly
+	nbdDev, err := attachNBD(sb.Ctx, sb.Log, rawImage)
 	if err != nil {
 		return fmt.Errorf("failed to attach nbd device: %w", err)
 	}
 	// Ensure we detach even if analysis fails
 	defer func() {
-		if err := detachNBD(sb.Ctx, &sb.Log, nbdDev); err != nil {
+		if err := detachNBD(sb.Ctx, sb.Log, nbdDev); err != nil {
 			sb.Log.Warn(sb.Ctx, "Failed to detach NBD device", "device", nbdDev, "error", err)
 		}
 	}()
 
 	sb.Log.Info(sb.Ctx, "Scanning partitions with lsblk", "device", nbdDev)
-	res, err := sst.ExecShell(sb.Ctx, &sb.Log, "lsblk", "-J", "-b", "-o", "NAME,START,SIZE,FSTYPE,PARTUUID,TYPE,MAJ:MIN,UUID", nbdDev)
+	res, err := sst.ExecShell(sb.Ctx, sb.Log, "lsblk", "-J", "-b", "-o", "NAME,START,SIZE,FSTYPE,PARTUUID,TYPE,MAJ:MIN,UUID", nbdDev)
 	if err != nil {
 		return fmt.Errorf("lsblk execution failed: %w", err)
 	}
 
-	// --- DEBUG INSTRUMENTATION START ---
 	sb.Log.Info(sb.Ctx, "lsblk raw output", "json", res.Stdout)
-	// --- DEBUG INSTRUMENTATION END ---
 
-	// 3. Parse JSON Output
 	type BlockDevice struct {
 		Name       string        `json:"name"`
 		Start      uint64        `json:"start"`	
@@ -74,7 +71,6 @@ func AnalyseImg(sb *ImageSB) error {
 		return fmt.Errorf("failed to parse lsblk json: %w", err)
 	}
 
-	// 4. Collect Candidates
 	type candidate struct {
 		Name      string
 		Start     uint64
@@ -83,7 +79,6 @@ func AnalyseImg(sb *ImageSB) error {
 		FsUUID    string
 		PartMinor string
 		FSType    string
-		Type      string
 	}
 	var candidates []candidate
     var maxStart uint64
@@ -92,15 +87,13 @@ func AnalyseImg(sb *ImageSB) error {
 
     findCandidates = func(devs []BlockDevice) {
         for _, d := range devs {
-            // 1. Check if THIS device is a candidate (Support pure disk or partitioned disk)
-            if (d.Type == "part" || d.Type == "disk") && (d.FSType == "ext4" || d.FSType == "xfs" || d.FSType == "ext2") {
-                minor := ""
-                if d.Type == "part" {
-					parts := strings.Split(d.MajorMinor, ":")
-					if len(parts) >= 2 {
-						minor = parts[1]
-					}
-				}
+            if d.Type == "part" && (d.FSType == "ext4" || d.FSType == "xfs") {
+                parts := strings.Split(d.MajorMinor, ":")
+                if len(parts) < 2 {
+                    sb.Log.Warn(sb.Ctx, "Skipping partition with invalid maj:min", "name", d.Name)
+                    continue
+                }
+                minor := parts[1]
 
                 c := candidate{
                     Name:      d.Name,
@@ -110,20 +103,13 @@ func AnalyseImg(sb *ImageSB) error {
                     FsUUID:    d.UUID,
                     PartMinor: minor,
                     FSType:    d.FSType,
-					Type:      d.Type,
                 }
 				if c.Start > maxStart {
 					maxStart = c.Start
 				}
                 candidates = append(candidates, c)
-                sb.Log.Info(sb.Ctx, "Found candidate partition",
-                    "name", c.Name,
-					"fstype", c.FSType,
-					"type", c.Type,
-                )
+                sb.Log.Info(sb.Ctx, "Found candidate partition", "name", c.Name, "fstype", c.FSType)
             }
-
-            // 2. RECURSE UNCONDITIONALLY
             if len(d.Children) > 0 {
                 findCandidates(d.Children)
             }
@@ -133,10 +119,9 @@ func AnalyseImg(sb *ImageSB) error {
 	findCandidates(output.BlockDevices)
 
 	if len(candidates) == 0 {
-		return fmt.Errorf("heuristic failed: no ext2/ext4/xfs filesystems found in %s", rawImage)
+		return fmt.Errorf("heuristic failed: no ext4 or xfs partitions found in %s", rawImage)
 	}
 
-	// 5. Apply Heuristics
 	sort.Slice(candidates, func(i, j int) bool {
 		return candidates[i].Size > candidates[j].Size
 	})
@@ -144,26 +129,20 @@ func AnalyseImg(sb *ImageSB) error {
 	rootPart := candidates[0]
 	sb.YamlObject.RootfsPartUuid = rootPart.PartUUID
 	sb.YamlObject.RootfsUuid = rootPart.FsUUID
-	if rootPart.Type == "part" && rootPart.PartMinor != "" {
-		sb.YamlObject.RootfsDevice = "/dev/vda" + rootPart.PartMinor
-	} else {
-		sb.YamlObject.RootfsDevice = "/dev/vda" // Raw unpartitioned disk
-	}
+	sb.YamlObject.RootfsDevice = "/dev/vda" + rootPart.PartMinor
 	sb.YamlObject.RootfsType = rootPart.FSType
 	sb.YamlObject.RootfsSize = fmt.Sprintf("%d%s", rootPart.Size, "B")
-	
 	if rootPart.Start == maxStart {
-		sb.Log.Info(sb.Ctx, "Rootfs is the last block device layout", "start", rootPart.Start)
+		sb.Log.Info(sb.Ctx, "Rootfs is the largest partition", "start", rootPart.Start)
 		sb.YamlObject.RootfsIsLast = true
 	} else {
-		sb.Log.Info(sb.Ctx, "Rootfs is not the last block device layout", "start", rootPart.Start)
+		sb.Log.Info(sb.Ctx, "Rootfs is not the largest partition", "start", rootPart.Start)
 		sb.YamlObject.RootfsIsLast = false
 	}
-	
 	sb.Log.Info(sb.Ctx, "Identified Rootfs (Largest)",
 		"part_uuid", sb.YamlObject.RootfsPartUuid,
 		"fs_uuid", sb.YamlObject.RootfsUuid,
-		"rootfs_device", sb.YamlObject.RootfsDevice,
+		"rootfs_device", "/dev/vda"+sb.YamlObject.RootfsDevice,
 		"fstype", sb.YamlObject.RootfsType,
 		"size_bytes", rootPart.Size,
 	)
@@ -172,11 +151,7 @@ func AnalyseImg(sb *ImageSB) error {
 		bootPart := candidates[len(candidates)-1]
 		sb.YamlObject.BootfsPartUuid = bootPart.PartUUID
 		sb.YamlObject.BootfsType = bootPart.FSType
-		if bootPart.Type == "part" && bootPart.PartMinor != "" {
-			sb.YamlObject.BootfsDevice = "/dev/vda" + bootPart.PartMinor
-		} else {
-			sb.YamlObject.BootfsDevice = "/dev/vda"
-		}
+		sb.YamlObject.BootfsDevice = "/dev/vda" + bootPart.PartMinor
 		sb.YamlObject.BootfsUuid = bootPart.FsUUID
 		sb.Log.Info(sb.Ctx, "Identified Bootfs (Smallest)",
 			"part_uuid", sb.YamlObject.BootfsPartUuid,
@@ -189,28 +164,28 @@ func AnalyseImg(sb *ImageSB) error {
 		sb.YamlObject.BootfsPartUuid = rootPart.PartUUID
 		sb.YamlObject.BootfsType = rootPart.FSType
 		sb.YamlObject.BootfsUuid = rootPart.FsUUID
-		sb.YamlObject.BootfsDevice = sb.YamlObject.RootfsDevice
-		sb.Log.Info(sb.Ctx, "Only one Linux block device found; assuming /boot is part of rootfs",
+		sb.YamlObject.BootfsDevice = "/dev/vda" + rootPart.PartMinor
+		sb.Log.Info(sb.Ctx, "Only one Linux partition found; assuming /boot is part of rootfs",
 			"bootfs_uuid", sb.YamlObject.BootfsPartUuid)
 	}
 
 	return nil
 }
 
-// ExtractKernelAndInitrdFromBootPartition extracts boot artifacts.
 func ExtractKernelAndInitrdFromBootPartition(sb *ImageSB) error {
-	// Reconstruct the full path to the raw image file
 	rawImage := filepath.Join(sb.SstRuntimeDir, "images", sb.YamlObject.Name, sb.YamlObject.RawImage)
 	bootfsPartUuid := sb.YamlObject.BootfsPartUuid
 
-	// If no PartUUID exists (because it's a raw disk), we fall back to mounting the raw device directly
+	if bootfsPartUuid == "" {
+		return fmt.Errorf("bootfs_part_uuid is empty; run AnalyseImg first")
+	}
+
 	sb.Log.Info(sb.Ctx, "kernel.extract.start",
 		"image", rawImage,
 		"bootfs_part_uuid", bootfsPartUuid,
 	)
 
-	// 1. Attach NBD
-	nbdDev, err := attachNBD(sb.Ctx, &sb.Log, rawImage)
+	nbdDev, err := attachNBD(sb.Ctx, sb.Log, rawImage)
 	if err != nil {
 		sb.Log.Diagnose(sb.Ctx, "NBD_ATTACH_FAILED", "failed to attach disk image",
 			"image", rawImage,
@@ -218,15 +193,13 @@ func ExtractKernelAndInitrdFromBootPartition(sb *ImageSB) error {
 		)
 		return err
 	}
-	// Always detach NBD at end of function
 	defer func() {
-		if err := detachNBD(sb.Ctx, &sb.Log, nbdDev); err != nil {
+		if err := detachNBD(sb.Ctx, sb.Log, nbdDev); err != nil {
 			sb.Log.Warn(sb.Ctx, "Failed to detach NBD device", "device", nbdDev, "error", err)
 		}
 	}()
 
-	// 2. Resolve Partition Device
-	partDev, err := resolveBootPartitionDevice(sb.YamlObject, nbdDev)
+	partDev, err := resolveBootPartitionDevice(sb.YamlObject)
 	if err != nil {
 		return err
 	}
@@ -235,20 +208,17 @@ func ExtractKernelAndInitrdFromBootPartition(sb *ImageSB) error {
 		return fmt.Errorf("boot partition device not found: %s", partDev)
 	}
 
-	// 3. Mount
-	mnt, err := mountPartition(sb.Ctx, &sb.Log, partDev)
+	mnt, err := mountPartition(sb.Ctx, sb.Log, partDev)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = unmountPartition(sb.Ctx, &sb.Log, mnt) }()
+	defer func() { _ = unmountPartition(sb.Ctx, sb.Log, mnt) }()
 
-	// 4. Scan & Copy
 	kernelPath, initrdPath, ok := scanPartitionForArtifacts(mnt)
 	if !ok {
 		return fmt.Errorf("kernel/initrd not found on boot partition %s", partDev)
 	}
 
-	// Destination: ~/.runtimes/images/<name>/
 	destDir := filepath.Join(sb.SstRuntimeDir, "images", sb.YamlObject.Name)
 	kernelName, initrdName, err := copyArtifacts(kernelPath, initrdPath, destDir)
 	if err != nil {
@@ -260,21 +230,17 @@ func ExtractKernelAndInitrdFromBootPartition(sb *ImageSB) error {
 		"initrd", initrdName,
 	)
 
-	// Update the SB object
 	sb.YamlObject.Kernel = kernelName
 	sb.YamlObject.Initrd = initrdName
 
 	return nil
 }
 
-// resolveBootPartitionDevice determines the device path.
-// It prioritizes the PartUUID found during analysis, falling back to the raw nbd device for pure disks.
-func resolveBootPartitionDevice(img *mkimagepb.ImageYAML, nbdDev string) (string, error) {
+func resolveBootPartitionDevice(img *mkimagepb.ImageYAML) (string, error) {
 	if img.BootfsPartUuid != "" {
 		return "/dev/disk/by-partuuid/" + img.BootfsPartUuid, nil
 	}
-	// If there's no PartUUID, it's likely a raw unpartitioned filesystem mapped directly to the NBD root
-	return nbdDev, nil
+	return "", fmt.Errorf("bootfs info missing")
 }
 
 func ParseMemorySizeMiB(sizeStr, suffix string) (uint64, error) {
@@ -289,10 +255,8 @@ func ParseMemorySizeMiB(sizeStr, suffix string) (uint64, error) {
 
 	switch strings.ToLower(suffix) {
 	case "", "mib":
-		// already MiB
 		return size, nil
 	case "mb":
-		// decimal MB → MiB
 		return size * 1000 / 1024, nil
 	case "gib":
 		return size * 1024, nil
@@ -307,32 +271,21 @@ func ParseMemorySizeMiB(sizeStr, suffix string) (uint64, error) {
 	}
 }
 
-// ============================================================================
-// Low-level helpers (updated to accept *sst.Logx)
-// ============================================================================
 func attachNBD(ctx context.Context, log *sst.Logx, image string) (string, error) {
-	// Dereference *log for ExecShell compatibility
 	_, _ = sst.ExecShell(ctx, log, "modprobe", "nbd", "max_part=16")
 	_, _ = sst.ExecShell(ctx, log, "qemu-nbd", "-d", "/dev/nbd0")
 
-	// Connect to /dev/nbd0
 	if _, err := sst.ExecShell(ctx, log,
 		"qemu-nbd", "-f", "raw", "--connect=/dev/nbd0", image); err != nil {
 		return "", err
 	}
 
-	// Force kernel to re-read partition table.
-	// We use blockdev because it is standard in util-linux.
 	_, _ = sst.ExecShell(ctx, log, "blockdev", "--rereadpt", "/dev/nbd0")
 
-	// POLLING LOOP: Wait up to 5s for partitions to appear.
-	// This solves the race condition where lsblk runs before
-	// the kernel/udev has populated the partition nodes.
 	dev := "/dev/nbd0"
 	partitionDetected := false
 
 	for i := 0; i < 20; i++ {
-		// Check for p1 (standard) or p15 (common on cloud images like Ubuntu)
 		if _, err := os.Stat(dev + "p1"); err == nil {
 			partitionDetected = true
 			break
@@ -341,28 +294,21 @@ func attachNBD(ctx context.Context, log *sst.Logx, image string) (string, error)
 			partitionDetected = true
 			break
 		}
-
-		// Fallback: Check sysfs (sometimes updates faster than /dev)
 		if _, err := os.Stat("/sys/block/nbd0/nbd0p1"); err == nil {
 			partitionDetected = true
 			break
 		}
-
-		// Wait 250ms
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
 		case <-time.After(250 * time.Millisecond):
-			// retry
 		}
 	}
 
 	if !partitionDetected {
-		// Warn but don't error; let the caller fail at lsblk if it really is empty.
 		log.Warn(ctx, "attachNBD: timed out waiting for partitions to appear", "device", dev)
 	}
 
-	// Final settle to ensure nodes are stable for mount
 	_, _ = sst.ExecShell(ctx, log, "udevadm", "settle")
 	return dev, nil
 }
@@ -425,12 +371,8 @@ func scanPartitionForArtifacts(mnt string) (string, string, bool) {
 				continue
 			}
 
-			name := strings.ToLower(f.Name()) // case-insensitive check
+			name := strings.ToLower(f.Name())
 
-			// KERNEL HEURISTICS
-			// 1. vmlinu* (standard Linux)
-			// 2. image (ARM64 standard)
-			// 3. kernel (generic)
 			isKernelName := strings.HasPrefix(name, "vmlinu") ||
 				strings.HasPrefix(name, "image") ||
 				strings.HasPrefix(name, "kernel")
@@ -439,9 +381,6 @@ func scanPartitionForArtifacts(mnt string) (string, string, bool) {
 				kernelPath = real
 			}
 
-			// INITRD HEURISTICS
-			// 1. initrd*
-			// 2. initramfs*
 			isInitrdName := strings.HasPrefix(name, "initrd") ||
 				strings.HasPrefix(name, "initramfs")
 
@@ -450,7 +389,6 @@ func scanPartitionForArtifacts(mnt string) (string, string, bool) {
 			}
 		}
 
-		// Stop if we found both in this directory
 		if kernelPath != "" && initrdPath != "" {
 			return kernelPath, initrdPath, true
 		}
@@ -487,7 +425,6 @@ func copyArtifacts(srcKernel, srcInitrd, destDir string) (string, string, error)
 	return kernelName, initrdName, nil
 }
 
-// IsQcow2 checks if the file at path is a QCOW2 image by reading the first 4 magic bytes.
 func IsQcow2(path string) (bool, error) {
 	f, err := os.Open(path)
 	if err != nil {

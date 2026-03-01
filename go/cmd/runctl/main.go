@@ -128,7 +128,14 @@ func (r *Runctl) Start(name string) error {
 		if len(inst.Params) > 0 {
 			args = append(args, "--params", strings.Join(inst.Params, " "))
 		}
+		// Positional kernel argument at the very end
 		args = append(args, inst.Kernel)
+	} else if inst.Bootloader == "efi" {
+		// FIX: Use upstream crosvm's --pflash argument to pass the UEFI variable store.
+		// The macOS wrapper now natively intercepts this.
+		if inst.EfiVars != "" {
+			args = append(args, "--pflash", inst.EfiVars)
+		}
 	}
 
 	// --- SHIM FOR PROCESS VISIBILITY ---

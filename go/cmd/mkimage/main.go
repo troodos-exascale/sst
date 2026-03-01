@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"os"
 	"os/user"
-    "time"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -42,7 +42,6 @@ func main() {
 }
 
 func init() {
-	// FIX: Leave default empty so we can dynamically resolve SST_RUNTIMEDIR at runtime
 	rootCmd.PersistentFlags().StringVarP(&flagRoot, "dir", "d", "", "Runtime root directory (default: $SST_RUNTIMEDIR or ~/.runtimes)")
 	rootCmd.PersistentFlags().BoolVarP(&flagVerbose, "verbose", "v", false, "Verbose logging")
 	rootCmd.PersistentFlags().BoolVarP(&flagForce, "force", "f", false, "Overwrite existing image directory")
@@ -117,10 +116,10 @@ func runPullVMSteps(app *pullVMApp) error {
 
 func pullVMSetupEnv(app *pullVMApp) error {
 	app.sb.Ctx = context.Background()
-	app.sb.Log = *sst.LogxRoot().Subsystem("mkimage.pullvm")
+	// FIX: app.sb.Log is now a pointer directly returned by Subsystem()
+	app.sb.Log = sst.LogxRoot().Subsystem("mkimage.pullvm")
 	app.sb.YamlObject = &mkimagepb.ImageYAML{}
 
-	// FIX: Use the centralized RuntimeDir resolver
 	if flagRoot != "" {
 		app.sb.SstRuntimeDir = flagRoot
 	} else {
@@ -160,7 +159,8 @@ func pullVMConvert(app *pullVMApp) error {
 
 	if isQcow {
 		app.sb.Log.Info(app.sb.Ctx, "image.convert", "from", app.srcImage, "to", rawImagePath, "format", "raw", "detected_type", "qcow2")
-		if _, err := sst.ExecShell(app.sb.Ctx, &app.sb.Log, "qemu-img", "convert", "-O", "raw", app.srcImage, rawImagePath); err != nil {
+		// FIX: app.sb.Log is passed directly as it's already a pointer
+		if _, err := sst.ExecShell(app.sb.Ctx, app.sb.Log, "qemu-img", "convert", "-O", "raw", app.srcImage, rawImagePath); err != nil {
 			return fmt.Errorf("failed to convert qcow2 to raw: %w", err)
 		}
 	} else {
@@ -188,7 +188,8 @@ func pullVMAnalyse(app *pullVMApp) error {
 
 func pullVMEnlargeRoot(app *pullVMApp) error {
 	ctx := app.sb.Ctx
-	logx := &app.sb.Log
+	// FIX: Use pointer directly
+	logx := app.sb.Log
 	imagePath := filepath.Join(app.imageDir, app.rawImageFile)
 	targetSize := int64(10737418240)
 	
@@ -257,7 +258,8 @@ func pullVMSave(app *pullVMApp) error {
 		Kind:   "Image",
 		Msg:    app.sb.YamlObject,
 	}
-	if diags := yo.Save(app.sb.Ctx, &app.sb.Log); diags != nil { return diags }
+	// FIX: Use pointer directly
+	if diags := yo.Save(app.sb.Ctx, app.sb.Log); diags != nil { return diags }
 	if flagVerbose { app.sb.Log.Info(app.sb.Ctx, "image.created", "name", app.sb.YamlObject.Name, "dir", app.imageDir) }
 	return nil
 }
@@ -320,7 +322,6 @@ func createInstance(image, name string) error {
 		Msg:    instanceYaml,
 	}
 
-	// Copy base image
 	src := filepath.Join(imageDir, imageYaml.RawImage)
 	dst := filepath.Join(instDir, imageYaml.RawImage)
 	
@@ -346,7 +347,11 @@ func createInstance(image, name string) error {
 	u, err := user.Current()
 	if err != nil { return err }
 
-	size := int64(30) * 1024 * 1024 * 1024 
+	size, err := rtsst.ParseSize(flagSize)
+	if err != nil {
+		return fmt.Errorf("invalid size %q: %w", flagSize, err)
+	}
+
 	f, err := os.Create(filepath.Join(instDir, "data.img"))
 	if err != nil { return err }
 	defer f.Close()

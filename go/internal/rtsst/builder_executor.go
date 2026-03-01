@@ -139,7 +139,6 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		return err
 	}
 
-	// 1. ALWAYS create the deterministic ext2 image (raw) as the foundation
 	rawImagePath := filepath.Join(b.ImageOutput, b.Name+".raw")
 	b.Log.Info(ctx, "creating deterministic ext2 foundation", "path", rawImagePath)
 
@@ -168,7 +167,7 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 
 	sb := &ImageSB{
 		Ctx: ctx,
-		Log: *b.Log,
+		Log: b.Log, // FIX: Pass pointer directly, do not dereference
 		YamlObject: &mkimagepb.ImageYAML{
 			Name:     b.Name,
 			RawImage: b.Name + ".raw",
@@ -181,13 +180,11 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		_ = ExtractKernelAndInitrdFromBootPartition(sb)
 	}
 
-	// 2. Process specific EMIT targets
 	for _, emit := range b.Emits {
 		b.Log.Info(ctx, "processing EMIT directive", "format", emit)
 
 		switch emit {
 		case "raw":
-			// Handled by foundation step.
 		case "qcow2":
 			qcowPath := filepath.Join(b.ImageOutput, b.Name+".qcow2")
 			if _, err := sst.ExecShell(ctx, b.Log, "qemu-img", "convert", "-f", "raw", "-O", "qcow2", rawImagePath, qcowPath); err != nil {
@@ -226,13 +223,11 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 				}
 			}
 
-			// Hash the layer tarball to generate the config diff_ids
 			layerHash, err := SHA256File(layerTar)
 			if err != nil {
 				return fmt.Errorf("failed to hash layer.tar: %w", err)
 			}
 
-			// Generate a minimal, deterministic Docker v2 config
 			configContent := fmt.Sprintf(`{
   "architecture": "%s",
   "os": "linux",
@@ -255,7 +250,6 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 				return err
 			}
 
-			// Generate the manifest linking the config and layer
 			manifestContent := fmt.Sprintf(`[
   {
     "Config": "%s",
@@ -268,7 +262,6 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 				return err
 			}
 
-			// Tar up the layout to create the final Docker-compatible archive
 			tarReq2 := sst.ExecRequest{
 				Cmd: "tar",
 				Args: []string{
