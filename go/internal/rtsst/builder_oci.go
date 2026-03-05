@@ -24,8 +24,13 @@ func (b *BuildApp) ResolveOCIPaths() error {
 	return os.MkdirAll(b.OCIStaging, 0755)
 }
 
-// ... (FetchOCI, VerifyWithPodman, UnpackOCI remain the same, they use b.OCIStaging and b.RootDir) ...
 func (b *BuildApp) FetchOCI(ctx context.Context) error {
+	// Bypass Skopeo for scratch builds
+	if b.BaseImage == "scratch" {
+		b.Log.Info(ctx, "base image is 'scratch', skipping OCI fetch")
+		return nil
+	}
+
 	indexFile := filepath.Join(b.OCIStaging, "index.json")
 	if _, err := os.Stat(indexFile); err == nil {
 		b.Log.Info(ctx, "base image already exists in cache, skipping pull", "file", indexFile)
@@ -50,8 +55,16 @@ func (b *BuildApp) VerifyWithPodman(ctx context.Context) error {
 func (b *BuildApp) UnpackOCI(ctx context.Context) error {
 	b.Log.Info(ctx, "unpacking and flattening OCI layers", "target", b.RootDir)
 	
+	// Nuke the build directory to guarantee a clean slate for every build.
+	_ = os.RemoveAll(b.RootDir)
+
 	if err := os.MkdirAll(b.RootDir, 0755); err != nil {
 		return err
+	}
+
+	// Return early if scratch, leaving the ROOTFS directory completely empty
+	if b.BaseImage == "scratch" {
+		return nil
 	}
 
 	indexPath := filepath.Join(b.OCIStaging, "index.json")

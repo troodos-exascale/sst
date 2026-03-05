@@ -176,8 +176,6 @@ func GetLocalPublicKey() (string, error) {
 		}
 	}
 
-	// FIX: Do not throw a fatal error if the user has no SSH keys.
-	// Return empty string so cloud-init generation gracefully skips the SSH section.
 	return "", nil
 }
 
@@ -234,13 +232,10 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 	sb.WriteString("# syntax=yaml\n\n")
 
 	fmt.Fprintf(&sb, "hostname: %s\n", inst.Hostname)
+	fmt.Fprintf(&sb, "local-hostname: %s\n", inst.Hostname)
 	sb.WriteString("lock_passwd: false\n")
 	sb.WriteString("ssh_pwauth: false\n")
 	sb.WriteString("disable_root: true\n\n")
-
-	sb.WriteString("bootcmd:\n")
-	sb.WriteString("  - [ cloud-init-per, once, move-gpt-header, sgdisk, -e, /dev/vda ]\n")
-	sb.WriteString("  - [ cloud-init-per, once, reread-pt, partprobe ]\n")
 
 	sb.WriteString("\nusers:\n")
 	sb.WriteString("  - default\n")
@@ -248,7 +243,6 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 	if user.Name != "" {
 		fmt.Fprintf(&sb, "    gecos: %s\n", user.Name)
 	}
-	sb.WriteString("    sudo: ALL=(ALL) NOPASSWD:ALL\n")
 	sb.WriteString("    shell: /bin/bash\n")
 	if pubKey != "" {
 		sb.WriteString("    ssh_authorized_keys:\n")
@@ -260,36 +254,37 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 	fmt.Fprintf(&sb, "    %s:abcd1234\n", user.Username)
 	sb.WriteString("  expire: False\n")
 
-	if len(mounts) > 0 {
-		sb.WriteString("\n# Mount virtiofs shares\n")
-		sb.WriteString("mounts:\n")
-		for _, m := range mounts {
-			fmt.Fprintf(
-				&sb,
-				"  - [ \"%s\", \"%s\", \"virtiofs\", \"%s\", \"0\", \"0\" ]\n",
-				m.tag,
-				m.guestPath,
-				m.options,
-			)
-		}
-	}
-
 	sb.WriteString("\nruncmd:\n")
-
 	sb.WriteString("  - |\n")
+	
+	// Inject user shell, passwordless sudo, and hostname cleanly
 	sb.WriteString(fmt.Sprintf(`    if [ -f /etc/alpine-release ]; then
       mkdir -p /etc/conf.d
       echo 'TTY="hvc0"' > /etc/conf.d/ttyAMA0
       sed -i 's/^ttyAMA0/#ttyAMA0/' /etc/inittab
-      apk add --no-cache sudo bash shadow
-      usermod -s /bin/bash %s
+      
+      # Ensure shell is set
+      if id "%s" >/dev/null 2>&1; then
+          usermod -s /bin/bash %s
+      fi
+      
+      # Explicit passwordless sudo configuration
+      mkdir -p /etc/sudoers.d
+      echo "%s ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/%s
+      chmod 0440 /etc/sudoers.d/%s
+      
+      # Force Hostname
+      hostname %s
+      echo "%s" > /etc/hostname
+      
       kill -HUP 1
     fi
-`, user.Username))
+`, user.Username, user.Username, user.Username, user.Username, user.Username, inst.Hostname, inst.Hostname))
 
 	for _, m := range mounts {
 		sb.WriteString("  - |\n")
 		fmt.Fprintf(&sb, "    mkdir -p %s\n", m.guestPath)
+		fmt.Fprintf(&sb, "    mount -t virtiofs %s %s -o %s\n", m.tag, m.guestPath, m.options)
 	}
 
 	userData := sb.String()
@@ -381,7 +376,7 @@ func EnsureCIDataISO(ctx context.Context, log *sst.Logx, instDir string) error {
 	log.Info(ctx, "Updated instance-id", "instance_id", instanceID)
 
 	_ = os.Remove(isoPath)
-    if err := UpdateCIDATAISO(instDir); err != nil {
+	if err := UpdateCIDATAISO(instDir); err != nil {
 		log.Error(ctx, "hdiutil/geniso makehybrid failed", "output")
 		return fmt.Errorf("Update cidata.iso: %w", err)
 	}
@@ -394,7 +389,6 @@ func UpdateCIDATAISO(instDir string) error {
 	iso := filepath.Join(instDir, "cidata.iso")
 	src := filepath.Join(instDir, "cidata")
 
-	// Try macOS tool first
 	if _, err := exec.LookPath("hdiutil"); err == nil {
 		cmd := exec.Command(
 			"hdiutil", "makehybrid",
@@ -409,7 +403,6 @@ func UpdateCIDATAISO(instDir string) error {
 		return nil
 	}
 
-	// Fallback to Linux tool
 	if _, err := exec.LookPath("genisoimage"); err == nil {
 		cmd := exec.Command(
 			"genisoimage",
