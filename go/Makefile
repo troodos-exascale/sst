@@ -1,39 +1,33 @@
 .DEFAULT_GOAL := build
 
-# Default list of binaries
-BINS := mkimage runctl sst hetzner-plugin
+# 1. Update BINS to use mkimg
+BINS := mkimg runctl sst hetzner-plugin
 ARCH := $(shell go env GOARCH)
 OS := $(shell go env GOOS)
 ENTITLEMENTS := cmd/crosvm/crosvm.entitlements
 
 .PHONY: build install clean generate tidy download vet test
 
-# 1. First: Download all known dependencies without validating imports
 download:
 	@echo "--> Downloading Go modules..."
 	go mod download
 
-# 2. Second: Generate the .pb.go files (now imports in code will be valid)
 generate: download
 	@echo "--> Generating protobuf code..."
 	go generate ./...
 
-# 3. Third: Finalize go.mod now that generated code exists on disk
 tidy: generate
 	@echo "--> Tidying Go modules..."
 	go mod tidy
 
-# 4. Vet: Examine Go source code and report suspicious constructs
 vet: tidy
 	@echo "--> Vetting Go code..."
 	go vet ./...
 
-# 5. Test: Run unit tests across the module
 test: tidy
 	@echo "--> Running tests..."
 	go test -v ./...
 
-# 6. Final: Build the binaries using the validated module graph
 build: tidy
 	@set -e; \
 	for b in $(BINS); do \
@@ -61,6 +55,12 @@ install: build
 	done
 	@if [ "${OS}" = "darwin" ]; then \
 		sudo install -m 755 build/darwin/${ARCH}/crosvm /usr/local/bin/crosvm ; \
+	fi
+	@# 2. Install Templates System-Wide
+	@if [ -d "templates" ]; then \
+		echo "--> Installing templates to /usr/local/share/mkimg/templates..."; \
+		sudo mkdir -p /usr/local/share/mkimg/templates; \
+		sudo cp -r templates/* /usr/local/share/mkimg/templates/ || true; \
 	fi
 
 clean:

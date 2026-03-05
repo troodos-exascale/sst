@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -12,18 +13,22 @@ import (
 )
 
 func TestOCIWorkflowWithPodman(t *testing.T) {
+	// Skip this test entirely if we are on macOS
+	if runtime.GOOS != "linux" {
+		t.Skip("skipping OCI fetch/verify test; requires a native Linux environment")
+	}
+
 	_, found := os.LookupEnv("PATH")
 	if !found {
 		t.Skip("PATH not found in environment")
 	}
 
 	log := sst.LogxRoot()
-	tmp := t.TempDir() // Use an isolated temp dir for tests
+	tmp := t.TempDir() 
 
-	// FIX: Added the 4th parameter (RuntimeDir) to NewBuilder
 	builder := NewBuilder(log, nil, "Dockerfile.test", tmp)
 	builder.BaseImage = "alpine:latest"
-	builder.Name = "test-vm" // FIX: Replaced VMOUT
+	builder.Name = "test-vm" 
 	
 	err := builder.ResolveOCIPaths()
 	require.NoError(t, err)
@@ -40,6 +45,5 @@ func TestOCIWorkflowWithPodman(t *testing.T) {
 	err = builder.VerifyWithPodman(ctx)
 	assert.NoError(t, err)
 	
-	// Cleanup staging area after test (no longer strictly necessary since tmp is destroyed, but good practice)
 	os.RemoveAll(filepath.Join(tmp, "oci", "alpine:latest"))
 }

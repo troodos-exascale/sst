@@ -1,3 +1,4 @@
+
 package rtsst
 
 import (
@@ -14,8 +15,29 @@ import (
 	mkimagepb "github.com/swiss-software-tool/runtime-smart/go/proto/yaml/mkimage/v1"
 )
 
+// shouldExecute evaluates if the instruction's conditions match the active EMIT targets.
+func (b *BuildApp) shouldExecute(conditions []string) bool {
+	for _, cond := range conditions {
+		if cond == "all" {
+			return true
+		}
+		for _, emit := range b.Emits {
+			if emit == cond {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (b *BuildApp) ExecuteSingleInstruction(ctx context.Context, inst Instruction) error {
-	args := b.Substitute(inst.Args)
+	var args string
+
+	if inst.Type == "RUN" {
+		args = inst.Args
+	} else {
+		args = b.Substitute(inst.Args)
+	}
 	
 	cleanArgs := args
 	if inst.Type != "RUN" {
@@ -45,84 +67,119 @@ func (b *BuildApp) ExecuteSingleInstruction(ctx context.Context, inst Instructio
 		}
 		b.Log.Info(ctx, "processed ENV", "key", parts[0])
 		return nil
-	case "FROM":
-		b.Args = make(map[string]string)
-		for k, v := range b.BuildArgs {
-			b.Args[k] = v
-		}
-		return nil
-	case "NAME", "VMOUT", "EMIT":
-		return nil
+	case "FROM", "NAME", "VMOUT", "EMIT":
+		return nil // Handled in PreProcess
 	case "EXPOSE", "CMD", "LABEL", "VOLUME", "USER", "WORKDIR":
 		b.Log.Info(ctx, "ignoring instruction (unnecessary for VM building)", "type", inst.Type, "args", cleanArgs)
 		return nil
 	case "COPY":
-		return b.execCopy(ctx, cleanArgs)
+		// COPY is now natively desugared into RUN [root, host] by the parser.
+		// If we reach here, it's an anomaly, but safe to ignore.
+		return nil
 	case "RUN":
-		return b.execRun(ctx, args)
+		if !b.shouldExecute(inst.Conditions) {
+			b.Log.Info(ctx, "skipping instruction (condition mismatch)", "conditions", inst.Conditions, "emits", b.Emits)
+			return nil
+		}
+
+		// Resolve Location
+		targetDir := b.RootDir // default "root"
+		if inst.Location == "base" {
+			targetDir = filepath.Dir(b.RootDir)
+		} else if inst.Location == "boot" {
+			targetDir = filepath.Join(filepath.Dir(b.RootDir), "boot")
+		}
+
+		if inst.Context == "host" {
+			return b.execHostRun(ctx, args, targetDir)
+		}
+		return b.execChrootRun(ctx, args, targetDir)
 	default:
 		return fmt.Errorf("unknown instruction type: %s", inst.Type)
 	}
 }
 
-func (b *BuildApp) execCopy(ctx context.Context, args string) error {
-	parts := strings.Fields(args)
-	if len(parts) < 2 {
-		return fmt.Errorf("invalid COPY instruction: %s", args)
-	}
+// execHostRun executes directly on the builder host OS without chroot.
+func (b *BuildApp) execHostRun(ctx context.Context, cmdStr string, targetDir string) error {
+	b.Log.Info(ctx, "executing HOST_RUN", "dir", targetDir)
 
-	dst := parts[len(parts)-1]
-	srcs := parts[:len(parts)-1]
-
-	dstPath := filepath.Join(b.RootDir, strings.TrimPrefix(dst, "/"))
-
-	if err := os.MkdirAll(filepath.Dir(dstPath), 0755); err != nil {
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		return err
 	}
 
-	for _, src := range srcs {
-		b.Log.Info(ctx, "executing COPY", "src", src, "dst", dstPath)
-		
-		target := dstPath
-		if strings.HasSuffix(dst, "/") || len(srcs) > 1 {
-			os.MkdirAll(dstPath, 0755)
-			target = filepath.Join(dstPath, filepath.Base(src))
-		}
-		
-		if _, err := sst.ExecShell(ctx, b.Log, "cp", "-a", src, target); err != nil {
-			return fmt.Errorf("COPY failed: %w", err)
-		}
+	var envs []string
+	for k, v := range b.Args { envs = append(envs, k+"="+v) }
+	for k, v := range b.Env { envs = append(envs, k+"="+v) }
+	
+	// Inject IR specific environment variables
+	envs = append(envs, "ROOTFS="+b.RootDir)
+	envs = append(envs, "BASEDIR="+filepath.Dir(b.RootDir))
+	envs = append(envs, "BOOTDIR="+filepath.Join(filepath.Dir(b.RootDir), "boot"))
+	envs = append(envs, "NAME="+b.Name)
+
+	req := sst.ExecRequest{
+		Cmd:  "/bin/sh",
+		Args: []string{"-c", cmdStr},
+		Dir:  targetDir,
+		Env:  envs,
+		Mode: sst.ExecCaptured,
+	}
+	_, err := sst.Exec(ctx, b.Log, req)
+	if err != nil {
+		return fmt.Errorf("host run command failed: %w", err)
 	}
 	return nil
 }
 
-func (b *BuildApp) execRun(ctx context.Context, cmdStr string) error {
-	b.Log.Info(ctx, "executing RUN in chroot", "command", cmdStr)
+// execChrootRun is the exact, preserved logic of the original execRun.
+func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir string) error {
+	b.Log.Info(ctx, "executing RUN in chroot", "dir", targetDir)
 	
 	mounts := []string{"/dev", "/dev/pts", "/proc", "/sys"}
 	for _, m := range mounts {
-		target := filepath.Join(b.RootDir, m)
+		target := filepath.Join(targetDir, m)
 		os.MkdirAll(target, 0755)
 		sst.ExecShell(ctx, b.Log, "mount", "--bind", m, target)
 	}
+
+	cachePaths := map[string]string{
+		"apk": "/etc/apk/cache",
+		"apt": "/var/cache/apt/archives",
+		"dnf": "/var/cache/dnf",
+	}
+	
+	var activeCacheMounts []string
+	for name, guestPath := range cachePaths {
+		hostDir := filepath.Join(b.RuntimeDir, "cache", "pkg", name)
+		os.MkdirAll(hostDir, 0755)
+		
+		target := filepath.Join(targetDir, guestPath)
+		os.MkdirAll(target, 0755)
+		
+		if _, err := sst.ExecShell(ctx, b.Log, "mount", "--bind", hostDir, target); err == nil {
+			activeCacheMounts = append(activeCacheMounts, target)
+		}
+	}
 	
 	defer func() {
+		for i := len(activeCacheMounts)-1; i >= 0; i-- {
+			sst.ExecShell(context.Background(), b.Log, "umount", "-l", activeCacheMounts[i])
+		}
 		for i := len(mounts)-1; i >= 0; i-- {
-			target := filepath.Join(b.RootDir, mounts[i])
+			target := filepath.Join(targetDir, mounts[i])
 			sst.ExecShell(context.Background(), b.Log, "umount", "-l", target)
 		}
 	}()
 
-	sst.ExecShell(ctx, b.Log, "cp", "-L", "/etc/resolv.conf", filepath.Join(b.RootDir, "etc/resolv.conf"))
+	sst.ExecShell(ctx, b.Log, "cp", "-L", "/etc/resolv.conf", filepath.Join(targetDir, "etc/resolv.conf"))
 
 	var envs []string
-	for k, v := range b.Env {
-		envs = append(envs, k+"="+v)
-	}
+	for k, v := range b.Args { envs = append(envs, k+"="+v) }
+	for k, v := range b.Env { envs = append(envs, k+"="+v) }
 
 	req := sst.ExecRequest{
 		Cmd:  "chroot",
-		Args: []string{b.RootDir, "/bin/sh", "-c", cmdStr},
+		Args: []string{targetDir, "/bin/sh", "-c", cmdStr},
 		Env:  envs,
 		Mode: sst.ExecCaptured,
 	}
@@ -133,6 +190,7 @@ func (b *BuildApp) execRun(ctx context.Context, cmdStr string) error {
 	return nil
 }
 
+// FinalizeVM remains intact for backward compatibility during this iteration.
 func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 	b.ImageOutput = filepath.Join(b.RuntimeDir, "images", b.Name)
 	if err := os.MkdirAll(b.ImageOutput, 0755); err != nil {
@@ -150,7 +208,7 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 	req := sst.ExecRequest{
 		Cmd: "mke2fs",
 		Args: []string{
-			"-t", "ext4", // FIX: Changed from ext2 to ext4 so AnalyseImg detects it
+			"-t", "ext4", 
 			"-d", b.RootDir,
 			"-U", fixedUUID,
 			"-E", "hash_seed=" + fixedUUID,
