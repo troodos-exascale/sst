@@ -52,6 +52,7 @@ func init() {
 	instCmd.Flags().StringVarP(&flagSize, "size", "s", "20G", "Target size for the root disk (e.g. 20G, 100GiB)")
 	instCmd.Flags().BoolVar(&flagEfi, "efi", false, "Use EFI bootloader instead of direct Linux kernel boot")
 	rootCmd.AddCommand(instCmd)
+	rootCmd.AddCommand(extractKernelCmd)
 }
 
 /* ======================= pullvm (Refactored to Steps) ======================= */
@@ -84,6 +85,22 @@ var defaultPullVMOps = pullVMMethods{
 	EnlargeRoot:      pullVMEnlargeRoot,
 	ExtractArtifacts: pullVMExtract,
 	SaveManifest:     pullVMSave,
+}
+
+var extractKernelCmd = &cobra.Command{
+	Use:   "extract_kernel <in> <out>",
+	Short: "Extracts an uncompressed raw kernel (vmlinux) from a compressed kernel image",
+	Args:  cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		inPath := args[0]
+		outPath := args[1]
+		
+		fmt.Printf("--> Extracting raw kernel from %s to %s\n", inPath, outPath)
+		if err := rtsst.ExtractRawKernel(inPath, outPath); err != nil { // Adjust package prefix as needed
+			return fmt.Errorf("failed to extract kernel: %w", err)
+		}
+		return nil
+	},
 }
 
 func pullvmCmd() *cobra.Command {

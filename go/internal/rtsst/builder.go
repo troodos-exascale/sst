@@ -117,12 +117,12 @@ func (b *BuildApp) resolveIncludePath(currentFile, target string) (string, error
 	if _, err := os.Stat(relPath); err == nil { return relPath, nil }
 	if _, err := os.Stat(relPath + ".dockerfile"); err == nil { return relPath + ".dockerfile", nil }
 
-	// 2. The Standard Library (/templates)
-	stdPath := filepath.Join(b.RuntimeDir, "templates", target)
+	// 2. The System-wide Standard Library
+	stdPath := filepath.Join("/usr/local/share/mkimg/templates", target)
 	if _, err := os.Stat(stdPath); err == nil { return stdPath, nil }
 	if _, err := os.Stat(stdPath + ".dockerfile"); err == nil { return stdPath + ".dockerfile", nil }
 
-	return "", fmt.Errorf("include file not found: %s (checked relative to %s and %s/templates)", target, currentFile, b.RuntimeDir)
+	return "", fmt.Errorf("include file not found: %s", target)
 }
 
 func (b *BuildApp) Parse(ctx context.Context) error {

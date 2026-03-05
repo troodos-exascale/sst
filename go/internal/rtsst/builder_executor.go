@@ -116,6 +116,7 @@ func (b *BuildApp) execHostRun(ctx context.Context, cmdStr string, targetDir str
 	envs = append(envs, "BASEDIR="+filepath.Dir(b.RootDir))
 	envs = append(envs, "BOOTDIR="+filepath.Join(filepath.Dir(b.RootDir), "boot"))
 	envs = append(envs, "NAME="+b.Name)
+	envs = append(envs, "OUTDIR="+filepath.Join(b.RuntimeDir, "images", b.Name))
 
 	req := sst.ExecRequest{
 		Cmd:  "/bin/sh",

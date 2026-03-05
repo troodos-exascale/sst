@@ -1,5 +1,6 @@
 */*.md
 **/build/*
+**/tmp/*
 **/.DS_Store
 /oldbuild/*
 /runctl/runctl

@@ -17,6 +17,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/Code-Hex/vz/v3"
 )
@@ -155,7 +156,29 @@ func NewVMWrapper(app *CrosvmApp) (*VMWrapper, error) {
 }
 
 func (v *VMWrapper) Start(ctx context.Context) error {
-	return v.machine.Start()
+	if err := v.machine.Start(); err != nil {
+		return err
+	}
+
+	// NEW: Monitor VM state in the background. 
+	// This ensures that when the guest OS halts (via ACPI or internal shutdown), 
+	// we instantly close the done channel so the wrapper can cleanly exit.
+	go func() {
+		for {
+			state := v.machine.State()
+			if state == vz.VirtualMachineStateStopped || state == vz.VirtualMachineStateError {
+				close(v.doneCh)
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(250 * time.Millisecond):
+			}
+		}
+	}()
+
+	return nil
 }
 
 func (v *VMWrapper) RequestStop() error {
