@@ -1,10 +1,10 @@
-
 package rtsst
 
 import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -67,14 +67,51 @@ func (b *BuildApp) ExecuteSingleInstruction(ctx context.Context, inst Instructio
 		}
 		b.Log.Info(ctx, "processed ENV", "key", parts[0])
 		return nil
+	case "WORKDIR":
+		b.Workdir = b.Substitute(cleanArgs)
+		b.Log.Info(ctx, "processed WORKDIR", "dir", b.Workdir)
+		return nil
+	case "USER":
+		b.User = b.Substitute(cleanArgs)
+		b.Log.Info(ctx, "processed USER", "user", b.User)
+		return nil
+	case "CMD":
+		b.Cmd = b.Substitute(cleanArgs)
+		b.Log.Info(ctx, "processed CMD", "cmd", b.Cmd)
+		return nil
+	case "ENTRYPOINT":
+		b.EntryPoint = b.Substitute(cleanArgs)
+		b.Log.Info(ctx, "processed ENTRYPOINT", "entrypoint", b.EntryPoint)
+		return nil
+	case "LABEL":
+		parts := strings.SplitN(cleanArgs, "=", 2)
+		if len(parts) == 2 {
+			// Strip quotes if they exist
+			b.Labels[strings.Trim(parts[0], `"`)] = strings.Trim(parts[1], `"`)
+		}
+		b.Log.Info(ctx, "processed LABEL", "label", parts[0])
+		return nil
+	case "EXPOSE":
+		for _, port := range strings.Fields(cleanArgs) {
+			// OCI expects "port/tcp" or "port/udp". Default to tcp.
+			if !strings.Contains(port, "/") { port += "/tcp" }
+			b.ExposedPorts[port] = struct{}{}
+		}
+		b.Log.Info(ctx, "processed EXPOSE", "ports", cleanArgs)
+		return nil
+	case "VOLUME":
+		// Handle both `VOLUME ["/data"]` and `VOLUME /data`
+		clean := strings.TrimPrefix(strings.TrimSuffix(cleanArgs, "]"), "[")
+		for _, vol := range strings.Split(clean, ",") {
+			// FIX: Trim spaces first, then trim quotes!
+			b.Volumes[strings.Trim(strings.TrimSpace(vol), `"`)] = struct{}{}
+		}
+		b.Log.Info(ctx, "processed VOLUME", "volumes", cleanArgs)
+		return nil
 	case "FROM", "NAME", "VMOUT", "EMIT":
 		return nil // Handled in PreProcess
-	case "EXPOSE", "CMD", "LABEL", "VOLUME", "USER", "WORKDIR":
-		b.Log.Info(ctx, "ignoring instruction (unnecessary for VM building)", "type", inst.Type, "args", cleanArgs)
-		return nil
-	case "COPY":
-		// COPY is now natively desugared into RUN [root, host] by the parser.
-		// If we reach here, it's an anomaly, but safe to ignore.
+	case "COPY", "ADD":
+		// COPY and ADD are natively desugared into RUN [root, host] by the parser.
 		return nil
 	case "RUN":
 		if !b.shouldExecute(inst.Conditions) {
@@ -121,7 +158,7 @@ func (b *BuildApp) execHostRun(ctx context.Context, cmdStr string, targetDir str
 	req := sst.ExecRequest{
 		Cmd:  "/bin/sh",
 		Args: []string{"-c", cmdStr},
-		Dir:  targetDir,
+		Dir:  filepath.Dir(b.Dockerfile), 
 		Env:  envs,
 		Mode: sst.ExecCaptured,
 	}
@@ -132,7 +169,7 @@ func (b *BuildApp) execHostRun(ctx context.Context, cmdStr string, targetDir str
 	return nil
 }
 
-// execChrootRun is the exact, preserved logic of the original execRun.
+// execChrootRun executes commands inside the guest filesystem using chroot, respecting WORKDIR and USER.
 func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir string) error {
 	b.Log.Info(ctx, "executing RUN in chroot", "dir", targetDir)
 	
@@ -178,9 +215,41 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 	for k, v := range b.Args { envs = append(envs, k+"="+v) }
 	for k, v := range b.Env { envs = append(envs, k+"="+v) }
 
+	// --- Resolve Context ---
+	workdir := b.Workdir
+	if workdir == "" { workdir = "/" }
+	
+	user := b.User
+	if user == "" { user = "root" }
+
+	// Ensure workdir exists in the guest before entering
+	guestWorkdir := filepath.Join(targetDir, workdir)
+	os.MkdirAll(guestWorkdir, 0755)
+
+	// Write the script to avoid all quoting/escaping shell nightmares
+	scriptName := ".sst-run-script.sh"
+	scriptPath := filepath.Join(targetDir, scriptName)
+	
+	scriptContent := fmt.Sprintf("#!/bin/sh\ncd '%s'\n%s\n", workdir, cmdStr)
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
+		return fmt.Errorf("failed to write run script: %w", err)
+	}
+	defer os.Remove(scriptPath)
+
+	// --- Impersonate User ---
+	var chrootCmd string
+	if user != "root" {
+		// Strip group if present (su compatibility)
+		execUser := strings.SplitN(user, ":", 2)[0]
+		// -p preserves the environment variables we inject via chroot
+		chrootCmd = fmt.Sprintf("su -p -s /bin/sh '%s' -c /%s", execUser, scriptName)
+	} else {
+		chrootCmd = fmt.Sprintf("/%s", scriptName)
+	}
+
 	req := sst.ExecRequest{
 		Cmd:  "chroot",
-		Args: []string{targetDir, "/bin/sh", "-c", cmdStr},
+		Args: []string{targetDir, "/bin/sh", "-c", chrootCmd},
 		Env:  envs,
 		Mode: sst.ExecCaptured,
 	}
@@ -191,7 +260,7 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 	return nil
 }
 
-// FinalizeVM remains intact for backward compatibility during this iteration.
+// FinalizeVM generates the VM disk images and optionally the OCI format.
 func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 	b.ImageOutput = filepath.Join(b.RuntimeDir, "images", b.Name)
 	if err := os.MkdirAll(b.ImageOutput, 0755); err != nil {
@@ -287,18 +356,68 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 				return fmt.Errorf("failed to hash layer.tar: %w", err)
 			}
 
-			configContent := fmt.Sprintf(`{
-  "architecture": "%s",
-  "os": "linux",
-  "config": {
-    "Env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]
-  },
-  "rootfs": {
-    "type": "layers",
-    "diff_ids": ["sha256:%s"]
-  },
-  "history": [{"created": "1970-01-01T00:00:00Z", "created_by": "sst mkimage"}]
-}`, runtime.GOARCH, layerHash)
+			// Helper to handle Docker's JSON array syntax vs shell syntax
+			parseArgs := func(input string) []string {
+				input = strings.TrimSpace(input)
+				if input == "" { return nil }
+				if strings.HasPrefix(input, "[") && strings.HasSuffix(input, "]") {
+					var parsed []string
+					if err := json.Unmarshal([]byte(input), &parsed); err == nil {
+						return parsed
+					}
+				}
+				return []string{"/bin/sh", "-c", input}
+			}
+
+			// Generate a strictly compliant OCI Image Configuration
+			type OCIConfig struct {
+				Env          []string               `json:"Env"`
+				Cmd          []string               `json:"Cmd,omitempty"`
+				Entrypoint   []string               `json:"Entrypoint,omitempty"`
+				WorkingDir   string                 `json:"WorkingDir,omitempty"`
+				User         string                 `json:"User,omitempty"`
+				Labels       map[string]string      `json:"Labels,omitempty"`       
+				ExposedPorts map[string]struct{}    `json:"ExposedPorts,omitempty"` 
+				Volumes      map[string]struct{}    `json:"Volumes,omitempty"`      
+			}
+
+			type OCIImageManifest struct {
+				Architecture string    `json:"architecture"`
+				OS           string    `json:"os"`
+				Config       OCIConfig `json:"config"`
+				RootFS       struct {
+					Type    string   `json:"type"`
+					DiffIDs []string `json:"diff_ids"`
+				} `json:"rootfs"`
+				History []map[string]string `json:"history"`
+			}
+
+			manifestObj := OCIImageManifest{
+				Architecture: runtime.GOARCH,
+				OS:           "linux",
+				RootFS: struct {
+					Type    string   `json:"type"`
+					DiffIDs []string `json:"diff_ids"`
+				}{
+					Type:    "layers",
+					DiffIDs: []string{"sha256:" + layerHash},
+				},
+				History: []map[string]string{{"created": "1970-01-01T00:00:00Z", "created_by": "sst mkimage"}},
+			}
+
+			// Inject our parsed Dockerfile state
+			manifestObj.Config.Env = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
+			if b.User != "" && b.User != "root" { manifestObj.Config.User = b.User }
+			if b.Workdir != "" && b.Workdir != "/" { manifestObj.Config.WorkingDir = b.Workdir }
+			if b.Cmd != "" { manifestObj.Config.Cmd = parseArgs(b.Cmd) }
+			if b.EntryPoint != "" { manifestObj.Config.Entrypoint = parseArgs(b.EntryPoint) }
+			
+			if len(b.Labels) > 0 { manifestObj.Config.Labels = b.Labels }
+			if len(b.ExposedPorts) > 0 { manifestObj.Config.ExposedPorts = b.ExposedPorts }
+			if len(b.Volumes) > 0 { manifestObj.Config.Volumes = b.Volumes }
+
+			configBytes, _ := json.Marshal(manifestObj)
+			configContent := string(configBytes)
 
 			h := sha256.New()
 			h.Write([]byte(configContent))

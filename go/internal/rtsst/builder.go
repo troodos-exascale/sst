@@ -34,6 +34,14 @@ type BuildApp struct {
 	Args      map[string]string
 	Env       map[string]string
 
+	Workdir      string
+	User         string
+	Cmd          string
+	EntryPoint   string
+	Labels       map[string]string
+	Volumes      map[string]struct{}
+	ExposedPorts map[string]struct{}
+
 	RuntimeDir  string
 	RootDir     string
 	OCIStaging  string
@@ -42,13 +50,18 @@ type BuildApp struct {
 
 func NewBuilder(log *sst.Logx, files sst.Files, dockerfile, runtimeDir string) *BuildApp {
 	return &BuildApp{
-		Log:        log.Subsystem("rtsst-builder"),
-		Files:      files,
-		Dockerfile: dockerfile,
-		RuntimeDir: runtimeDir,
-		BuildArgs:  make(map[string]string),
-		Args:       make(map[string]string),
-		Env:        make(map[string]string),
+		Log:          log.Subsystem("rtsst-builder"),
+		Files:        files,
+		Dockerfile:   dockerfile,
+		RuntimeDir:   runtimeDir,
+		BuildArgs:    make(map[string]string),
+		Args:         make(map[string]string),
+		Env:          make(map[string]string),
+		Labels:       make(map[string]string),
+		Volumes:      make(map[string]struct{}),
+		ExposedPorts: make(map[string]struct{}),
+		Workdir:      "/",
+		User:         "root",
 	}
 }
 
@@ -94,6 +107,32 @@ func desugarCopy(args string) Instruction {
 
 	script := fmt.Sprintf("DST=\"${ROOTFS}/%s\"\nmkdir -p \"$(dirname \"$DST\")\"\ncp -a %s \"$DST\"", 
 		strings.TrimPrefix(dst, "/"), srcs)
+
+	return Instruction{
+		Type:       "RUN",
+		Args:       script,
+		Location:   "root",
+		Context:    "host",
+		Conditions: []string{"all"},
+	}
+}
+
+func desugarAdd(args string) Instruction {
+	parts := strings.Fields(args)
+	if len(parts) < 2 {
+		return Instruction{Type: "ADD", Args: args}
+	}
+	dst := parts[len(parts)-1]
+	src := parts[0] // Simplified for single source
+
+	var script string
+	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
+		script = fmt.Sprintf("DST=\"${ROOTFS}/%s\"\nmkdir -p \"$(dirname \"$DST\")\"\ncurl -sL '%s' -o \"$DST\"", strings.TrimPrefix(dst, "/"), src)
+	} else if strings.HasSuffix(src, ".tar.gz") || strings.HasSuffix(src, ".tgz") {
+		script = fmt.Sprintf("DST=\"${ROOTFS}/%s\"\nmkdir -p \"$DST\"\ntar -xzf '%s' -C \"$DST\"", strings.TrimPrefix(dst, "/"), src)
+	} else {
+		script = fmt.Sprintf("DST=\"${ROOTFS}/%s\"\nmkdir -p \"$(dirname \"$DST\")\"\ncp -a '%s' \"$DST\"", strings.TrimPrefix(dst, "/"), src)
+	}
 
 	return Instruction{
 		Type:       "RUN",
@@ -230,6 +269,8 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 
 			if inst.Type == "COPY" {
 				inst = desugarCopy(inst.Args)
+			} else if inst.Type == "ADD" {
+				inst = desugarAdd(inst.Args)
 			}
 
 			b.Instructions = append(b.Instructions, inst)

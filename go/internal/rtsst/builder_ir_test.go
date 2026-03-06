@@ -104,9 +104,8 @@ func TestIRExecutionConditionMatching(t *testing.T) {
 func TestIRParserInclude(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	tmplDir := filepath.Join(tmpDir, "templates")
-	os.MkdirAll(tmplDir, 0755)
-	tmplPath := filepath.Join(tmplDir, "boot-efi.dockerfile")
+	// FIX: Place the mock include exactly where the parser expects it (next to the main file)
+	tmplPath := filepath.Join(tmpDir, "boot-efi.dockerfile")
 	os.WriteFile(tmplPath, []byte("RUN [base, host, qcow2]: echo \"format disk\"\n"), 0644)
 
 	localPath := filepath.Join(tmpDir, "local-setup.dockerfile")
