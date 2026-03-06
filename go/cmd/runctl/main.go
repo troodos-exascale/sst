@@ -276,8 +276,18 @@ func (r *Runctl) Stop(name string) error {
 	info, err := rtsst.ReadLock(lp)
 	if err != nil { return nil }
 	if !rtsst.IsPidAlive(info.Pid) { return nil }
-	r.Log.Info(r.Ctx, "stopping instance", "instance", name, "pid", info.Pid)
-	return syscall.Kill(info.Pid, syscall.SIGTERM)
+	
+	r.Log.Info(r.Ctx, "stopping instance", "instance", name, "pid", info.Pid, "arch", runtime.GOARCH)
+
+	var sig syscall.Signal
+	if runtime.GOARCH == "arm64" || runtime.GOARCH == "arm" {
+		// kill -9 for ARM architectures, no ACIPI intercept exists
+		sig = syscall.SIGKILL
+	} else {
+		sig = syscall.SIGTERM
+	}
+
+	return syscall.Kill(info.Pid, sig)
 }
 
 func (r *Runctl) pauseCmd() *cobra.Command {

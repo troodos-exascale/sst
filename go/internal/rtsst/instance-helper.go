@@ -64,6 +64,7 @@ func ReadLock(path string) (*LockInfo, error) {
 		if ln == "" {
 			continue
 		}
+		// Corrected: added the "=" separator back in
 		parts := strings.SplitN(ln, "=", 2)
 		if len(parts) != 2 {
 			continue
@@ -243,35 +244,29 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 	if user.Name != "" {
 		fmt.Fprintf(&sb, "    gecos: %s\n", user.Name)
 	}
-	sb.WriteString("    shell: /bin/bash\n")
+	sb.WriteString("    shell: /bin/sh\n") // CHANGED: explicitly use busybox sh
 	if pubKey != "" {
 		sb.WriteString("    ssh_authorized_keys:\n")
 		sb.WriteString("      - " + pubKey + "\n")
 	}
 
-	sb.WriteString("\nchpasswd:\n")
-	sb.WriteString("  list: |\n")
-	fmt.Fprintf(&sb, "    %s:abcd1234\n", user.Username)
-	sb.WriteString("  expire: False\n")
+	// CHANGED: Removed the chpasswd block completely since we don't need passwords
 
 	sb.WriteString("\nruncmd:\n")
 	sb.WriteString("  - |\n")
 	
-	// Inject user shell, passwordless sudo, and hostname cleanly
+	// CHANGED: Inject user shell via sed (no usermod), passwordless doas (no sudo), and hostname cleanly
 	sb.WriteString(fmt.Sprintf(`    if [ -f /etc/alpine-release ]; then
       mkdir -p /etc/conf.d
       echo 'TTY="hvc0"' > /etc/conf.d/ttyAMA0
       sed -i 's/^ttyAMA0/#ttyAMA0/' /etc/inittab
       
-      # Ensure shell is set
-      if id "%s" >/dev/null 2>&1; then
-          usermod -s /bin/bash %s
-      fi
+      # Ensure shell is set using sed since usermod is removed
+      sed -i -e "s#^\(%s:.*:\)[^:]*\$#\1/bin/sh#" /etc/passwd
       
-      # Explicit passwordless sudo configuration
-      mkdir -p /etc/sudoers.d
-      echo "%s ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/%s
-      chmod 0440 /etc/sudoers.d/%s
+      # Explicit passwordless doas configuration
+      mkdir -p /etc/doas.d
+      echo "permit nopass %s as root" > /etc/doas.d/%s.conf
       
       # Force Hostname
       hostname %s
@@ -279,7 +274,7 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
       
       kill -HUP 1
     fi
-`, user.Username, user.Username, user.Username, user.Username, user.Username, inst.Hostname, inst.Hostname))
+`, user.Username, user.Username, user.Username, inst.Hostname, inst.Hostname))
 
 	for _, m := range mounts {
 		sb.WriteString("  - |\n")
