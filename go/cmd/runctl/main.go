@@ -282,6 +282,7 @@ func (r *Runctl) Stop(name string) error {
 	var sig syscall.Signal
 	if runtime.GOARCH == "arm64" || runtime.GOARCH == "arm" {
 		// kill -9 for ARM architectures, no ACIPI intercept exists
+		r.Log.Info(r.Ctx, "sending SIGKILL")
 		sig = syscall.SIGKILL
 	} else {
 		sig = syscall.SIGTERM

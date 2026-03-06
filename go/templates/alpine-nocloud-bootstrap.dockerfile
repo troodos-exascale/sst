@@ -2,7 +2,6 @@ RUN: |
   set -e
   
   # 1. Install tiny-cloud and base packages (Aggressively Optimized)
-  # Dropped bash, shadow, sudo. Swapped for doas and dropbear.
   apk add alpine-base linux-virt grub-efi e2fsprogs \
       tzdata doas dropbear dosfstools \
       tiny-cloud tiny-cloud-openrc tiny-cloud-nocloud \
@@ -34,11 +33,9 @@ RUN: |
   echo "auto eth0" >> /etc/network/interfaces
   echo "iface eth0 inet dhcp" >> /etc/network/interfaces
 
-  # 5. Align Runlevels for tiny-cloud (Swapped out chronyd/dhcpcd for ntpd)
+  # 5. Align Runlevels for tiny-cloud
   for svc in devfs dmesg mdev hwdrivers modules; do rc-update add $svc sysinit 2>/dev/null || true; done
   for svc in sysctl hostname bootmisc syslog networking ntpd tiny-cloud-early acpid; do rc-update add $svc boot 2>/dev/null || true; done
-
-  # (Swapped sshd for dropbear)
   for svc in dropbear tiny-cloud-main tiny-cloud-final; do rc-update add $svc default 2>/dev/null || true; done
 
   # 6. Explicitly configure tiny-cloud for NoCloud (cidata)
@@ -51,6 +48,14 @@ RUN: |
   echo "hvc0::respawn:/sbin/getty -L hvc0 115200 vt100" >> /etc/inittab
   echo "ttyS0" >> /etc/securetty
   echo "hvc0" >> /etc/securetty
+
+  # 8. Configure GRUB to route kernel output to our terminal (hvc0)
+# 8. Configure GRUB to display the menu using standard EFI console mapping
+  mkdir -p /etc/default
+  echo 'GRUB_TIMEOUT=5' > /etc/default/grub
+  echo 'GRUB_TIMEOUT_STYLE="menu"' >> /etc/default/grub
+  echo 'GRUB_CMDLINE_LINUX_DEFAULT="console=hvc0 oops=panic panic=10 loglevel=4 rootfstype=ext4 rw rootwait"' >> /etc/default/grub
+  echo 'GRUB_TERMINAL="console"' >> /etc/default/grub
   
-  # 8. Clean up apk cache to reduce image size
+  # 9. Clean up apk cache to reduce image size
   rm -rf /var/cache/apk/*
