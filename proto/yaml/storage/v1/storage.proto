@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package sst.yaml.storage.v1;
+
+option go_package = "github.com/swiss-software-tool/sst/proto/yaml/storage/v1;storagepb";
+
+// -----------------------------------------------------------------------------
+// StorageLayout
+// -----------------------------------------------------------------------------
+
+message StorageLayout {
+  string api_version = 1; // "sst.io/v1"
+  string kind        = 2; // "StorageLayout"
+
+  StorageSpec spec = 3;
+}
+
+message StorageSpec {
+  repeated Device     devices     = 1;
+  repeated Pool       pools       = 2;
+  repeated Filesystem filesystems = 3;
+}
+
+// -----------------------------------------------------------------------------
+// Devices
+// -----------------------------------------------------------------------------
+
+message Device {
+  string name       = 1;
+  string kind       = 2; // "block-device"
+  string device_ref = 3;
+
+  ResourceStatus status = 10;
+}
+
+// -----------------------------------------------------------------------------
+// Pools
+// -----------------------------------------------------------------------------
+
+message Pool {
+  string name       = 1;
+  string raid_level = 2; // "single", "mirror", etc.
+  repeated string devices = 3;
+
+  ResourceStatus status = 10;
+}
+
+// -----------------------------------------------------------------------------
+// Filesystems
+// -----------------------------------------------------------------------------
+
+message Filesystem {
+  string name = 1;
+
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    ZFS_FILESET     = 1;
+    EXT4            = 2;
+  }
+
+  Kind kind = 2;
+
+  string pool_ref   = 3;
+  string device_ref = 4;
+  string mountpoint = 5;
+
+  repeated string mount_options = 6;
+
+  ResourceStatus status = 10;
+}
+
+// -----------------------------------------------------------------------------
+// Shared status
+// -----------------------------------------------------------------------------
+
+message ResourceStatus {
+  string state   = 1; // "plan-recorded", "ready-for-implementation", "deployed", "error"
+  string message = 2;
+}
