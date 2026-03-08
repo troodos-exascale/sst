@@ -2,7 +2,9 @@ package rtsst
 
 import (
 	"context"
+	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -12,15 +14,15 @@ import (
 	"github.com/swiss-software-tool/sst/internal/sst"
 )
 
-func TestOCIWorkflowWithPodman(t *testing.T) {
-	// Skip this test entirely if we are on macOS
+func TestOCIWorkflowWithCrun(t *testing.T) {
+	// Skip on non-Linux environments
 	if runtime.GOOS != "linux" {
 		t.Skip("skipping OCI fetch/verify test; requires a native Linux environment")
 	}
 
-	_, found := os.LookupEnv("PATH")
-	if !found {
-		t.Skip("PATH not found in environment")
+	// Ensure crun is installed
+	if _, err := exec.LookPath("crun"); err != nil {
+		t.Skip("skipping test; crun not found in PATH")
 	}
 
 	log := sst.LogxRoot()
@@ -30,20 +32,42 @@ func TestOCIWorkflowWithPodman(t *testing.T) {
 	builder.BaseImage = "alpine:latest"
 	builder.Name = "test-vm" 
 	
-	err := builder.ResolveOCIPaths()
-	require.NoError(t, err)
-
 	ctx := context.Background()
 	
-	// Step 1: Fetch via Skopeo
-	err = builder.FetchOCI(ctx)
-	if err != nil {
-		t.Skipf("skopeo fetch failed (is skopeo installed?): %v", err)
-	}
+	// Step 1: Fetch and extract natively via crane
+	err := builder.FetchAndExtractBase(ctx)
+	require.NoError(t, err, "FetchAndExtractBase should succeed")
 
-	// Step 2: Verify with Podman
-	err = builder.VerifyWithPodman(ctx)
-	assert.NoError(t, err)
+	// Step 2: Verify the extracted rootfs using crun.
+	// We use the parent directory of b.RootDir as our OCI bundle directory.
+	bundleDir := filepath.Dir(builder.RootDir) 
 	
-	os.RemoveAll(filepath.Join(tmp, "oci", "alpine:latest"))
+	// Generate a default OCI config.json
+	cmd := exec.Command("crun", "spec")
+	cmd.Dir = bundleDir
+	require.NoError(t, cmd.Run(), "failed to generate crun spec")
+
+	// Modify config.json to run a specific command non-interactively
+	specPath := filepath.Join(bundleDir, "config.json")
+	specBytes, err := os.ReadFile(specPath)
+	require.NoError(t, err)
+	
+	var spec map[string]interface{}
+	require.NoError(t, json.Unmarshal(specBytes, &spec))
+	
+	// Override the default process execution
+	process := spec["process"].(map[string]interface{})
+	process["terminal"] = false
+	process["args"] = []string{"/bin/cat", "/etc/os-release"}
+	
+	specBytes, _ = json.MarshalIndent(spec, "", "  ")
+	require.NoError(t, os.WriteFile(specPath, specBytes, 0644))
+
+	// Step 3: Run crun against our newly extracted rootfs
+	runCmd := exec.Command("crun", "run", "sst-test-container")
+	runCmd.Dir = bundleDir
+	out, err := runCmd.CombinedOutput()
+	
+	require.NoError(t, err, "crun execution failed: %s", string(out))
+	assert.Contains(t, string(out), "Alpine Linux", "crun did not return expected output from rootfs")
 }

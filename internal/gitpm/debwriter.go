@@ -52,9 +52,13 @@ func BuildDeb(opts *Options) (string, error) {
 		return nil
 	}
 
-	w("!<arch>\n", []byte{}) // ar magic is at start
+	// ar magic is at start (exactly 8 bytes, NOT a file header)
+	if _, err := out.Write([]byte("!<arch>\n")); err != nil {
+		return "", err
+	}
 
 	debianBinary := []byte("2.0\n")
+
 	w("debian-binary", debianBinary)
 	if b, err := os.ReadFile(controlTar); err == nil {
 		w("control.tar.gz", b)
@@ -110,7 +114,18 @@ func writeDataTar(path, dir string) error {
 			return nil
 		}
 		name, _ := filepath.Rel(dir, p)
-		hdr, err := tar.FileInfoHeader(info, "")
+
+		// NEW: Read the symlink target if it's a symlink
+		var link string
+		if info.Mode()&os.ModeSymlink != 0 {
+			link, err = os.Readlink(p)
+			if err != nil {
+				return err
+			}
+		}
+
+		// Pass the link target to the tar header
+		hdr, err := tar.FileInfoHeader(info, link)
 		if err != nil {
 			return err
 		}
@@ -118,6 +133,7 @@ func writeDataTar(path, dir string) error {
 		hdr.ModTime = time.Unix(0, 0)
 		hdr.Uid, hdr.Gid = 0, 0
 		hdr.Uname, hdr.Gname = "root", "root"
+		
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
 		}

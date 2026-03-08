@@ -9,12 +9,13 @@ import (
 )
 
 func TestCLIBuildManifestDEBAndRPM(t *testing.T) {
-	// Build gitpm at repo root
-	if err := exec.Command("go", "build", "-o", "gitpm", "./cmd/gitpm").Run(); err != nil {
+	tmp := t.TempDir()
+	binPath := filepath.Join(tmp, "gitpm")
+
+	// Build gitpm and output the binary directly into the temp dir
+	if err := exec.Command("go", "build", "-o", binPath, "../../cmd/gitpm").Run(); err != nil {
 		t.Fatalf("failed to build gitpm: %v", err)
 	}
-
-	tmp := t.TempDir()
 
 	// Create a minimal manifest that installs one file
 	manifest := `
@@ -36,7 +37,8 @@ build:
 		t.Fatal(err)
 	}
 
-	args := []string{"./gitpm", "build", "-f", mf}
+	// Use the absolute path to the binary we just built
+	args := []string{binPath, "build", "-f", mf}
 	cmd := exec.Command("bash", "-c", strings.Join(args, " "))
 	cmd.Dir = tmp
 	out, err := cmd.CombinedOutput()
@@ -46,8 +48,8 @@ build:
 
 	// Expect both deb and rpm outputs named by arch inferred from runtime
 	arch := detectArch()
-	wantDeb := filepath.Join(tmp, "demo_9.9.9_"+arch+".deb")
-	wantRpm := filepath.Join(tmp, "demo_9.9.9_"+arch+".rpm")
+	wantDeb := filepath.Join(tmp, "dist", "demo_9.9.9_"+arch+".deb") // <-- NOTE: output goes to dist/
+	wantRpm := filepath.Join(tmp, "dist", "demo_9.9.9_"+arch+".rpm") // <-- NOTE: output goes to dist/
 	if _, err := os.Stat(wantDeb); err != nil {
 		t.Fatalf("missing output deb: %s", wantDeb)
 	}

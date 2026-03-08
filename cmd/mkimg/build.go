@@ -51,16 +51,10 @@ var buildCmd = &cobra.Command{
 
 		runner := sst.StepsInit("mkimage.build")
 		
-		runner.StepsAdd("prepare workspace", func(ctx *sst.StepsContext, _ sst.StepState) error {
-			return builder.ResolveOCIPaths()
+		runner.StepsAdd("fetch and extract base", func(ctx *sst.StepsContext, _ sst.StepState) error {
+			return builder.FetchAndExtractBase(cmd.Context())
 		})
-		runner.StepsAdd("fetch base image", func(ctx *sst.StepsContext, _ sst.StepState) error {
-			return builder.FetchOCI(cmd.Context())
-		})
-		runner.StepsAdd("unpack rootfs", func(ctx *sst.StepsContext, _ sst.StepState) error {
-			return builder.UnpackOCI(cmd.Context())
-		})
-
+		
 		for i, inst := range builder.Instructions {
 			instruction := inst 
 			stepName := fmt.Sprintf("%s %d: %s", instruction.Type, i+1, strings.Split(instruction.Args, "\n")[0])

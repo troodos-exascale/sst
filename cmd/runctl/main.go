@@ -183,10 +183,17 @@ func (r *Runctl) Start(name string) error {
 
 	go func() {
 		for sig := range sigCh {
-			_ = cmd.Process.Signal(sig)
+			// On ARM (macOS), ACPI isn't available to gracefully power down.
+			// Instead of hanging, we violently kill the VM child process.
+			if runtime.GOARCH == "arm64" || runtime.GOARCH == "arm" {
+				r.Log.Info(r.Ctx, "ARM architecture detected: sending SIGKILL to child VM")
+				_ = cmd.Process.Signal(syscall.SIGKILL)
+			} else {
+				_ = cmd.Process.Signal(sig)
+			}
 		}
 	}()
-
+	
 	return cmd.Wait()
 }
 
@@ -277,18 +284,11 @@ func (r *Runctl) Stop(name string) error {
 	if err != nil { return nil }
 	if !rtsst.IsPidAlive(info.Pid) { return nil }
 	
-	r.Log.Info(r.Ctx, "stopping instance", "instance", name, "pid", info.Pid, "arch", runtime.GOARCH)
+	r.Log.Info(r.Ctx, "stopping instance", "instance", name, "pid", info.Pid)
 
-	var sig syscall.Signal
-	if runtime.GOARCH == "arm64" || runtime.GOARCH == "arm" {
-		// kill -9 for ARM architectures, no ACIPI intercept exists
-		r.Log.Info(r.Ctx, "sending SIGKILL")
-		sig = syscall.SIGKILL
-	} else {
-		sig = syscall.SIGTERM
-	}
-
-	return syscall.Kill(info.Pid, sig)
+	// Always send SIGTERM to the supervisor. 
+	// The supervisor will translate this to SIGKILL for the child VM if necessary.
+	return syscall.Kill(info.Pid, syscall.SIGTERM)
 }
 
 func (r *Runctl) pauseCmd() *cobra.Command {

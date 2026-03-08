@@ -2,116 +2,74 @@ package rtsst
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
+	"runtime"
 
+	"github.com/google/go-containerregistry/pkg/crane"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/swiss-software-tool/sst/internal/sst"
-    "github.com/google/go-containerregistry/pkg/crane"
 )
 
-func pullAndExtract(imageName string, targetDir string) error {
-    // This connects to the registry, downloads the image, 
-    // flattens the layers, and writes the raw files to targetDir.
-    return crane.Export(imageName, targetDir)
-}
+// FetchAndExtractBase resolves the FROM image and extracts it directly to the rootfs.
+func (b *BuildApp) FetchAndExtractBase(ctx context.Context) error {
+	// 1. Resolve path
+	b.RootDir = filepath.Join(b.RuntimeDir, "build", b.Name, "rootfs")
+	b.Log.Info(ctx, "resolved paths", "rootfs", b.RootDir)
 
-
-func sanitizeName(s string) string {
-	return strings.ReplaceAll(s, ":", "_")
-}
-
-func (b *BuildApp) ResolveOCIPaths() error {
-	safeBase := sanitizeName(b.BaseImage)
-	b.OCIStaging = filepath.Join(b.RuntimeDir, "oci", safeBase)
-	b.RootDir = filepath.Join(b.RuntimeDir, "build", b.Name, "rootfs") // UPDATED: use b.Name
-	
-	b.Log.Info(context.Background(), "resolved paths", "oci_staging", b.OCIStaging, "rootfs", b.RootDir)
-	return os.MkdirAll(b.OCIStaging, 0755)
-}
-
-func (b *BuildApp) FetchOCI(ctx context.Context) error {
-	// Bypass Skopeo for scratch builds
-	if b.BaseImage == "scratch" {
-		b.Log.Info(ctx, "base image is 'scratch', skipping OCI fetch")
-		return nil
-	}
-
-	indexFile := filepath.Join(b.OCIStaging, "index.json")
-	if _, err := os.Stat(indexFile); err == nil {
-		b.Log.Info(ctx, "base image already exists in cache, skipping pull", "file", indexFile)
-		return nil
-	}
-
-	b.Log.Info(ctx, "fetching OCI base image", "image", b.BaseImage, "target", b.OCIStaging)
-	
-	_, err := sst.ExecShell(ctx, b.Log, "skopeo", "copy", 
-		"--src-tls-verify=false",
-		"docker://"+b.BaseImage, 
-		"oci:"+b.OCIStaging)
-	return err
-}
-
-func (b *BuildApp) VerifyWithPodman(ctx context.Context) error {
-	b.Log.Info(ctx, "verifying image with podman", "image", b.BaseImage)
-	_, err := sst.ExecShell(ctx, b.Log, "podman", "run", "--rm", "oci:"+b.OCIStaging, "ls", "/")
-	return err
-}
-
-func (b *BuildApp) UnpackOCI(ctx context.Context) error {
-	b.Log.Info(ctx, "unpacking and flattening OCI layers", "target", b.RootDir)
-	
-	// Nuke the build directory to guarantee a clean slate for every build.
+	// 2. Guarantee a clean slate
 	_ = os.RemoveAll(b.RootDir)
-
 	if err := os.MkdirAll(b.RootDir, 0755); err != nil {
-		return err
+		return fmt.Errorf("failed to create root directory: %w", err)
 	}
 
-	// Return early if scratch, leaving the ROOTFS directory completely empty
+	// 3. Bypass fetching for scratch builds
 	if b.BaseImage == "scratch" {
+		b.Log.Info(ctx, "base image is 'scratch', skipping OCI fetch, leaving empty rootfs")
 		return nil
 	}
 
-	indexPath := filepath.Join(b.OCIStaging, "index.json")
-	data, err := os.ReadFile(indexPath)
-	if err != nil { 
-		return fmt.Errorf("failed to read OCI index at %s: %w", indexPath, err) 
-	}
-	
-	var index struct {
-		Manifests []struct { Digest string `json:"digest"` } `json:"manifests"`
-	}
-	if err := json.Unmarshal(data, &index); err != nil || len(index.Manifests) == 0 {
-		return fmt.Errorf("invalid or empty OCI index at %s", indexPath)
+	b.Log.Info(ctx, "fetching OCI base image via crane", "image", b.BaseImage, "arch", runtime.GOARCH)
+
+	// 4. Pull the image metadata and layers natively (forcing the host architecture)
+	platform := &v1.Platform{
+		Architecture: runtime.GOARCH,
+		OS:           "linux",
 	}
 
-	mDigest := strings.TrimPrefix(index.Manifests[0].Digest, "sha256:")
-	mPath := filepath.Join(b.OCIStaging, "blobs", "sha256", mDigest)
-	mData, err := os.ReadFile(mPath)
-	if err != nil { 
-		return fmt.Errorf("failed to read manifest blob %s: %w", mPath, err) 
+	img, err := crane.Pull(b.BaseImage, crane.WithPlatform(platform))
+	if err != nil {
+		b.Log.Diagnose(ctx, "OCI_PULL_FAILED", "failed to pull OCI image", "image", b.BaseImage, "error", err.Error())
+		return fmt.Errorf("crane pull failed for %s: %w", b.BaseImage, err)
 	}
 
-	var manifest struct {
-		Layers []struct { Digest string `json:"digest"` } `json:"layers"`
-	}
-	if err := json.Unmarshal(mData, &manifest); err != nil { 
-		return fmt.Errorf("failed to parse manifest: %w", err) 
+	// 5. Export the flattened filesystem to a temporary tarball
+	tmpTar := filepath.Join(b.RuntimeDir, "build", b.Name, "base_flat.tar")
+	f, err := os.Create(tmpTar)
+	if err != nil {
+		return fmt.Errorf("failed to create temp tarball: %w", err)
 	}
 
-	for i, layer := range manifest.Layers {
-		lDigest := strings.TrimPrefix(layer.Digest, "sha256:")
-		lPath := filepath.Join(b.OCIStaging, "blobs", "sha256", lDigest)
-		
-		b.Log.Info(ctx, "extracting layer", "index", i, "digest", layer.Digest)
-		
-		_, err := sst.ExecShell(ctx, b.Log, "tar", "-C", b.RootDir, "-xf", lPath)
-		if err != nil {
-			b.Log.Warn(ctx, "failed to extract layer blob (it may be metadata)", "digest", layer.Digest)
-		}
+	b.Log.Info(ctx, "exporting flattened filesystem", "tarball", tmpTar)
+	if err := crane.Export(img, f); err != nil {
+		f.Close()
+		_ = os.Remove(tmpTar)
+		b.Log.Diagnose(ctx, "OCI_EXPORT_FAILED", "failed to export image to tarball", "image", b.BaseImage, "error", err.Error())
+		return fmt.Errorf("crane export failed: %w", err)
 	}
+	f.Close()
+
+	// Ensure cleanup of the intermediate tarball
+	defer os.Remove(tmpTar)
+
+	// 6. Extract the flattened tarball to the rootfs using the system tar
+	b.Log.Info(ctx, "extracting filesystem to rootfs", "rootfs", b.RootDir)
+	if _, err := sst.ExecShell(ctx, b.Log, "tar", "-C", b.RootDir, "-xf", tmpTar); err != nil {
+		b.Log.Diagnose(ctx, "OCI_EXTRACT_FAILED", "failed to extract tarball to rootfs", "target_dir", b.RootDir, "error", err.Error())
+		return fmt.Errorf("failed to untar base image: %w", err)
+	}
+
+	b.Log.Info(ctx, "successfully unpacked base image", "image", b.BaseImage)
 	return nil
 }
