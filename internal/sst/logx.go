@@ -203,9 +203,19 @@ func (l *Logx) emit(level Level, msg string, kv ...interface{}) {
 	}
 
 	// Output Routing: 
-	// If it's a TTY, print the beautiful string.
-	// If it's a pipe/file, print the strict JSON.
-	if l.isTTY && l.outTTY != nil {
+	// Check SST_LOG_FORMAT environment variable first.
+	format := strings.ToLower(os.Getenv("SST_LOG_FORMAT"))
+	usePretty := false
+	if format == "text" {
+		usePretty = true
+	} else if format == "json" {
+		usePretty = false
+	} else {
+		// Fallback to original TTY detection
+		usePretty = l.isTTY && l.outTTY != nil
+	}
+
+	if usePretty {
 		l.emitPretty(level, msg, finalFields)
 	} else if l.outJSON != nil {
 		b, _ := json.Marshal(ev)
@@ -234,8 +244,17 @@ func (l *Logx) emitPretty(level Level, msg string, fields map[string]interface{}
 		return
 	}
 	l.lastPretty = line
-	// Explicit CR + LF ensures no staircasing in raw terminal mode
-	fmt.Fprintf(l.outTTY, "%s\r\n", line)
+	
+	// Select the correct writer in case outTTY is nil (e.g. forced via format string)
+	out := l.outTTY
+	if out == nil {
+		out = l.outJSON
+	}
+
+	if out != nil {
+		// Explicit CR + LF ensures no staircasing in raw terminal mode
+		fmt.Fprintf(out, "%s\r\n", line)
+	}
 }
 
 func formatPretty(sub string, level Level, msg string, f map[string]interface{}) string {

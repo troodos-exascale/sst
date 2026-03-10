@@ -339,7 +339,7 @@ func (r *Runctl) sshCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "ssh <name>",
 		Short: "SSH into a running instance",
-		Args:  cobra.ExactArgs(1),
+		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			instName := args[0]
 			inst, err := r.loadInstance(instName)
@@ -372,7 +372,6 @@ func (r *Runctl) sshCmd() *cobra.Command {
 
 			fmt.Printf("Connecting to %s@%s...\n", u.Username, ip)
 
-			// Exec syscall replaces the runctl process with ssh
 			sshArgs := []string{
 				"ssh",
 				"-i", filepath.Join(u.HomeDir, ".ssh", "id_ed25519"),
@@ -382,7 +381,13 @@ func (r *Runctl) sshCmd() *cobra.Command {
 				fmt.Sprintf("%s@%s", u.Username, ip),
 			}
 			
+			// <-- NEW: Append any trailing commands provided by the user
+			if len(args) > 1 {
+				sshArgs = append(sshArgs, args[1:]...)
+			}
+			
 			return syscall.Exec(sshBin, sshArgs, os.Environ())
+			
 		},
 	}
 }

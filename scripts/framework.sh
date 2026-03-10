@@ -7,6 +7,9 @@
 # - Propagates SST_CALL_PATH
 # - Compatible with Go logx + future OTEL
 
+# Default to text for human terminal usage if not specified
+export SST_LOG_FORMAT="${SST_LOG_FORMAT:-text}"
+
 # ===== guards =====
 if [[ -n "${__SST_FRAMEWORK_LOADED:-}" ]]; then return 0; fi
 __SST_FRAMEWORK_LOADED=1
@@ -32,32 +35,46 @@ _sanitize() {
 #
 # LEVEL: debug | info | warn | error
 #
+
 logx() {
-  local level="$1"; shift
-  local msg="$1"; shift
-
-  printf '{'
-  printf '"level":"%s",' "$level"
-  printf '"time":"%s",' "$(_now_iso)"
-  printf '"pid":%d,' "$$"
-
-  if [[ -n "$SST_CALL_PATH" ]]; then
-    printf '"call_path":"%s",' "$SST_CALL_PATH"
-  fi
-  if [[ -n "$SST_TRACE_ID" ]]; then
-    printf '"trace_id":"%s",' "$SST_TRACE_ID"
-  fi
-
-  printf '"message":"%s"' "$msg"
-
-  for kv in "$@"; do
-    key="${kv%%=*}"
-    val="${kv#*=}"
-    printf ',"%s":"%s"' "$key" "$val"
-  done
-
-  printf '}\n'
+    local level="$1"; shift
+    local msg="$1"; shift
+    local time_str=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    
+    if [[ "$SST_LOG_FORMAT" == "json" ]]; then
+        # Build a basic JSON string
+        local json="{\"time\":\"$time_str\",\"level\":\"$level\",\"message\":\"$msg\""
+        while [[ $# -gt 1 ]]; do
+            json+=",\"$1\":\"$2\""
+            shift 2
+        done
+        json+="}"
+        echo "$json" >&2
+    else
+        # Pretty Text Formatting
+        local c_rst="\033[0m"
+        local c_lvl="\033[0m"
+        local c_dim="\033[90m"
+        
+        case "$level" in
+            info)  c_lvl="\033[36m" ;;
+            warn)  c_lvl="\033[33m" ;;
+            error|fatal) c_lvl="\033[31m" ;;
+            debug) c_lvl="\033[90m" ;;
+        esac
+        
+        local lvl_upper=$(echo "$level" | tr '[:lower:]' '[:upper:]')
+        local lvl_pad=$(printf "%-5s" "$lvl_upper")
+        local out="${c_dim}${time_str}${c_rst} ${c_lvl}${lvl_pad}${c_rst} ${msg}"
+        
+        while [[ $# -gt 1 ]]; do
+            out+=" ${c_dim}$1=${c_rst}$2"
+            shift 2
+        done
+        echo -e "$out" >&2
+    fi
 }
+
 
 die() {
   logx error "fatal" msg="$*"
