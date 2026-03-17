@@ -151,7 +151,7 @@ func (r *Runctl) Start(name string) error {
 		return fmt.Errorf("failed to create process shim symlink: %w", err)
 	}
 
-	r.Log.Info(r.Ctx, "starting aligned vmm", "bin", "./"+inst.Name, "target", crosvmPath)
+	r.Log.Info(r.Ctx, "starting aligned vmm", "bin", "./"+inst.Name, "target", crosvmPath, "args", args)
 
 	cmd := exec.CommandContext(r.Ctx, "./"+inst.Name, args...)
 	cmd.Dir = instDir

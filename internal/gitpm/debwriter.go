@@ -133,7 +133,7 @@ func writeDataTar(path, dir string) error {
 		hdr.ModTime = time.Unix(0, 0)
 		hdr.Uid, hdr.Gid = 0, 0
 		hdr.Uname, hdr.Gname = "root", "root"
-		
+
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
 		}

@@ -12,13 +12,12 @@ import (
 	"github.com/swiss-software-tool/sst/internal/sst"
 )
 
-// Instruction represents a parsed line or block in the IR
 type Instruction struct {
 	Type       string
 	Args       string
-	Location   string   // "root", "base", "boot"
-	Context    string   // "chroot", "host"
-	Conditions []string // "all", "oci", "qcow2", "aws", etc.
+	Location   string
+	Context    string
+	Conditions []string
 }
 
 type BuildApp struct {
@@ -44,7 +43,6 @@ type BuildApp struct {
 
 	RuntimeDir  string
 	RootDir     string
-	OCIStaging  string
 	ImageOutput string
 }
 
@@ -90,7 +88,7 @@ func parseModifiers(modStr string) (string, string, []string) {
 			parsedConds = append(parsedConds, m)
 		}
 	}
-	
+
 	if len(parsedConds) > 0 {
 		conds = parsedConds
 	}
@@ -100,21 +98,15 @@ func parseModifiers(modStr string) (string, string, []string) {
 func desugarCopy(args string) Instruction {
 	parts := strings.Fields(args)
 	if len(parts) < 2 {
-		return Instruction{Type: "COPY", Args: args} 
+		return Instruction{Type: "COPY", Args: args}
 	}
 	dst := parts[len(parts)-1]
 	srcs := strings.Join(parts[:len(parts)-1], " ")
 
-	script := fmt.Sprintf("DST=\"${ROOTFS}/%s\"\nmkdir -p \"$(dirname \"$DST\")\"\ncp -a %s \"$DST\"", 
+	script := fmt.Sprintf("DST=\"${ROOTFS}/%s\"\nmkdir -p \"$(dirname \"$DST\")\"\ncp -a %s \"$DST\"",
 		strings.TrimPrefix(dst, "/"), srcs)
 
-	return Instruction{
-		Type:       "RUN",
-		Args:       script,
-		Location:   "root",
-		Context:    "host",
-		Conditions: []string{"all"},
-	}
+	return Instruction{Type: "RUN", Args: script, Location: "root", Context: "host", Conditions: []string{"all"}}
 }
 
 func desugarAdd(args string) Instruction {
@@ -123,27 +115,20 @@ func desugarAdd(args string) Instruction {
 		return Instruction{Type: "ADD", Args: args}
 	}
 	dst := parts[len(parts)-1]
-	src := parts[0] // Simplified for single source
+	src := parts[0]
 
 	var script string
 	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
-		script = fmt.Sprintf("DST=\"${ROOTFS}/%s\"\nmkdir -p \"$(dirname \"$DST\")\"\ncurl -sL '%s' -o \"$DST\"", strings.TrimPrefix(dst, "/"), src)
+		script = fmt.Sprintf("DST=\"${ROOTFS}/%s\"\nmkdir -p \"$(dirname \"$DST\")\"\ncurl -sSL '%s' -o \"$DST\"", strings.TrimPrefix(dst, "/"), src)
 	} else if strings.HasSuffix(src, ".tar.gz") || strings.HasSuffix(src, ".tgz") {
 		script = fmt.Sprintf("DST=\"${ROOTFS}/%s\"\nmkdir -p \"$DST\"\ntar -xzf '%s' -C \"$DST\"", strings.TrimPrefix(dst, "/"), src)
 	} else {
 		script = fmt.Sprintf("DST=\"${ROOTFS}/%s\"\nmkdir -p \"$(dirname \"$DST\")\"\ncp -a '%s' \"$DST\"", strings.TrimPrefix(dst, "/"), src)
 	}
 
-	return Instruction{
-		Type:       "RUN",
-		Args:       script,
-		Location:   "root",
-		Context:    "host",
-		Conditions: []string{"all"},
-	}
+	return Instruction{Type: "RUN", Args: script, Location: "root", Context: "host", Conditions: []string{"all"}}
 }
 
-// resolveIncludePath checks relative to the current file, then the standard library.
 func (b *BuildApp) resolveIncludePath(currentFile, target string) (string, error) {
 	if filepath.IsAbs(target) {
 		if _, err := os.Stat(target); err == nil {
@@ -151,27 +136,46 @@ func (b *BuildApp) resolveIncludePath(currentFile, target string) (string, error
 		}
 	}
 
-	// 1. Relative to the file currently being parsed
 	relPath := filepath.Join(filepath.Dir(currentFile), target)
-	if _, err := os.Stat(relPath); err == nil { return relPath, nil }
-	if _, err := os.Stat(relPath + ".dockerfile"); err == nil { return relPath + ".dockerfile", nil }
+	if _, err := os.Stat(relPath); err == nil {
+		return relPath, nil
+	}
+	if _, err := os.Stat(relPath + ".dockerfile"); err == nil {
+		return relPath + ".dockerfile", nil
+	}
 
-	// 2. The System-wide Standard Library
 	stdPath := filepath.Join("/usr/local/share/mkimg/templates", target)
-	if _, err := os.Stat(stdPath); err == nil { return stdPath, nil }
-	if _, err := os.Stat(stdPath + ".dockerfile"); err == nil { return stdPath + ".dockerfile", nil }
+	if _, err := os.Stat(stdPath); err == nil {
+		return stdPath, nil
+	}
+	if _, err := os.Stat(stdPath + ".dockerfile"); err == nil {
+		return stdPath + ".dockerfile", nil
+	}
 
 	return "", fmt.Errorf("include file not found: %s", target)
 }
 
 func (b *BuildApp) Parse(ctx context.Context) error {
 	visited := make(map[string]bool)
+
+	// If the provided Dockerfile path isn't absolute and doesn't exist, check standard templates
+	// (This enables `mkimg pullvm` and `mkimg instance` to seamlessly load their templates)
+	if !filepath.IsAbs(b.Dockerfile) {
+		if _, err := os.Stat(b.Dockerfile); os.IsNotExist(err) {
+			if stdPath, err := b.resolveIncludePath("", b.Dockerfile); err == nil {
+				b.Dockerfile = stdPath
+			}
+		}
+	}
+
 	return b.parseFile(ctx, b.Dockerfile, visited)
 }
 
 func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[string]bool) error {
 	absPath, err := filepath.Abs(filePath)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 
 	if visited[absPath] {
 		return fmt.Errorf("circular INCLUDE detected: %s", absPath)
@@ -204,11 +208,7 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 		if isMultiline {
 			if len(line) > 0 && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
 				b.Instructions = append(b.Instructions, Instruction{
-					Type:       mlType,
-					Args:       strings.Join(currentBlock, "\n"),
-					Location:   mlLoc,
-					Context:    mlCtx,
-					Conditions: mlConds,
+					Type: mlType, Args: strings.Join(currentBlock, "\n"), Location: mlLoc, Context: mlCtx, Conditions: mlConds,
 				})
 				currentBlock = nil
 				isMultiline = false
@@ -234,7 +234,7 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 			baseType := strings.ToUpper(matches[1])
 			modStr := matches[2]
 			args := strings.TrimSpace(matches[3])
-			
+
 			loc, execCtx, conds := parseModifiers(modStr)
 
 			if args == "|" {
@@ -246,7 +246,7 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 				continue
 			}
 
-			// --- RECURSIVE INCLUDE HANDLING ---
+			// --- RECURSIVE INCLUDE ---
 			if baseType == "INCLUDE" {
 				resolvedPath, err := b.resolveIncludePath(absPath, args)
 				if err != nil {
@@ -259,31 +259,54 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 				continue
 			}
 
-			inst := Instruction{
-				Type:       baseType,
-				Args:       args,
-				Location:   loc,
-				Context:    execCtx,
-				Conditions: conds,
+			// --- DESUGAR EMIT TO INCLUDES ---
+			if baseType == "EMIT" {
+				b.Instructions = append(b.Instructions, Instruction{Type: baseType, Args: args})
+				formats := strings.Split(args, ",")
+				for _, f := range formats {
+					format := strings.TrimSpace(f)
+					resolvedPath, err := b.resolveIncludePath(absPath, "emit-"+format)
+					if err == nil {
+						b.Log.Info(ctx, "desugaring EMIT to INCLUDE", "format", format, "file", resolvedPath)
+						if err := b.parseFile(ctx, resolvedPath, visited); err != nil {
+							return err
+						}
+					} else {
+						b.Log.Warn(ctx, "no template found for EMIT format", "format", format)
+					}
+				}
+				continue
 			}
 
+			// --- DESUGAR FROM TO INCLUDES ---
+			if baseType == "FROM" {
+				b.Instructions = append(b.Instructions, Instruction{Type: baseType, Args: args})
+				// Desugar cleanly: If it's not scratch and not a URL, it's an OCI image.
+				if args != "scratch" && !strings.Contains(args, "://") {
+					resolvedPath, err := b.resolveIncludePath(absPath, "from-oci")
+					if err == nil {
+						b.Log.Info(ctx, "desugaring FROM to INCLUDE", "file", resolvedPath)
+						if err := b.parseFile(ctx, resolvedPath, visited); err != nil {
+							return err
+						}
+					}
+				}
+				continue
+			}
+
+			inst := Instruction{Type: baseType, Args: args, Location: loc, Context: execCtx, Conditions: conds}
 			if inst.Type == "COPY" {
 				inst = desugarCopy(inst.Args)
 			} else if inst.Type == "ADD" {
 				inst = desugarAdd(inst.Args)
 			}
-
 			b.Instructions = append(b.Instructions, inst)
 		}
 	}
 
 	if isMultiline && len(currentBlock) > 0 {
 		b.Instructions = append(b.Instructions, Instruction{
-			Type:       mlType,
-			Args:       strings.Join(currentBlock, "\n"),
-			Location:   mlLoc,
-			Context:    mlCtx,
-			Conditions: mlConds,
+			Type: mlType, Args: strings.Join(currentBlock, "\n"), Location: mlLoc, Context: mlCtx, Conditions: mlConds,
 		})
 	}
 
@@ -299,8 +322,12 @@ func (b *BuildApp) PreProcess(ctx context.Context) error {
 
 	for _, inst := range b.Instructions {
 		args := os.Expand(inst.Args, func(k string) string {
-			if v, ok := tmpEnv[k]; ok { return v }
-			if v, ok := tmpArgs[k]; ok { return v }
+			if v, ok := tmpEnv[k]; ok {
+				return v
+			}
+			if v, ok := tmpArgs[k]; ok {
+				return v
+			}
 			return ""
 		})
 
@@ -349,18 +376,22 @@ func (b *BuildApp) PreProcess(ctx context.Context) error {
 	if len(b.Emits) == 0 {
 		b.Emits = append(b.Emits, "raw")
 	}
-
 	if b.BaseImage == "" {
 		return fmt.Errorf("no FROM instruction found in Dockerfile")
 	}
 
+	b.RootDir = filepath.Join(b.RuntimeDir, "build", b.Name, "rootfs")
 	return nil
 }
 
 func (b *BuildApp) Substitute(val string) string {
 	return os.Expand(val, func(k string) string {
-		if v, ok := b.Env[k]; ok { return v }
-		if v, ok := b.Args[k]; ok { return v }
+		if v, ok := b.Env[k]; ok {
+			return v
+		}
+		if v, ok := b.Args[k]; ok {
+			return v
+		}
 		return ""
 	})
 }

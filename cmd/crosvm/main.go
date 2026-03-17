@@ -1,4 +1,5 @@
 //go:build darwin
+
 package main
 
 /*
@@ -47,7 +48,7 @@ func runSupervisor() {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
-	
+
 	go func() {
 		for sig := range sigCh {
 			_ = cmd.Process.Signal(sig)
@@ -83,16 +84,16 @@ type CrosvmApp struct {
 	ShutdownTimeout float64
 	Gui             bool
 
-	NestedVirt      bool
-	CdromPaths      []string
-	Balloon         bool
-	
+	NestedVirt bool
+	CdromPaths []string
+	Balloon    bool
+
 	// Internal inferred state
-	Bootloader      string
-	EfiVars         string
+	Bootloader string
+	EfiVars    string
 
 	// Ignored upstream flags (prevent wrapper crash if runctl sends them)
-	dummyBios       string
+	dummyBios string
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -113,7 +114,7 @@ func runWorker() {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}
-	
+
 	runCmd := &cobra.Command{
 		Use:   "run",
 		Short: "macOS VMM (crosvm-aligned flags)",
@@ -122,7 +123,7 @@ func runWorker() {
 			if len(args) > 0 && app.Kernel == "" {
 				app.Kernel = args[0]
 			}
-			
+
 			app.ctx, app.cancel = context.WithCancel(context.Background())
 			app.steps = sst.StepsInit("crosvm")
 			app.steps.StepsAdd("validate", app.stepValidate)
@@ -151,15 +152,15 @@ func runWorker() {
 	f.StringVar(&app.Name, "name", "vm", "Instance name")
 	f.IntVar(&app.CPUCount, "cpus", 1, "CPU count")
 	f.Uint64Var(&app.MemorySize, "mem", 512, "Memory size (MiB)")
-	
+
 	f.StringSliceVar(&app.Blocks, "block", []string{}, "Block devices (path=...,ro=...)")
 	f.StringSliceVar(&app.Networks, "net", []string{"nat"}, "Network config")
 	f.StringSliceVar(&app.SharedDirs, "shared-dir", []string{}, "Shared directories")
-	
+
 	f.BoolVar(&app.NestedVirt, "nested-virt", false, "Enable nested virtualization")
 	f.StringSliceVar(&app.CdromPaths, "cdrom", []string{}, "CD-ROMs")
 	f.BoolVar(&app.Balloon, "balloon", true, "Enable memory ballooning")
-	
+
 	// FIX: Align EFI flags with upstream crosvm
 	f.StringVar(&app.EfiVars, "pflash", "", "Path to EFI variables (upstream pflash equivalent)")
 	f.StringVar(&app.dummyBios, "bios", "", "BIOS/UEFI payload (ignored on macOS, VZ provides its own)")
@@ -168,7 +169,7 @@ func runWorker() {
 	f.StringVar(&app.Params, "params", "", "Cmdline")
 	f.BoolVar(&app.Gui, "gui", false, "Show GUI window")
 	f.Float64Var(&app.ShutdownTimeout, "shutdown-timeout", 120.0, "Graceful timeout")
-	
+
 	rootCmd.AddCommand(runCmd)
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\r\n", err)
@@ -223,7 +224,9 @@ func (a *CrosvmApp) stepValidate(ctx *sst.StepsContext, s sst.StepState) error {
 
 func (a *CrosvmApp) stepConfigureVM(ctx *sst.StepsContext, s sst.StepState) error {
 	vm, err := NewVMWrapper(a)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	a.vm = vm
 	return nil
 }

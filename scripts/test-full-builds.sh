@@ -13,25 +13,18 @@ if [[ $# -lt 1 ]]; then
 fi
 
 DOCKERFILE="$1"
-# Default to 'ub' if you don't provide a second argument
 BUILD_HOST="${2:-ub}" 
 
 UBUNTU_RUNTIMES_DIR="/home/braam/.runtimes"
 MAC_RUNTIMES_DIR="${HOME}/.runtimes"
 
-# FIX 1: Tell awk to treat both spaces AND colons as delimiters so "NAME: alpine-vm" parses perfectly
 IMAGE_NAME=$(awk -F'[: \t]+' 'tolower($1) == "name" {print $2}' "$DOCKERFILE" | tr -d '"\r\n' | head -n 1 || true)
-
 if [[ -z "$IMAGE_NAME" ]]; then
     IMAGE_NAME=$(basename "$DOCKERFILE" .dockerfile)
-    logx warn "NAME directive not found or unparseable, falling back to filename" fallback "$IMAGE_NAME"
 fi
 
 INSTANCE_NAME="test-run-${IMAGE_NAME}"
-
-# Ensure absolute path for the dockerfile
 DOCKERFILE_ABS="$(cd "$(dirname "$DOCKERFILE")" && pwd)/$(basename "$DOCKERFILE")"
-WORK_DIR="$PWD"
 VM_PID=""
 
 # --- Teardown Hook ---
@@ -53,54 +46,79 @@ trap cleanup EXIT
 logx info "roundtrip.start" image "$IMAGE_NAME" instance "$INSTANCE_NAME" host "$BUILD_HOST"
 
 # ---------------------------------------------------------
-# Phase 1: Build on Linux (via runctl ssh)
+# Phase 1: Build (Delegates to 'ub' using Linux ZFS disk)
 # ---------------------------------------------------------
-step_enter "build_on_linux"
-
-# FIX 2: We evaluate SST_LOG_FORMAT on the Mac, and hardcode it inline with sudo 
-# so neither SSH nor sudo can strip it out!
-REMOTE_SCRIPT="
-set -euo pipefail
-cd '$WORK_DIR'
-echo '--> Running mkimg build on linux...'
-
-sudo SST_LOG_FORMAT='${SST_LOG_FORMAT:-text}' mkimg build -d '$UBUNTU_RUNTIMES_DIR' '$DOCKERFILE_ABS'
-
-echo '--> Fixing ownership & transferring to Mac filesystem...'
-sudo chown -R \$(whoami) '$UBUNTU_RUNTIMES_DIR'
-
-rm -rf '$MAC_RUNTIMES_DIR/images/$IMAGE_NAME'
-mv '$UBUNTU_RUNTIMES_DIR/images/$IMAGE_NAME' '$MAC_RUNTIMES_DIR/images/'
-"
-
-run runctl ssh "$BUILD_HOST" "$REMOTE_SCRIPT"
+step_enter "build_image"
+# We explicitly pass the Ubuntu directory. mkimg automatically delegates this command to 'ub'.
+run mkimg build -d "$UBUNTU_RUNTIMES_DIR" "$DOCKERFILE_ABS"
 step_ok
 
 # ---------------------------------------------------------
-# Phase 2: Instantiate on macOS
+# Phase 2: Instantiate (Delegates to 'ub' using Linux ZFS disk)
 # ---------------------------------------------------------
 step_enter "instantiate_vm"
-run mkimg instance "$IMAGE_NAME" "$INSTANCE_NAME" --force
+
+# Ensure genisoimage is installed on Ubuntu so cidata generation doesn't fail with exit code 127
+logx info "checking for genisoimage on build host..."
+runctl ssh "$BUILD_HOST" "if ! command -v genisoimage >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y genisoimage; fi" >/dev/null 2>&1 || true
+
+# Extract semantic name. The extra 'tail -n 1' strips runctl's "Connecting to..." banner.
+SEMANTIC_NAME=$(runctl ssh "$BUILD_HOST" "ls -1rt '$UBUNTU_RUNTIMES_DIR/images/' | grep alpine" | tail -n 1 | tr -d '\r')
+if [[ -z "$SEMANTIC_NAME" ]]; then
+    SEMANTIC_NAME="$IMAGE_NAME"
+fi
+logx info "detected semantic image name" name "$SEMANTIC_NAME"
+
+# Explicitly instruct mkimg to use the Ubuntu ZFS runtime dir for instance creation
+run mkimg instance -d "$UBUNTU_RUNTIMES_DIR" "$SEMANTIC_NAME" "$INSTANCE_NAME" --force
 step_ok
 
 # ---------------------------------------------------------
-# Phase 3: Start VM
+# Phase 3: Sync from ZFS (ub) to macOS
+# ---------------------------------------------------------
+step_enter "sync_artifacts"
+logx info "syncing built artifacts from Linux ZFS back to macOS"
+SYNC_SCRIPT="
+sudo chown -R \$(whoami) '$UBUNTU_RUNTIMES_DIR/images/' '$UBUNTU_RUNTIMES_DIR/instances/'
+mkdir -p '$MAC_RUNTIMES_DIR/images/' '$MAC_RUNTIMES_DIR/instances/'
+cp -a '$UBUNTU_RUNTIMES_DIR/images/.' '$MAC_RUNTIMES_DIR/images/'
+cp -a '$UBUNTU_RUNTIMES_DIR/instances/.' '$MAC_RUNTIMES_DIR/instances/'
+"
+run runctl ssh "$BUILD_HOST" "$SYNC_SCRIPT"
+step_ok
+
+# ---------------------------------------------------------
+# Phase 4: Start VM natively on macOS
 # ---------------------------------------------------------
 step_enter "start_vm"
 logx info "starting vm in background" instance "$INSTANCE_NAME"
+# runctl defaults to ~/.runtimes natively on macOS
 runctl start "$INSTANCE_NAME" &
 VM_PID=$!
 
-logx info "waiting for VM to boot..."
-run sleep 10
+logx info "waiting for VM to boot and acquire IP..."
+run sleep 15
 step_ok
 
 # ---------------------------------------------------------
-# Phase 4: Verify via SSH
+# Phase 5: Verify SSH
 # ---------------------------------------------------------
 step_enter "verify_ssh"
 logx info "executing 'uname -a' inside the VM"
-run runctl ssh "$INSTANCE_NAME" "uname -a"
+
+ssh_success=false
+for i in {1..3}; do
+    if runctl ssh "$INSTANCE_NAME" "uname -a"; then
+        ssh_success=true
+        break
+    fi
+    logx warn "SSH failed, retrying in 5 seconds..."
+    sleep 5
+done
+
+if [ "$ssh_success" = false ]; then
+    die "Failed to connect to the VM via SSH after 3 attempts."
+fi
 step_ok
 
 logx info "roundtrip.success"

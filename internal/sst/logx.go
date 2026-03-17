@@ -202,7 +202,7 @@ func (l *Logx) emit(level Level, msg string, kv ...interface{}) {
 		ev[k] = v
 	}
 
-	// Output Routing: 
+	// Output Routing:
 	// Check SST_LOG_FORMAT environment variable first.
 	format := strings.ToLower(os.Getenv("SST_LOG_FORMAT"))
 	usePretty := false
@@ -244,7 +244,7 @@ func (l *Logx) emitPretty(level Level, msg string, fields map[string]interface{}
 		return
 	}
 	l.lastPretty = line
-	
+
 	// Select the correct writer in case outTTY is nil (e.g. forced via format string)
 	out := l.outTTY
 	if out == nil {
@@ -268,11 +268,16 @@ func formatPretty(sub string, level Level, msg string, f map[string]interface{})
 	// 2. Level
 	lvlStr := fmt.Sprintf("%-5s", strings.ToUpper(string(level)))
 	switch level {
-	case LevelError: sb.WriteString(colorRed + lvlStr + colorReset)
-	case LevelWarn:  sb.WriteString(colorYellow + lvlStr + colorReset)
-	case LevelInfo:  sb.WriteString(colorBlue + lvlStr + colorReset)
-	case LevelDebug: sb.WriteString(colorGray + lvlStr + colorReset)
-	default:         sb.WriteString(lvlStr)
+	case LevelError:
+		sb.WriteString(colorRed + lvlStr + colorReset)
+	case LevelWarn:
+		sb.WriteString(colorYellow + lvlStr + colorReset)
+	case LevelInfo:
+		sb.WriteString(colorBlue + lvlStr + colorReset)
+	case LevelDebug:
+		sb.WriteString(colorGray + lvlStr + colorReset)
+	default:
+		sb.WriteString(lvlStr)
 	}
 	sb.WriteString(" ")
 
@@ -296,7 +301,11 @@ func formatPretty(sub string, level Level, msg string, f map[string]interface{})
 		delete(f, "to")
 	case "exec.start":
 		sb.WriteString(fmt.Sprintf("$ %v", f["cmdline"]))
+		// Nip the double-output in the bud!
 		delete(f, "cmdline")
+		delete(f, "args")
+		delete(f, "cmd")
+		delete(f, "mode")
 	case "exec.ok":
 		if d, ok := f["duration_ms"]; ok {
 			sb.WriteString(fmt.Sprintf("✓ done (%v ms)", d))
@@ -304,6 +313,10 @@ func formatPretty(sub string, level Level, msg string, f map[string]interface{})
 		} else {
 			sb.WriteString("✓ done")
 		}
+		// Stop dumping the script again on success!
+		delete(f, "cmdline")
+		delete(f, "cmd")
+		delete(f, "args")
 	default:
 		if level == LevelError {
 			sb.WriteString(colorRed + "✗ " + msg + colorReset)

@@ -126,16 +126,16 @@ RUN: echo "main"`
 	assert.NoError(t, err)
 
 	assert.Equal(t, 5, len(builder.Instructions))
-	
+
 	assert.Equal(t, "FROM", builder.Instructions[0].Type)
 	assert.Equal(t, "NAME", builder.Instructions[1].Type)
-	
+
 	assert.Equal(t, "RUN", builder.Instructions[2].Type)
 	assert.Contains(t, builder.Instructions[2].Args, "format disk")
-	
+
 	assert.Equal(t, "RUN", builder.Instructions[3].Type)
 	assert.Contains(t, builder.Instructions[3].Args, "local setup")
-	
+
 	assert.Equal(t, "RUN", builder.Instructions[4].Type)
 	assert.Contains(t, builder.Instructions[4].Args, "main")
 }

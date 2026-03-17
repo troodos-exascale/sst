@@ -1,4 +1,5 @@
 //go:build darwin
+
 package main
 
 /*
@@ -147,8 +148,8 @@ func NewVMWrapper(app *CrosvmApp) (*VMWrapper, error) {
 	}
 
 	wrapper := &VMWrapper{
-		machine: vm, 
-		config:  config, 
+		machine: vm,
+		config:  config,
 		errCh:   make(chan error, 1),
 		doneCh:  make(chan struct{}),
 	}
@@ -160,8 +161,8 @@ func (v *VMWrapper) Start(ctx context.Context) error {
 		return err
 	}
 
-	// NEW: Monitor VM state in the background. 
-	// This ensures that when the guest OS halts (via ACPI or internal shutdown), 
+	// NEW: Monitor VM state in the background.
+	// This ensures that when the guest OS halts (via ACPI or internal shutdown),
 	// we instantly close the done channel so the wrapper can cleanly exit.
 	go func() {
 		for {
@@ -224,9 +225,9 @@ func createBootloader(app *CrosvmApp) (vz.BootLoader, error) {
 			vz.WithInitrd(app.Initrd),
 		)
 	}
-	
+
 	store, err := vz.NewEFIVariableStore(
-		app.EfiVars, 
+		app.EfiVars,
 		vz.WithCreatingEFIVariableStore(),
 	)
 	if err != nil {
@@ -271,10 +272,10 @@ func createNetworkConfig(netStr string) (*vz.VirtioNetworkDeviceConfiguration, e
 				macStr = kv[1]
 			}
 		} else if len(kv) == 1 && kv[0] != "" {
-            if strings.Contains(kv[0], ":") {
-                macStr = kv[0]
-            }
-        }
+			if strings.Contains(kv[0], ":") {
+				macStr = kv[0]
+			}
+		}
 	}
 
 	attachment, err := vz.NewNATNetworkDeviceAttachment()
@@ -298,7 +299,7 @@ func createNetworkConfig(netStr string) (*vz.VirtioNetworkDeviceConfiguration, e
 		}
 		dev.SetMACAddress(mac)
 	}
-	
+
 	return dev, nil
 }
 

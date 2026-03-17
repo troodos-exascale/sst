@@ -1,6 +1,7 @@
 package rtsst
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -11,6 +12,59 @@ import (
 	"strings"
 	"syscall"
 )
+
+// ParseOSRelease reads os-release from a mounted filesystem.
+func ParseOSRelease(rootfsPath string) (map[string]string, error) {
+	target := filepath.Join(rootfsPath, "etc", "os-release")
+	if _, err := os.Stat(target); os.IsNotExist(err) {
+		target = filepath.Join(rootfsPath, "usr", "lib", "os-release")
+	}
+
+	f, err := os.Open(target)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	data := make(map[string]string)
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			data[strings.TrimSpace(parts[0])] = strings.Trim(strings.TrimSpace(parts[1]), `"'`)
+		}
+	}
+	return data, scanner.Err()
+}
+
+// GenerateSemanticName constructs the canonical <ID>-<VERSION>-<VARIANT>-<BUILD> name.
+func GenerateSemanticName(info map[string]string) string {
+	id := info["ID"]
+	if id == "" {
+		id = "linux"
+	}
+	versionID := info["VERSION_ID"]
+	if versionID == "" {
+		versionID = "unknown"
+	}
+
+	name := fmt.Sprintf("%s-%s", id, versionID)
+
+	if variant, ok := info["VARIANT_ID"]; ok && variant != "" {
+		name = fmt.Sprintf("%s-%s", name, variant)
+	}
+	if buildID, ok := info["BUILD_ID"]; ok && buildID != "" {
+		// Clean the build ID of unsafe filename characters just in case
+		cleanBuild := strings.ReplaceAll(buildID, ":", "")
+		name = fmt.Sprintf("%s-%s", name, cleanBuild)
+	}
+
+	return name
+}
 
 func GetFileOwnership(path string) (int, int, error) {
 	info, err := os.Stat(path)

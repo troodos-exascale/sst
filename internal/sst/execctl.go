@@ -12,33 +12,18 @@ import (
 	"time"
 )
 
-//
-// ============================================================================
-// Execution mode
-// ============================================================================
-
 type ExecMode int
 
 const (
-	// Capture stdout/stderr into buffers (default)
 	ExecCaptured ExecMode = iota
-
-	// Inherit stdin/stdout/stderr (runvm-style foreground execution)
 	ExecForeground
 )
-
-//
-// ============================================================================
-// Request / Result
-// ============================================================================
 
 type ExecRequest struct {
 	Cmd  string
 	Args []string
-
-	Dir string
-	Env []string
-
+	Dir  string
+	Env  []string
 	Mode ExecMode
 }
 
@@ -48,11 +33,6 @@ type ExecResult struct {
 	Stderr   string
 	Duration time.Duration
 }
-
-//
-// ============================================================================
-// Typed execution error
-// ============================================================================
 
 type ExecError struct {
 	Cmd      string
@@ -77,19 +57,7 @@ func (e *ExecError) Error() string {
 	return fmt.Sprintf("command failed (%d): %s", e.ExitCode, cmdline)
 }
 
-//
-// ============================================================================
-// Public entry point
-// ============================================================================
-
-// ExecShell executes a command with captured stdout/stderr.
-// Updated to take *Logx to prevent lock copying.
-func ExecShell(
-	ctx context.Context,
-	log *Logx,
-	cmd string,
-	args ...string,
-) (*ExecResult, error) {
+func ExecShell(ctx context.Context, log *Logx, cmd string, args ...string) (*ExecResult, error) {
 	return Exec(ctx, log, ExecRequest{
 		Cmd:  cmd,
 		Args: args,
@@ -97,12 +65,9 @@ func ExecShell(
 	})
 }
 
-// Exec executes the request.
-// Updated to take *Logx to prevent lock copying.
 func Exec(ctx context.Context, log *Logx, req ExecRequest) (*ExecResult, error) {
 	start := time.Now()
 
-	// Canonical command line for forensics
 	cmdline := req.Cmd
 	if len(req.Args) > 0 {
 		cmdline += " " + strings.Join(req.Args, " ")
@@ -125,28 +90,16 @@ func Exec(ctx context.Context, log *Logx, req ExecRequest) (*ExecResult, error) 
 	case ExecForeground:
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-
-		// Still capture stderr for diagnostics
 		cmd.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
-
 	default:
 		cmd.Stdout = &stdoutBuf
 		cmd.Stderr = &stderrBuf
 	}
 
 	if err := cmd.Start(); err != nil {
-
-		log.Diagnose(
-			ctx,
-			"EXEC_START_FAILED",
-			"failed to start command",
-			"cmd", req.Cmd,
-			"args", req.Args,
-			"cmdline", cmdline,
-			"error", err.Error(),
+		log.Diagnose(ctx, "EXEC_START_FAILED", "failed to start command",
+			"cmd", req.Cmd, "args", req.Args, "cmdline", cmdline, "error", err.Error(),
 		)
-
 		return nil, err
 	}
 
@@ -175,37 +128,30 @@ func Exec(ctx context.Context, log *Logx, req ExecRequest) (*ExecResult, error) 
 
 	if exitCode != 0 {
 		stderr := strings.TrimSpace(res.Stderr)
+		stdout := strings.TrimSpace(res.Stdout)
+		
+		errMsg := stderr
+		if errMsg == "" && stdout != "" {
+			errMsg = stdout
+		}
 
-		log.Diagnose(
-			ctx,
-			"EXEC_FAILED",
-			"command execution failed",
-			"cmd", req.Cmd,
-			"args", req.Args,
-			"cmdline", cmdline,
-			"exit_code", exitCode,
-			"stderr", stderr,
-			"duration_ms", dur.Milliseconds(),
+		log.Diagnose(ctx, "EXEC_FAILED", "command execution failed",
+			"cmd", req.Cmd, "args", req.Args, "cmdline", cmdline,
+			"exit_code", exitCode, "stderr", errMsg, "duration_ms", dur.Milliseconds(),
 		)
 
-		// Ensure user sees failure immediately
-		if stderr != "" && req.Mode != ExecForeground {
-			fmt.Fprintln(os.Stderr, stderr)
+		if errMsg != "" && req.Mode != ExecForeground {
+			fmt.Fprintln(os.Stderr, errMsg)
 		}
 
 		return res, &ExecError{
 			Cmd:      req.Cmd,
 			Args:     req.Args,
 			ExitCode: exitCode,
-			Stderr:   stderr,
+			Stderr:   errMsg,
 		}
 	}
 
-	log.Info(ctx, "exec.ok",
-		"cmd", req.Cmd,
-		"cmdline", cmdline,
-		"duration_ms", dur.Milliseconds(),
-	)
-
+	log.Info(ctx, "exec.ok", "cmd", req.Cmd, "cmdline", cmdline, "duration_ms", dur.Milliseconds())
 	return res, nil
 }

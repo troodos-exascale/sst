@@ -153,6 +153,10 @@ func GenerateMAC() (string, error) {
 }
 
 func GetLocalPublicKey() (string, error) {
+	if pk := os.Getenv("SST_HOST_PUBKEY"); pk != "" {
+		return pk, nil
+	}
+
 	u, err := user.Current()
 	if err != nil {
 		return "", fmt.Errorf("cannot determine current user: %w", err)
@@ -191,9 +195,13 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 		return fmt.Errorf("failed to get user's local public key: %w", err)
 	}
 
-	user, err := user.Current()
-	if err != nil {
-		return fmt.Errorf("failed to get current user: %w", err)
+	username := os.Getenv("SST_HOST_USER")
+	if username == "" {
+		u, err := user.Current()
+		if err != nil {
+			return fmt.Errorf("failed to get current user: %w", err)
+		}
+		username = u.Username
 	}
 
 	type mountInfo struct {
@@ -240,10 +248,7 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 
 	sb.WriteString("\nusers:\n")
 	sb.WriteString("  - default\n")
-	fmt.Fprintf(&sb, "  - name: %s\n", user.Username)
-	if user.Name != "" {
-		fmt.Fprintf(&sb, "    gecos: %s\n", user.Name)
-	}
+	fmt.Fprintf(&sb, "  - name: %s\n", username)
 	sb.WriteString("    shell: /bin/sh\n") // CHANGED: explicitly use busybox sh
 	if pubKey != "" {
 		sb.WriteString("    ssh_authorized_keys:\n")
@@ -254,7 +259,7 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 
 	sb.WriteString("\nruncmd:\n")
 	sb.WriteString("  - |\n")
-	
+
 	// CHANGED: Inject user shell via sed (no usermod), passwordless doas (no sudo), and hostname cleanly
 	sb.WriteString(fmt.Sprintf(`    if [ -f /etc/alpine-release ]; then
       mkdir -p /etc/conf.d
@@ -274,12 +279,12 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
       
       kill -HUP 1
     fi
-`, user.Username, user.Username, user.Username, inst.Hostname, inst.Hostname))
+`, username, username, username, inst.Hostname, inst.Hostname))
 
 	for _, m := range mounts {
 		sb.WriteString("  - |\n")
 		fmt.Fprintf(&sb, "    mkdir -p %s\n", m.guestPath)
-		fmt.Fprintf(&sb, "    mount -t virtiofs %s %s -o %s\n", m.tag, m.guestPath, m.options)
+		fmt.Fprintf(&sb, "    mount -t virtiofs %s %s -o %s\n", m.options)
 	}
 
 	userData := sb.String()
