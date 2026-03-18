@@ -24,6 +24,10 @@ vet: tidy
 	@echo "--> Vetting Go code..."
 	go vet ./...
 
+fmt:
+	@echo "--> Formatting Go code..."
+	go fmt ./...
+
 test: tidy
 	@echo "--> Running tests..."
 	go test -v ./...

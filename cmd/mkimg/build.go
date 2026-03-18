@@ -14,23 +14,33 @@ import (
 var buildArgs []string
 
 // RunBuildEngine is the universal entrypoint for parsing and executing VAXLang DAGs.
-func RunBuildEngine(ctx context.Context, dockerfile, runtimeDir string, bArgs map[string]string) error {
+func RunBuildEngine(ctx context.Context, dockerfile, runtimeDir string, flagForce bool, bArgs map[string]string) error {
 	log := sst.LogxRoot().Subsystem("mkimage.build")
 	builder := rtsst.NewBuilder(log, nil, dockerfile, runtimeDir)
-	
+	builder.Force = flagForce
+
 	for k, v := range bArgs {
 		builder.BuildArgs[k] = v
 	}
 
-	if err := builder.Parse(ctx); err != nil { return err }
-	if err := builder.PreProcess(ctx); err != nil { return err }
+	if err := builder.Parse(ctx); err != nil {
+		return err
+	}
+	if err := builder.PreProcess(ctx); err != nil {
+		return err
+	}
+
+	// NEW: Initialize the ZFS Dataset topology
+	if err := builder.InitEnvironment(ctx); err != nil {
+		return err
+	}
 
 	runner := sst.StepsInit("mkimage.build")
-	
+
 	for i, inst := range builder.Instructions {
-		instruction := inst 
+		instruction := inst
 		stepName := fmt.Sprintf("%s %02d", instruction.Type, i+1)
-		
+
 		runner.StepsAdd(stepName, func(c *sst.StepsContext, _ sst.StepState) error {
 			return builder.ExecuteSingleInstruction(ctx, instruction)
 		})
@@ -53,15 +63,21 @@ var buildCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		runtimeDir := flagRoot
-		if runtimeDir == "" { runtimeDir = rtsst.RuntimeDir() }
+		if runtimeDir == "" {
+			runtimeDir = rtsst.RuntimeDir()
+		}
 
 		bArgs := make(map[string]string)
 		for _, arg := range buildArgs {
 			parts := strings.SplitN(arg, "=", 2)
-			if len(parts) == 2 { bArgs[parts[0]] = parts[1] } else { bArgs[parts[0]] = os.Getenv(parts[0]) }
+			if len(parts) == 2 {
+				bArgs[parts[0]] = parts[1]
+			} else {
+				bArgs[parts[0]] = os.Getenv(parts[0])
+			}
 		}
 
-		return RunBuildEngine(cmd.Context(), args[0], runtimeDir, bArgs)
+		return RunBuildEngine(cmd.Context(), args[0], runtimeDir, flagForce, bArgs)
 	},
 }
 

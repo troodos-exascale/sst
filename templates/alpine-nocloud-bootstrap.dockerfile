@@ -50,12 +50,8 @@ RUN: |
   echo "hvc0" >> /etc/securetty
 
   # 8. Configure GRUB to route kernel output to our terminal (hvc0)
-# 8. Configure GRUB to display the menu using standard EFI console mapping
   mkdir -p /etc/default
   echo 'GRUB_TIMEOUT=5' > /etc/default/grub
   echo 'GRUB_TIMEOUT_STYLE="menu"' >> /etc/default/grub
   echo 'GRUB_CMDLINE_LINUX_DEFAULT="console=hvc0 oops=panic panic=10 loglevel=4 rootfstype=ext4 rw rootwait"' >> /etc/default/grub
   echo 'GRUB_TERMINAL="console"' >> /etc/default/grub
-  
-  # 9. Clean up apk cache to reduce image size
-  rm -rf /var/cache/apk/*

@@ -47,7 +47,7 @@ func delegateToLinuxVM() {
 		os.Exit(1)
 	}
 
-	// Reconstruct the command for remote execution. 
+	// Reconstruct the command for remote execution.
 	// We inject 'sudo' because mkimg requires root privileges on Linux.
 	remoteCmd := []string{"sudo"}
 	if logFmt := os.Getenv("SST_LOG_FORMAT"); logFmt != "" {
@@ -66,7 +66,7 @@ func delegateToLinuxVM() {
 	remoteCmd = append(remoteCmd, "mkimg")
 	remoteCmd = append(remoteCmd, os.Args[1:]...)
 
-	// Construct the SSH call. We pass the remoteCmd as a single joined string 
+	// Construct the SSH call. We pass the remoteCmd as a single joined string
 	// so runctl executes it seamlessly over SSH.
 	args := []string{runctlPath, "ssh", vmName, strings.Join(remoteCmd, " ")}
 
@@ -118,12 +118,12 @@ func init() {
 	rootCmd.PersistentFlags().BoolVarP(&flagForce, "force", "f", false, "Overwrite existing image directory")
 
 	rootCmd.AddCommand(pullvmCmd())
-	
+
 	instCmd := instanceCmd()
 	instCmd.Flags().StringVarP(&flagSize, "size", "s", "20G", "Target size for the root disk (e.g. 20G, 100GiB)")
 	instCmd.Flags().BoolVar(&flagEfi, "efi", false, "Use EFI bootloader instead of direct Linux kernel boot")
 	rootCmd.AddCommand(instCmd)
-	
+
 	rootCmd.AddCommand(extractKernelCmd)
 }
 
@@ -144,16 +144,18 @@ func pullvmCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			runtimeDir := flagRoot
-			if runtimeDir == "" { runtimeDir = rtsst.RuntimeDir() }
-			
+			if runtimeDir == "" {
+				runtimeDir = rtsst.RuntimeDir()
+			}
+
 			base := filepath.Base(args[0])
 			name := strings.TrimSuffix(base, filepath.Ext(base))
-			
+
 			bArgs := map[string]string{
 				"URL":       args[0],
 				"PULL_NAME": name,
 			}
-			return RunBuildEngine(cmd.Context(), "pullvm.dockerfile", runtimeDir, bArgs)
+			return RunBuildEngine(cmd.Context(), "pullvm.dockerfile", runtimeDir, flagForce, bArgs)
 		},
 	}
 }
@@ -165,13 +167,15 @@ func instanceCmd() *cobra.Command {
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			runtimeDir := flagRoot
-			if runtimeDir == "" { runtimeDir = rtsst.RuntimeDir() }
-			
+			if runtimeDir == "" {
+				runtimeDir = rtsst.RuntimeDir()
+			}
+
 			bArgs := map[string]string{
 				"BASE_IMAGE": args[0],
 				"INST_NAME":  args[1],
 			}
-			return RunBuildEngine(cmd.Context(), "instance.dockerfile", runtimeDir, bArgs)
+			return RunBuildEngine(cmd.Context(), "instance.dockerfile", runtimeDir, flagForce, bArgs)
 		},
 	}
 }

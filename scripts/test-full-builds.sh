@@ -49,7 +49,6 @@ logx info "roundtrip.start" image "$IMAGE_NAME" instance "$INSTANCE_NAME" host "
 # Phase 1: Build (Delegates to 'ub' using Linux ZFS disk)
 # ---------------------------------------------------------
 step_enter "build_image"
-# We explicitly pass the Ubuntu directory. mkimg automatically delegates this command to 'ub'.
 run mkimg build -d "$UBUNTU_RUNTIMES_DIR" "$DOCKERFILE_ABS"
 step_ok
 
@@ -58,23 +57,20 @@ step_ok
 # ---------------------------------------------------------
 step_enter "instantiate_vm"
 
-# Ensure genisoimage is installed on Ubuntu so cidata generation doesn't fail with exit code 127
 logx info "checking for genisoimage on build host..."
 runctl ssh "$BUILD_HOST" "if ! command -v genisoimage >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y genisoimage; fi" >/dev/null 2>&1 || true
 
-# Extract semantic name. The extra 'tail -n 1' strips runctl's "Connecting to..." banner.
 SEMANTIC_NAME=$(runctl ssh "$BUILD_HOST" "ls -1rt '$UBUNTU_RUNTIMES_DIR/images/' | grep alpine" | tail -n 1 | tr -d '\r')
 if [[ -z "$SEMANTIC_NAME" ]]; then
     SEMANTIC_NAME="$IMAGE_NAME"
 fi
 logx info "detected semantic image name" name "$SEMANTIC_NAME"
 
-# Explicitly instruct mkimg to use the Ubuntu ZFS runtime dir for instance creation
 run mkimg instance -d "$UBUNTU_RUNTIMES_DIR" "$SEMANTIC_NAME" "$INSTANCE_NAME" --force
 step_ok
 
 # ---------------------------------------------------------
-# Phase 3: Sync from ZFS (ub) to macOS
+# Phase 3: Sync from ZFS (ub) to macOS & Purify
 # ---------------------------------------------------------
 step_enter "sync_artifacts"
 logx info "syncing built artifacts from Linux ZFS back to macOS"
@@ -85,6 +81,19 @@ cp -a '$UBUNTU_RUNTIMES_DIR/images/.' '$MAC_RUNTIMES_DIR/images/'
 cp -a '$UBUNTU_RUNTIMES_DIR/instances/.' '$MAC_RUNTIMES_DIR/instances/'
 "
 run runctl ssh "$BUILD_HOST" "$SYNC_SCRIPT"
+
+# THE FIX: The files just arrived via a Linux copy over a shared folder. 
+# They are poisoned. We must natively purify them on the Mac right now.
+if [ "$(uname)" = "Darwin" ]; then
+    logx info "purifying synced artifacts natively on macOS..."
+    for f in "$MAC_RUNTIMES_DIR/instances/$INSTANCE_NAME/$INSTANCE_NAME.raw" "$MAC_RUNTIMES_DIR/instances/$INSTANCE_NAME/cidata.iso"; do
+        if [ -f "$f" ]; then
+            cp "$f" "${f}.clean"
+            rm "$f"
+            mv "${f}.clean" "$f"
+        fi
+    done
+fi
 step_ok
 
 # ---------------------------------------------------------
@@ -92,7 +101,6 @@ step_ok
 # ---------------------------------------------------------
 step_enter "start_vm"
 logx info "starting vm in background" instance "$INSTANCE_NAME"
-# runctl defaults to ~/.runtimes natively on macOS
 runctl start "$INSTANCE_NAME" &
 VM_PID=$!
 

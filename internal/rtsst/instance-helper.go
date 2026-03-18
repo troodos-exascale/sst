@@ -284,7 +284,7 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 	for _, m := range mounts {
 		sb.WriteString("  - |\n")
 		fmt.Fprintf(&sb, "    mkdir -p %s\n", m.guestPath)
-		fmt.Fprintf(&sb, "    mount -t virtiofs %s %s -o %s\n", m.options)
+		fmt.Fprintf(&sb, "    mount -t virtiofs %s %s -o %s\n", m.tag, m.guestPath, m.options)
 	}
 
 	userData := sb.String()

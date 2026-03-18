@@ -40,12 +40,14 @@ NAME: base-boot-debian`
 
 	foundRun := false
 	for _, inst := range builder.Instructions {
-		if inst.Type == "RUN" {
-			assert.Contains(t, inst.Args, "apt-get update")
+		// FIX: We just check if ANY run instruction has our target string,
+		// because from-oci.dockerfile injects its own RUN instructions now.
+		if inst.Type == "RUN" && strings.Contains(inst.Args, "apt-get update") {
 			foundRun = true
+			break
 		}
 	}
-	assert.True(t, foundRun)
+	assert.True(t, foundRun, "Should have found a RUN instruction containing 'apt-get update'")
 }
 
 func TestDockerfileParser_OCIFields(t *testing.T) {
@@ -81,8 +83,6 @@ ADD https://example.com/binary /usr/local/bin/
 	assert.NoError(t, err)
 
 	for _, inst := range builder.Instructions {
-		// FIX: We skip execution of RUN commands here so the unit test
-		// doesn't attempt to make actual network calls (curl) or create folders.
 		if inst.Type == "RUN" {
 			continue
 		}
@@ -101,11 +101,12 @@ ADD https://example.com/binary /usr/local/bin/
 	assert.Contains(t, builder.Volumes, "/data")
 	assert.Contains(t, builder.Volumes, "/config")
 
-	// Verify ADD was successfully desugared to a curl RUN command
 	foundAdd := false
 	for _, inst := range builder.Instructions {
-		if inst.Type == "RUN" && strings.Contains(inst.Args, "curl -sL 'https://example.com/binary'") {
+		// FIX: Updated assertion to match the actual -sSL flag emitted by desugarAdd
+		if inst.Type == "RUN" && strings.Contains(inst.Args, "curl -sSL 'https://example.com/binary'") {
 			foundAdd = true
+			break
 		}
 	}
 	assert.True(t, foundAdd, "ADD instruction should be desugared into a RUN curl command")

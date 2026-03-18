@@ -6,12 +6,12 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
-	"os/user"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -193,7 +193,7 @@ func (r *Runctl) Start(name string) error {
 			}
 		}
 	}()
-	
+
 	return cmd.Wait()
 }
 
@@ -209,7 +209,6 @@ func (r *Runctl) setupHostCmd() *cobra.Command {
 		},
 	}
 }
-
 
 func (r *Runctl) SetupLinuxNetwork() error {
 	if runtime.GOOS != "linux" {
@@ -269,11 +268,10 @@ func (r *Runctl) SetupLinuxNetwork() error {
 	return err
 }
 
-
 func (r *Runctl) stopCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "stop <name>",
-		Args:  cobra.ExactArgs(1),
+		Use:  "stop <name>",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error { return r.Stop(args[0]) },
 	}
 }
@@ -281,24 +279,30 @@ func (r *Runctl) stopCmd() *cobra.Command {
 func (r *Runctl) Stop(name string) error {
 	lp := rtsst.LockFilePath(name)
 	info, err := rtsst.ReadLock(lp)
-	if err != nil { return nil }
-	if !rtsst.IsPidAlive(info.Pid) { return nil }
-	
+	if err != nil {
+		return nil
+	}
+	if !rtsst.IsPidAlive(info.Pid) {
+		return nil
+	}
+
 	r.Log.Info(r.Ctx, "stopping instance", "instance", name, "pid", info.Pid)
 
-	// Always send SIGTERM to the supervisor. 
+	// Always send SIGTERM to the supervisor.
 	// The supervisor will translate this to SIGKILL for the child VM if necessary.
 	return syscall.Kill(info.Pid, syscall.SIGTERM)
 }
 
 func (r *Runctl) pauseCmd() *cobra.Command {
 	return &cobra.Command{
-		Use: "pause <name>",
+		Use:  "pause <name>",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			lp := rtsst.LockFilePath(args[0])
 			info, _ := rtsst.ReadLock(lp)
-			if rtsst.IsPidAlive(info.Pid) { return syscall.Kill(info.Pid, syscall.SIGSTOP) }
+			if rtsst.IsPidAlive(info.Pid) {
+				return syscall.Kill(info.Pid, syscall.SIGSTOP)
+			}
 			return nil
 		},
 	}
@@ -306,12 +310,14 @@ func (r *Runctl) pauseCmd() *cobra.Command {
 
 func (r *Runctl) resumeCmd() *cobra.Command {
 	return &cobra.Command{
-		Use: "resume <name>",
+		Use:  "resume <name>",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			lp := rtsst.LockFilePath(args[0])
 			info, _ := rtsst.ReadLock(lp)
-			if rtsst.IsPidAlive(info.Pid) { return syscall.Kill(info.Pid, syscall.SIGCONT) }
+			if rtsst.IsPidAlive(info.Pid) {
+				return syscall.Kill(info.Pid, syscall.SIGCONT)
+			}
 			return nil
 		},
 	}
@@ -323,17 +329,20 @@ func (r *Runctl) listCmd() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ents, _ := os.ReadDir(rtsst.InstanceRoot())
 			for _, e := range ents {
-				if !e.IsDir() { continue }
+				if !e.IsDir() {
+					continue
+				}
 				lp := rtsst.LockFilePath(e.Name())
 				state := "stopped"
-				if info, err := rtsst.ReadLock(lp); err == nil && rtsst.IsPidAlive(info.Pid) { state = "running" }
+				if info, err := rtsst.ReadLock(lp); err == nil && rtsst.IsPidAlive(info.Pid) {
+					state = "running"
+				}
 				fmt.Printf("%s\t%s\n", e.Name(), state)
 			}
 			return nil
 		},
 	}
 }
-
 
 func (r *Runctl) sshCmd() *cobra.Command {
 	return &cobra.Command{
@@ -352,7 +361,7 @@ func (r *Runctl) sshCmd() *cobra.Command {
 
 			// Extract the MAC address from the YAML (format: "mac@nat" or just "mac")
 			mac := strings.Split(inst.Network[0], "@")[0]
-			
+
 			// Resolve the IP from the MAC address
 			ip, err := r.resolveIP(mac)
 			if err != nil {
@@ -380,18 +389,17 @@ func (r *Runctl) sshCmd() *cobra.Command {
 				"-o", "LogLevel=ERROR",
 				fmt.Sprintf("%s@%s", u.Username, ip),
 			}
-			
+
 			// <-- NEW: Append any trailing commands provided by the user
 			if len(args) > 1 {
 				sshArgs = append(sshArgs, args[1:]...)
 			}
-			
+
 			return syscall.Exec(sshBin, sshArgs, os.Environ())
-			
+
 		},
 	}
 }
-
 
 // resolveIP scans DHCP leases and ARP caches to find the IP associated with a MAC address.
 func (r *Runctl) resolveIP(mac string) (string, error) {
@@ -466,17 +474,18 @@ func (r *Runctl) resolveIP(mac string) (string, error) {
 	return "", fmt.Errorf("MAC %s not found in DHCP leases or ARP cache", mac)
 }
 
-
 func (r *Runctl) instanceDir(name string) string { return rtsst.InstanceDir(name) }
 
 func (r *Runctl) loadInstance(name string) (*runctlpb.Instance, error) {
 	inst := &runctlpb.Instance{}
 	yo := &sst.YamlObject{
-		Path: filepath.Join(r.instanceDir(name), "instance.yaml"),
+		Path:   filepath.Join(r.instanceDir(name), "instance.yaml"),
 		Schema: "sst.yaml.runctl.v1.Instance",
-		Kind: "Instance",
-		Msg: inst,
+		Kind:   "Instance",
+		Msg:    inst,
 	}
-	if diags := yo.Load(r.Ctx, r.Log); diags != nil { return nil, diags }
+	if diags := yo.Load(r.Ctx, r.Log); diags != nil {
+		return nil, diags
+	}
 	return inst, nil
 }

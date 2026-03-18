@@ -12,20 +12,66 @@ import (
 	runctlpb "github.com/swiss-software-tool/sst/proto/yaml/runctl/v1"
 )
 
+func (b *BuildApp) InitEnvironment(ctx context.Context) error {
+	b.BuildID = b.Name // Scope datasets by target name for isolation
+
+	b.DatasetMgr = NewDatasetManager(b.RuntimeDir, b.BuildID)
+
+	// If --force is provided, completely wipe the existing build environment first
+	if b.Force {
+		b.Log.Info(ctx, "force flag provided, annihilating existing build environment", "build_id", b.BuildID)
+		_ = b.DatasetMgr.Destroy()
+	}
+
+	if err := b.DatasetMgr.InitBuildEnvironment(); err != nil {
+		return fmt.Errorf("failed to initialize dataset environment: %w", err)
+	}
+
+	b.RootDir = b.DatasetMgr.RuntimeRoot()
+	return nil
+}
+
 func (b *BuildApp) shouldExecute(conditions []string) bool {
 	for _, cond := range conditions {
-		if cond == "all" { return true }
+		if cond == "all" {
+			return true
+		}
 		for _, emit := range b.Emits {
-			if emit == cond { return true }
+			if emit == cond {
+				return true
+			}
 		}
 	}
 	return false
 }
 
+func (b *BuildApp) execProvisionDataset(ctx context.Context, args string) error {
+	parts := strings.Fields(args)
+	var target string
+	for _, p := range parts {
+		if strings.HasPrefix(p, "--target=") {
+			target = strings.TrimPrefix(p, "--target=")
+		}
+	}
+
+	mntPath, err := b.DatasetMgr.CreateAsRoot(target)
+	if err != nil {
+		return err
+	}
+
+	b.StageMounts[target] = mntPath
+	b.Log.Info(ctx, "provisioned AS dataset", "stage", target, "mount", mntPath)
+	return nil
+}
+
 func (b *BuildApp) ExecuteSingleInstruction(ctx context.Context, inst Instruction) error {
 	var args string
-	if inst.Type == "RUN" { args = inst.Args } else { args = b.Substitute(inst.Args) }
-	
+	if inst.Type == "RUN" {
+		args = inst.Args
+	} else {
+		args = b.Substitute(inst.Args)
+	}
+
 	cleanArgs := args
 	if inst.Type != "RUN" {
 		cleanArgs = strings.SplitN(args, " #", 2)[0]
@@ -40,84 +86,124 @@ func (b *BuildApp) ExecuteSingleInstruction(ctx context.Context, inst Instructio
 		} else if val, ok := b.BuildArgs[parts[0]]; ok {
 			b.Args[parts[0]] = val
 		}
-		b.Log.Info(ctx, "processed ARG", "key", parts[0])
 		return nil
 	case "ENV":
 		parts := strings.SplitN(cleanArgs, "=", 2)
-		if len(parts) == 2 { b.Env[parts[0]] = parts[1] } else {
+		if len(parts) == 2 {
+			b.Env[parts[0]] = parts[1]
+		} else {
 			parts = strings.SplitN(cleanArgs, " ", 2)
-			if len(parts) == 2 { b.Env[parts[0]] = parts[1] }
+			if len(parts) == 2 {
+				b.Env[parts[0]] = parts[1]
+			}
 		}
-		b.Log.Info(ctx, "processed ENV", "key", parts[0])
 		return nil
 	case "WORKDIR":
 		b.Workdir = b.Substitute(cleanArgs)
-		b.Log.Info(ctx, "processed WORKDIR", "dir", b.Workdir)
 		return nil
 	case "USER":
 		b.User = b.Substitute(cleanArgs)
-		b.Log.Info(ctx, "processed USER", "user", b.User)
 		return nil
 	case "CMD":
 		b.Cmd = b.Substitute(cleanArgs)
-		b.Log.Info(ctx, "processed CMD", "cmd", b.Cmd)
 		return nil
 	case "ENTRYPOINT":
 		b.EntryPoint = b.Substitute(cleanArgs)
-		b.Log.Info(ctx, "processed ENTRYPOINT", "entrypoint", b.EntryPoint)
 		return nil
 	case "LABEL":
 		parts := strings.SplitN(cleanArgs, "=", 2)
-		if len(parts) == 2 { b.Labels[strings.Trim(parts[0], `"`)] = strings.Trim(parts[1], `"`) }
-		b.Log.Info(ctx, "processed LABEL", "label", parts[0])
+		if len(parts) == 2 {
+			b.Labels[strings.Trim(parts[0], `"`)] = strings.Trim(parts[1], `"`)
+		}
 		return nil
 	case "EXPOSE":
 		for _, port := range strings.Fields(cleanArgs) {
-			if !strings.Contains(port, "/") { port += "/tcp" }
+			if !strings.Contains(port, "/") {
+				port += "/tcp"
+			}
 			b.ExposedPorts[port] = struct{}{}
 		}
-		b.Log.Info(ctx, "processed EXPOSE", "ports", cleanArgs)
 		return nil
 	case "VOLUME":
 		clean := strings.TrimPrefix(strings.TrimSuffix(cleanArgs, "]"), "[")
 		for _, vol := range strings.Split(clean, ",") {
 			b.Volumes[strings.Trim(strings.TrimSpace(vol), `"`)] = struct{}{}
 		}
-		b.Log.Info(ctx, "processed VOLUME", "volumes", cleanArgs)
 		return nil
 	case "FROM", "NAME", "VMOUT", "EMIT", "COPY", "ADD":
-		return nil 
+		return nil
 	case "RUN":
 		if !b.shouldExecute(inst.Conditions) {
 			b.Log.Info(ctx, "skipping instruction (condition mismatch)", "conditions", inst.Conditions, "emits", b.Emits)
 			return nil
 		}
 
-		targetDir := b.RootDir 
-		if inst.Location == "base" { targetDir = filepath.Dir(b.RootDir) } else if inst.Location == "boot" { targetDir = filepath.Join(filepath.Dir(b.RootDir), "boot") }
+		if strings.HasPrefix(inst.Args, "sys.provision_dataset") {
+			return b.execProvisionDataset(ctx, inst.Args)
+		}
 
-		b.Log.Info(ctx, "evaluating RUN directive", "context", inst.Context, "dir", targetDir, "conditions", inst.Conditions)
+		resolvedLoc := b.Substitute(inst.Location)
 
-		if inst.Context == "host" { return b.execHostRun(ctx, args, targetDir) }
-		return b.execChrootRun(ctx, args, targetDir)
+		// DYNAMIC LOCATION RESOLUTION
+		targetDir := b.RootDir
+		activeRootfs := b.RootDir // By default, the payload being built IS the main rootfs
+
+		if resolvedLoc == "base" {
+			targetDir = filepath.Dir(b.RootDir)
+			// activeRootfs remains b.RootDir
+		} else if resolvedLoc == "boot" {
+			targetDir = filepath.Join(filepath.Dir(b.RootDir), "boot")
+			// activeRootfs remains b.RootDir
+		} else if stagePath, ok := b.StageMounts[resolvedLoc]; ok {
+			targetDir = stagePath
+			activeRootfs = stagePath // An AS stage acts as its own payload
+		} else if resolvedLoc != "root" && resolvedLoc != "host" && resolvedLoc != "chroot" && resolvedLoc != "" {
+			targetDir = filepath.Join(b.DatasetMgr.mountPath(""), resolvedLoc)
+			os.MkdirAll(targetDir, 0755)
+		}
+
+		b.Log.Info(ctx, "evaluating RUN directive", "context", inst.Context, "dir", targetDir)
+
+		if inst.Context == "host" {
+			return b.execHostRun(ctx, args, targetDir, activeRootfs)
+		}
+		return b.execChrootRun(ctx, args, targetDir, activeRootfs)
 	default:
 		return fmt.Errorf("unknown instruction type: %s", inst.Type)
 	}
 }
 
-func (b *BuildApp) buildEnvironmentMap() []string {
+// buildEnvironmentMap injects standard env vars AND the Host-Level Cache Datasets.
+func (b *BuildApp) buildEnvironmentMap(activeRootfs string) []string {
 	envMap := make(map[string]string)
-	
+
+	if activeRootfs == "" {
+		activeRootfs = b.RootDir
+	}
+
 	envMap["BASE_IMAGE"] = b.BaseImage
-	envMap["ROOTFS"] = b.RootDir
+	envMap["ROOTFS"] = activeRootfs
 	envMap["BASEDIR"] = filepath.Dir(b.RootDir)
 	envMap["BOOTDIR"] = filepath.Join(filepath.Dir(b.RootDir), "boot")
 	envMap["NAME"] = b.Name
 	envMap["OUTDIR"] = filepath.Join(b.RuntimeDir, "images", b.Name)
 
-	for k, v := range b.Env { envMap[k] = v }
-	for k, v := range b.Args { envMap[k] = v }
-	for k, v := range b.BuildArgs { envMap[k] = v }
+	// Expose the Phase 1 persistent ZFS cache boundaries to the shell templates
+	envMap["SST_CACHE_APT"] = b.DatasetMgr.CacheDir("apt")
+	envMap["SST_CACHE_APK"] = b.DatasetMgr.CacheDir("apk")
+	envMap["SST_CACHE_DNF"] = b.DatasetMgr.CacheDir("dnf")
+	envMap["SST_CACHE_GET"] = b.DatasetMgr.CacheDir("get")
+	envMap["SST_CACHE_FROM"] = b.DatasetMgr.CacheDir("from")
+
+	for k, v := range b.Env {
+		envMap[k] = v
+	}
+	for k, v := range b.Args {
+		envMap[k] = v
+	}
+	for k, v := range b.BuildArgs {
+		envMap[k] = v
+	}
 
 	var envs []string
 	for k, v := range envMap {
@@ -126,22 +212,28 @@ func (b *BuildApp) buildEnvironmentMap() []string {
 	return envs
 }
 
-func (b *BuildApp) execHostRun(ctx context.Context, cmdStr string, targetDir string) error {
-	if err := os.MkdirAll(targetDir, 0755); err != nil { return err }
+func (b *BuildApp) execHostRun(ctx context.Context, cmdStr string, targetDir string, activeRootfs string) error {
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return err
+	}
+
+	env := b.buildEnvironmentMap(activeRootfs)
 
 	req := sst.ExecRequest{
 		Cmd:  "/bin/sh",
 		Args: []string{"-c", cmdStr},
-		Dir:  filepath.Dir(b.Dockerfile), 
-		Env:  b.buildEnvironmentMap(),
+		Dir:  filepath.Dir(b.Dockerfile), // Host context executes inside the Dockerfile directory
+		Env:  env,
 		Mode: sst.ExecCaptured,
 	}
 	_, err := sst.Exec(ctx, b.Log, req)
-	if err != nil { return fmt.Errorf("host run command failed: %w", err) }
+	if err != nil {
+		return fmt.Errorf("host run command failed: %w", err)
+	}
 	return nil
 }
 
-func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir string) error {
+func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir string, activeRootfs string) error {
 	mounts := []string{"/dev", "/dev/pts", "/proc", "/sys"}
 	for _, m := range mounts {
 		target := filepath.Join(targetDir, m)
@@ -149,36 +241,45 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 		sst.ExecShell(ctx, b.Log, "mount", "--bind", m, target)
 	}
 
+	// 1. ISOLATED DATASET CACHES (Bind Mounts for Package Managers)
 	cachePaths := map[string]string{
-		"apk": "/etc/apk/cache",
+		"apk": "/var/cache/apk",
 		"apt": "/var/cache/apt/archives",
 		"dnf": "/var/cache/dnf",
 	}
-	
+
 	var activeCacheMounts []string
 	for name, guestPath := range cachePaths {
-		hostDir := filepath.Join(b.RuntimeDir, "cache", "pkg", name)
+		hostDir := b.DatasetMgr.CacheDir(name)
 		os.MkdirAll(hostDir, 0755)
-		
+
 		target := filepath.Join(targetDir, guestPath)
 		os.MkdirAll(target, 0755)
-		
+
 		if _, err := sst.ExecShell(ctx, b.Log, "mount", "--bind", hostDir, target); err == nil {
 			activeCacheMounts = append(activeCacheMounts, target)
 		}
 	}
-	
+
 	defer func() {
-		for i := len(activeCacheMounts)-1; i >= 0; i-- { sst.ExecShell(context.Background(), b.Log, "umount", "-l", activeCacheMounts[i]) }
-		for i := len(mounts)-1; i >= 0; i-- { sst.ExecShell(context.Background(), b.Log, "umount", "-l", filepath.Join(targetDir, mounts[i])) }
+		for i := len(activeCacheMounts) - 1; i >= 0; i-- {
+			sst.ExecShell(context.Background(), b.Log, "umount", "-l", activeCacheMounts[i])
+		}
+		for i := len(mounts) - 1; i >= 0; i-- {
+			sst.ExecShell(context.Background(), b.Log, "umount", "-l", filepath.Join(targetDir, mounts[i]))
+		}
 	}()
 
 	sst.ExecShell(ctx, b.Log, "cp", "-L", "/etc/resolv.conf", filepath.Join(targetDir, "etc/resolv.conf"))
 
 	workdir := b.Workdir
-	if workdir == "" { workdir = "/" }
+	if workdir == "" {
+		workdir = "/"
+	}
 	user := b.User
-	if user == "" { user = "root" }
+	if user == "" {
+		user = "root"
+	}
 
 	guestWorkdir := filepath.Join(targetDir, workdir)
 	os.MkdirAll(guestWorkdir, 0755)
@@ -186,7 +287,9 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 	scriptName := ".sst-run-script.sh"
 	scriptPath := filepath.Join(targetDir, scriptName)
 	scriptContent := fmt.Sprintf("#!/bin/sh\ncd '%s'\n%s\n", workdir, cmdStr)
-	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil { return fmt.Errorf("failed to write run script: %w", err) }
+	if err := os.WriteFile(scriptPath, []byte(scriptContent), 0755); err != nil {
+		return fmt.Errorf("failed to write run script: %w", err)
+	}
 	defer os.Remove(scriptPath)
 
 	var chrootCmd string
@@ -197,19 +300,30 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 		chrootCmd = fmt.Sprintf("/%s", scriptName)
 	}
 
+	// 2. INJECT PACKAGE MANAGER ENVIRONMENT VARIABLES
+	env := b.buildEnvironmentMap(activeRootfs)
+	env = append(env,
+		"APK_CACHE_DIR=/var/cache/apk",
+		"APT_CACHE_DIR=/var/cache/apt/archives",
+		"DNF_CACHE_DIR=/var/cache/dnf",
+		"YUM_CACHE_DIR=/var/cache/dnf",
+	)
+
 	req := sst.ExecRequest{
 		Cmd:  "chroot",
 		Args: []string{targetDir, "/bin/sh", "-c", chrootCmd},
-		Env:  b.buildEnvironmentMap(),
+		Env:  env,
 		Mode: sst.ExecCaptured,
 	}
-	if _, err := sst.Exec(ctx, b.Log, req); err != nil { return fmt.Errorf("chroot command failed: %w", err) }
+	if _, err := sst.Exec(ctx, b.Log, req); err != nil {
+		return fmt.Errorf("chroot command failed: %w", err)
+	}
 	return nil
 }
 
 func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 	originalName := b.Name
-	
+
 	osInfo, err := ParseOSRelease(b.RootDir)
 	if err == nil {
 		semanticName := GenerateSemanticName(osInfo)
@@ -219,53 +333,63 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 			b.Name = semanticName
 		}
 	}
-	
+
 	b.ImageOutput = filepath.Join(b.RuntimeDir, "images", b.Name)
-	
+
 	if originalName != b.Name {
 		oldOutDir := filepath.Join(b.RuntimeDir, "images", originalName)
-		
+
 		if _, err := os.Stat(oldOutDir); err == nil {
 			os.MkdirAll(filepath.Dir(b.ImageOutput), 0755)
 			b.Log.Info(ctx, "renaming output artifacts to match semantic name", "from", oldOutDir, "to", b.ImageOutput)
-			
+
 			if _, err := os.Stat(b.ImageOutput); err == nil {
 				b.Log.Warn(ctx, "destination directory already exists, overwriting", "dest", b.ImageOutput)
 				_ = os.RemoveAll(b.ImageOutput)
 			}
-			
+
 			if err := os.Rename(oldOutDir, b.ImageOutput); err != nil {
 				return fmt.Errorf("failed to rename output directory: %w", err)
 			}
-			
+
 			oldRaw := filepath.Join(b.ImageOutput, originalName+".raw")
 			newRaw := filepath.Join(b.ImageOutput, b.Name+".raw")
-			if _, err := os.Stat(oldRaw); err == nil { _ = os.Rename(oldRaw, newRaw) }
-			
+			if _, err := os.Stat(oldRaw); err == nil {
+				_ = os.Rename(oldRaw, newRaw)
+			}
+
 			oldQcow := filepath.Join(b.ImageOutput, originalName+".qcow2")
 			newQcow := filepath.Join(b.ImageOutput, b.Name+".qcow2")
-			if _, err := os.Stat(oldQcow); err == nil { _ = os.Rename(oldQcow, newQcow) }
-			
+			if _, err := os.Stat(oldQcow); err == nil {
+				_ = os.Rename(oldQcow, newQcow)
+			}
+
 			oldTar := filepath.Join(b.ImageOutput, originalName+".tar")
 			newTar := filepath.Join(b.ImageOutput, b.Name+".tar")
-			if _, err := os.Stat(oldTar); err == nil { _ = os.Rename(oldTar, newTar) }
+			if _, err := os.Stat(oldTar); err == nil {
+				_ = os.Rename(oldTar, newTar)
+			}
 		} else {
-			if err := os.MkdirAll(b.ImageOutput, 0755); err != nil { return err }
+			if err := os.MkdirAll(b.ImageOutput, 0755); err != nil {
+				return err
+			}
 		}
 	} else {
-		if err := os.MkdirAll(b.ImageOutput, 0755); err != nil { return err }
+		if err := os.MkdirAll(b.ImageOutput, 0755); err != nil {
+			return err
+		}
 	}
-	
+
 	sb := &ImageSB{
 		Ctx: ctx,
-		Log: b.Log, 
+		Log: b.Log,
 		YamlObject: &mkimagepb.ImageYAML{
 			Name:     b.Name,
 			RawImage: b.Name + ".raw",
 		},
 		SstRuntimeDir: b.RuntimeDir,
 	}
-	
+
 	_ = AnalyseImg(sb)
 	if sb.YamlObject.BootfsDevice != "" {
 		_ = ExtractArtifacts(sb)
@@ -277,7 +401,7 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		Kind:   "Image",
 		Msg:    sb.YamlObject,
 	}
-	
+
 	if diags := yo.Save(ctx, b.Log); diags != nil && diags.HasAny() {
 		return diags
 	}
@@ -313,7 +437,7 @@ func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
 		Kind:   "Image",
 		Msg:    imgManifest,
 	}
-	
+
 	rootDev := "/dev/vda2"
 	rootType := "ext4"
 	if diags := yoImg.Load(ctx, b.Log); diags == nil || !diags.HasAny() {
@@ -334,13 +458,13 @@ func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
 	}
 
 	inst := &runctlpb.Instance{
-		ApiVersion:       "sst.io/v1",
-		Kind:             "Instance",
-		Name:             instName,
-		Hostname:         instName,
-		Bootloader:       "linux",
-		Kernel:           "kernel",
-		Initrd:           "initrd",
+		ApiVersion: "sst.io/v1",
+		Kind:       "Instance",
+		Name:       instName,
+		Hostname:   instName,
+		Bootloader: "linux",
+		Kernel:     "kernel",
+		Initrd:     "initrd",
 		Params: []string{
 			"console=hvc0",
 			"oops=panic",
@@ -389,8 +513,6 @@ func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
 	return nil
 }
 
-// QueuePurification writes emitted file paths to a shared queue file in the runtime dir.
-// This allows the Mac host to know exactly what needs VirtioFS/APFS purification.
 func QueuePurification(runtimeDir string, files []string) {
 	queueFile := filepath.Join(runtimeDir, ".purify_queue")
 	f, err := os.OpenFile(queueFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)

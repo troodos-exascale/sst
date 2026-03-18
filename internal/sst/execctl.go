@@ -129,7 +129,7 @@ func Exec(ctx context.Context, log *Logx, req ExecRequest) (*ExecResult, error) 
 	if exitCode != 0 {
 		stderr := strings.TrimSpace(res.Stderr)
 		stdout := strings.TrimSpace(res.Stdout)
-		
+
 		errMsg := stderr
 		if errMsg == "" && stdout != "" {
 			errMsg = stdout
