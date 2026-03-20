@@ -10,19 +10,21 @@ import (
 
 // DatasetManager enforces the strict ZFS topology for a single build instance.
 type DatasetManager struct {
-	Zpool     string // e.g., "zroot/runtimes"
-	BuildID   string // e.g., the hash or inode of the Dockerfile
-	BasePoint string // Physical mountpoint, e.g., ~/.runtimes
+	Zpool           string // e.g., "zroot/runtimes"
+	BuildID         string // e.g., the hash or inode of the Dockerfile
+	BasePoint       string // Physical mountpoint, e.g., ~/.runtimes
+	RuntimeRootName string // e.g., "runtime-root-ubuntu.dockerfile"
 }
 
 // NewDatasetManager creates a new DatasetManager.
-func NewDatasetManager(runtimeDir, buildID string) *DatasetManager {
+func NewDatasetManager(runtimeDir, buildID, runtimeRootName string) *DatasetManager {
 	// Detect ZFS pool if requested via env, else empty for standard directories
 	zpool := os.Getenv("SST_ZPOOL")
 	return &DatasetManager{
-		Zpool:     zpool,
-		BuildID:   buildID,
-		BasePoint: runtimeDir,
+		Zpool:           zpool,
+		BuildID:         buildID,
+		BasePoint:       runtimeDir,
+		RuntimeRootName: runtimeRootName,
 	}
 }
 
@@ -33,14 +35,14 @@ func (d *DatasetManager) datasetPath(subPath string) string {
 	}
 	// Avoid trailing slash if subPath is empty
 	if subPath == "" {
-		return fmt.Sprintf("%s/builds/build-%s", d.Zpool, d.BuildID)
+		return fmt.Sprintf("%s/builds/%s", d.Zpool, d.BuildID)
 	}
-	return fmt.Sprintf("%s/builds/build-%s/%s", d.Zpool, d.BuildID, subPath)
+	return fmt.Sprintf("%s/builds/%s/%s", d.Zpool, d.BuildID, subPath)
 }
 
 // mountPath returns the physical host directory.
 func (d *DatasetManager) mountPath(subPath string) string {
-	return filepath.Join(d.BasePoint, "builds", fmt.Sprintf("build-%s", d.BuildID), subPath)
+	return filepath.Join(d.BasePoint, "builds", d.BuildID, subPath)
 }
 
 // create idempotently provisions the path, trying ZFS first.
@@ -80,7 +82,7 @@ func (d *DatasetManager) InitBuildEnvironment() error {
 	if err := d.create("as-roots"); err != nil {
 		return err
 	}
-	if err := d.create("runtime-root"); err != nil {
+	if err := d.create(d.RuntimeRootName); err != nil {
 		return err
 	}
 
@@ -98,7 +100,7 @@ func (d *DatasetManager) CreateAsRoot(stageName string) (string, error) {
 
 // RuntimeRoot returns the primary output root dataset.
 func (d *DatasetManager) RuntimeRoot() string {
-	return d.mountPath("runtime-root")
+	return d.mountPath(d.RuntimeRootName)
 }
 
 // CacheDir returns the path for a specific persistent cache.
@@ -117,4 +119,25 @@ func (d *DatasetManager) Destroy() error {
 
 	// 2. Annihilate the physical host directory
 	return os.RemoveAll(d.mountPath(""))
+}
+
+// ClearCache destroys and recreates only the persistent cache datasets.
+func (d *DatasetManager) ClearCache() error {
+	caches := []string{"cache/apt", "cache/apk", "cache/get", "cache/from", "cache/dnf"}
+	for _, cache := range caches {
+		// 1. Annihilate the ZFS dataset (if ZFS is active)
+		if dsPath := d.datasetPath(cache); dsPath != "" {
+			cmd := exec.Command("zfs", "destroy", "-r", dsPath)
+			_ = cmd.Run() // Ignore error if it doesn't exist
+		}
+
+		// 2. Annihilate the physical host directory
+		_ = os.RemoveAll(d.mountPath(cache))
+
+		// 3. Recreate it fresh
+		if err := d.create(cache); err != nil {
+			return fmt.Errorf("failed to recreate cache %s: %w", cache, err)
+		}
+	}
+	return nil
 }

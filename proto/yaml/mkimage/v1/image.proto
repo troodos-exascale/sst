@@ -9,26 +9,60 @@ option go_package = "github.com/swiss-software-tool/sst/proto/yaml/mkimage/v1;mk
 // ============================================================================
 
 message ImageYAML {
-   string name = 1;
-   string upstream = 2;
-   string retrieved_at = 3;
-   string source_file_name = 4;
-   string format = 5;
-   string local_sha =6;
-
-   string raw_image = 7;
-   string kernel = 8;
-   string initrd = 9;
-   string rootfs_part_uuid = 10;
-   string rootfs_device = 11;
-   string rootfs_uuid = 12;
-   string rootfs_type = 13;
-   string rootfs_size = 14;
-   bool rootfs_is_last = 15;
-   string bootfs_part_uuid = 16;
-   string bootfs_device = 17;
-   string bootfs_uuid = 18;
-   string bootfs_type = 19;
-   bool bootfs_is_last = 20;
+   string api_version = 1; // "sst.io/v1"
+   string kind        = 2; // "Image"
+   
+   Provenance provenance = 3;
+   StoragePlan storage = 4;
+   BootStructure boot = 5;
+   InstanceStructure instance = 6;
 }
 
+message Provenance {
+   string name = 1;              // The human-readable repository/directory name
+   string build_id = 2;          // Local hash/timestamp of the compilation
+   string upstream_os = 3;       // Semantic name from /etc/os-release (ID-VERSION-VARIANT)
+   string source_url = 4;        // Upstream registry/download URL
+   string retrieved_at = 5;      // UTC Timestamp of artifact retrieval
+   string local_sha256 = 6;      // Checksum of the primary artifact
+   string upstream_build_id = 7; // BUILD_ID from /etc/os-release
+}
+
+message StoragePlan {
+   string raw_image = 1;         // Filename of the block device (e.g., image.raw)
+   string format = 2;            // raw, qcow2, etc.
+   
+   string rootfs_part_uuid = 3;
+   string rootfs_device = 4;
+   string rootfs_uuid = 5;
+   string rootfs_type = 6;
+   string rootfs_size = 7;
+   bool rootfs_is_last = 8;
+}
+
+message BootStructure {
+   string kernel = 1;            // Filename of the extracted uncompressed kernel
+   string initrd = 2;            // Filename of the initramfs
+   
+   string bootfs_part_uuid = 3;
+   string bootfs_device = 4;
+   string bootfs_uuid = 5;
+   string bootfs_type = 6;
+   bool bootfs_is_last = 7;
+}
+
+// ============================================================================
+// Instance Definition
+// ============================================================================
+
+message InstanceStructure {
+   string name = 1;
+   string hostname = 2;
+   string cpu_count = 3;
+   string memory_size = 4;
+   string memory_size_suffix = 5;
+   repeated string network = 6;
+   repeated string disk = 7;
+   repeated string rwdisk = 8;
+   repeated string shared_dir = 9;
+}

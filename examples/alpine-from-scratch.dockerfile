@@ -1,24 +1,29 @@
 FROM scratch
 NAME: alpine-scratch
 
+# REQUIRED: Declare the argument so the Go engine is allowed to inject it!
+ARG ALPINE_ARCH
+
 # 1. Bootstrap the root filesystem from scratch using the host context
+GET https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/${ALPINE_ARCH}/alpine-minirootfs-3.22.0-${ALPINE_ARCH}.tar.gz /alpine-rootfs.tar.gz
+
 RUN [host]: |
   set -e
-  echo "--> Bootstrapping Alpine Linux from scratch into ${ROOTFS}..."
+  echo "--> Extracting cached Alpine Linux into ${ROOTFS}..."
   
-  # Download the official Alpine mini rootfs (aarch64 to match your Mac/ARM64 Linux host)
-  wget -qO /tmp/alpine-rootfs.tar.gz "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/aarch64/alpine-minirootfs-3.22.0-aarch64.tar.gz"
-  
-  # Extract directly into the builder's empty ROOTFS target
-  tar -xzf /tmp/alpine-rootfs.tar.gz -C "${ROOTFS}"
-  rm -f /tmp/alpine-rootfs.tar.gz
+  # Extract the payload injected by the GET instruction
+  tar -xzf "${ROOTFS}/alpine-rootfs.tar.gz" -C "${ROOTFS}"
+  rm -f "${ROOTFS}/alpine-rootfs.tar.gz"
 
-# 2. Hydrate the OS for NoCloud environments
-# Because the ROOTFS is now populated, standard [chroot] commands will work normally
-INCLUDE alpine-nocloud-bootstrap.dockerfile
+# 2. The Modular OS Stack
+# Hydrate the OS for NoCloud environments (LXC/Base)
+INCLUDE alpine/nocloud-init.dockerfile
 
-# 3. Assemble the physical disk and install GRUB
-INCLUDE boot-efi.dockerfile
+# Install hardware kernel (for direct VZ/QEMU boot)
+INCLUDE alpine/kernel.dockerfile
 
-# 4. Trigger the desugared emit templates to extract the kernel and build the QCOW2
+# Assemble the physical disk and install GRUB (which internally calls common/boot-efi)
+INCLUDE alpine/efiboot.dockerfile
+
+# 3. Trigger the desugared emit templates to extract the kernel and build the QCOW2
 EMIT: raw, kernel, qcow2

@@ -2,38 +2,43 @@
 set -euo pipefail
 
 # Setup absolute paths
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../" &>/dev/null && pwd)
+HOST_SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+HOST_REPO_ROOT=$(cd -- "${HOST_SCRIPT_DIR}/../" &>/dev/null && pwd)
 
 # Load the SST Shell Framework
-source "${REPO_ROOT}/scripts/framework.sh"
+source "${HOST_REPO_ROOT}/scripts/framework.sh"
 
 if [[ $# -lt 1 ]]; then
-    die "Usage: $0 <dockerfile> [build_host]"
+    die "Usage: $0 <dockerfile> [build_host] [context_dir]"
 fi
 
-DOCKERFILE="$1"
-BUILD_HOST="${2:-ub}" 
+HOST_DOCKERFILE="$1"
+VM_BUILD_HOST="${2:-ub}"
+HOST_CONTEXT_DIR="${3:-.}"
 
-UBUNTU_RUNTIMES_DIR="/home/braam/.runtimes"
-MAC_RUNTIMES_DIR="${HOME}/.runtimes"
+# Resolve absolute path for the host side
+HOST_CONTEXT_ABS="$(cd "$HOST_CONTEXT_DIR" && pwd)"
 
-IMAGE_NAME=$(awk -F'[: \t]+' 'tolower($1) == "name" {print $2}' "$DOCKERFILE" | tr -d '"\r\n' | head -n 1 || true)
+# Define VM-side mapped directories
+VM_BUILD_DIR="/runtimes"
+VM_WORKSPACE_DIR="/workspace"
+
+IMAGE_NAME=$(awk -F'[: \t]+' 'tolower($1) == "name" {print $2}' "$HOST_DOCKERFILE" | tr -d '"\r\n' | head -n 1 || true)
 if [[ -z "$IMAGE_NAME" ]]; then
-    IMAGE_NAME=$(basename "$DOCKERFILE" .dockerfile)
+    IMAGE_NAME=$(basename "$HOST_DOCKERFILE" .dockerfile)
 fi
 
 INSTANCE_NAME="test-run-${IMAGE_NAME}"
-DOCKERFILE_ABS="$(cd "$(dirname "$DOCKERFILE")" && pwd)/$(basename "$DOCKERFILE")"
-VM_PID=""
+HOST_VM_PID=""
 
 # --- Teardown Hook ---
 cleanup() {
     local rc=$?
-    if [[ -n "$VM_PID" ]]; then
+    if [[ -n "$HOST_VM_PID" ]]; then
         logx info "teardown.start" instance "$INSTANCE_NAME"
-        runctl stop "$INSTANCE_NAME" >/dev/null 2>&1 || true
-        wait $VM_PID 2>/dev/null || true
+        # Execute from context dir to ensure local resolution
+        (cd "$HOST_CONTEXT_ABS" && runctl stop "$INSTANCE_NAME" >/dev/null 2>&1 || true)
+        wait $HOST_VM_PID 2>/dev/null || true
         logx info "teardown.ok"
     fi
     if [[ $rc -ne 0 ]]; then
@@ -43,80 +48,50 @@ cleanup() {
 }
 trap cleanup EXIT
 
-logx info "roundtrip.start" image "$IMAGE_NAME" instance "$INSTANCE_NAME" host "$BUILD_HOST"
+logx info "roundtrip.start" image "$IMAGE_NAME" instance "$INSTANCE_NAME" host "$VM_BUILD_HOST"
 
 # ---------------------------------------------------------
-# Phase 1: Build (Delegates to 'ub' using Linux ZFS disk)
+# Phase 1: Build (Delegates to VM using ZFS disk)
 # ---------------------------------------------------------
 step_enter "build_image"
-run mkimg build -d "$UBUNTU_RUNTIMES_DIR" "$DOCKERFILE_ABS"
+# -b instructs the VM to use the fast ZFS pool for intermediate extraction
+# -d instructs the VM to emit final artifacts to virtiofs (mapped to HOST_CONTEXT_ABS)
+run mkimg build -b "$VM_BUILD_DIR" -d "$VM_WORKSPACE_DIR" -f "$HOST_DOCKERFILE" "$HOST_CONTEXT_DIR" 
 step_ok
 
 # ---------------------------------------------------------
-# Phase 2: Instantiate (Delegates to 'ub' using Linux ZFS disk)
+# Phase 2: Instantiate
 # ---------------------------------------------------------
 step_enter "instantiate_vm"
-
-logx info "checking for genisoimage on build host..."
-runctl ssh "$BUILD_HOST" "if ! command -v genisoimage >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y genisoimage; fi" >/dev/null 2>&1 || true
-
-SEMANTIC_NAME=$(runctl ssh "$BUILD_HOST" "ls -1rt '$UBUNTU_RUNTIMES_DIR/images/' | grep alpine" | tail -n 1 | tr -d '\r')
-if [[ -z "$SEMANTIC_NAME" ]]; then
-    SEMANTIC_NAME="$IMAGE_NAME"
-fi
-logx info "detected semantic image name" name "$SEMANTIC_NAME"
-
-run mkimg instance -d "$UBUNTU_RUNTIMES_DIR" "$SEMANTIC_NAME" "$INSTANCE_NAME" --force
+run mkimg instance -b "$VM_BUILD_DIR" -d "$VM_WORKSPACE_DIR" "$IMAGE_NAME" "$INSTANCE_NAME" --force
 step_ok
 
 # ---------------------------------------------------------
-# Phase 3: Sync from ZFS (ub) to macOS & Purify
-# ---------------------------------------------------------
-step_enter "sync_artifacts"
-logx info "syncing built artifacts from Linux ZFS back to macOS"
-SYNC_SCRIPT="
-sudo chown -R \$(whoami) '$UBUNTU_RUNTIMES_DIR/images/' '$UBUNTU_RUNTIMES_DIR/instances/'
-mkdir -p '$MAC_RUNTIMES_DIR/images/' '$MAC_RUNTIMES_DIR/instances/'
-cp -a '$UBUNTU_RUNTIMES_DIR/images/.' '$MAC_RUNTIMES_DIR/images/'
-cp -a '$UBUNTU_RUNTIMES_DIR/instances/.' '$MAC_RUNTIMES_DIR/instances/'
-"
-run runctl ssh "$BUILD_HOST" "$SYNC_SCRIPT"
-
-# THE FIX: The files just arrived via a Linux copy over a shared folder. 
-# They are poisoned. We must natively purify them on the Mac right now.
-if [ "$(uname)" = "Darwin" ]; then
-    logx info "purifying synced artifacts natively on macOS..."
-    for f in "$MAC_RUNTIMES_DIR/instances/$INSTANCE_NAME/$INSTANCE_NAME.raw" "$MAC_RUNTIMES_DIR/instances/$INSTANCE_NAME/cidata.iso"; do
-        if [ -f "$f" ]; then
-            cp "$f" "${f}.clean"
-            rm "$f"
-            mv "${f}.clean" "$f"
-        fi
-    done
-fi
-step_ok
-
-# ---------------------------------------------------------
-# Phase 4: Start VM natively on macOS
+# Phase 3: Start VM natively on macOS
 # ---------------------------------------------------------
 step_enter "start_vm"
-logx info "starting vm in background" instance "$INSTANCE_NAME"
-runctl start "$INSTANCE_NAME" &
-VM_PID=$!
+logx info "starting vm natively on host" instance "$INSTANCE_NAME"
+
+# Execute in context dir so runctl resolves it locally, but keep it in the main shell
+pushd "$HOST_CONTEXT_ABS" >/dev/null
+run runctl start "$INSTANCE_NAME" &
+HOST_VM_PID=$!
+popd >/dev/null
 
 logx info "waiting for VM to boot and acquire IP..."
-run sleep 15
+run sleep 5
 step_ok
 
 # ---------------------------------------------------------
-# Phase 5: Verify SSH
+# Phase 4: Verify SSH
 # ---------------------------------------------------------
 step_enter "verify_ssh"
 logx info "executing 'uname -a' inside the VM"
 
 ssh_success=false
 for i in {1..3}; do
-    if runctl ssh "$INSTANCE_NAME" "uname -a"; then
+    # Execute from context dir to ensure local resolution
+    if (cd "$HOST_CONTEXT_ABS" && runctl ssh "$INSTANCE_NAME" "uname -a"); then
         ssh_success=true
         break
     fi

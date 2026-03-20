@@ -2,10 +2,12 @@ package rtsst
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/swiss-software-tool/sst/internal/sst"
 	mkimagepb "github.com/swiss-software-tool/sst/proto/yaml/mkimage/v1"
@@ -13,11 +15,53 @@ import (
 )
 
 func (b *BuildApp) InitEnvironment(ctx context.Context) error {
-	b.BuildID = b.Name // Scope datasets by target name for isolation
+	absContext, err := filepath.Abs(b.ContextDir)
+	if err != nil {
+		return fmt.Errorf("failed to resolve context directory: %w", err)
+	}
 
-	b.DatasetMgr = NewDatasetManager(b.RuntimeDir, b.BuildID)
+	absDockerfilePath, err := filepath.Abs(b.Dockerfile)
+	if err != nil {
+		return fmt.Errorf("failed to resolve absolute path of dockerfile: %w", err)
+	}
 
-	// If --force is provided, completely wipe the existing build environment first
+	targetDockerfilePath := filepath.Join(absContext, filepath.Base(absDockerfilePath))
+
+	if absDockerfilePath != targetDockerfilePath {
+		err = os.Link(absDockerfilePath, targetDockerfilePath)
+		if err != nil {
+			if os.IsExist(err) {
+				srcInfo, statErr1 := os.Stat(absDockerfilePath)
+				dstInfo, statErr2 := os.Stat(targetDockerfilePath)
+				if statErr1 != nil || statErr2 != nil || !os.SameFile(srcInfo, dstInfo) {
+					return fmt.Errorf("dockerfile name collision: %s already exists in context directory but points to a different file", filepath.Base(absDockerfilePath))
+				}
+			} else {
+				return fmt.Errorf("failed to hardlink dockerfile into context directory (cross-device link?): %w", err)
+			}
+		}
+		b.Log.Info(ctx, "hardlinked dockerfile into context workspace", "src", absDockerfilePath, "dst", targetDockerfilePath)
+	}
+
+	b.Dockerfile = targetDockerfilePath
+
+	hashBytes := sha256.Sum256([]byte(absContext))
+	contextHash := fmt.Sprintf("%x", hashBytes)[:12]
+
+	dockerfileName := filepath.Base(b.Dockerfile)
+
+	b.BuildID = fmt.Sprintf("%s-%s", contextHash, dockerfileName)
+	runtimeRootName := fmt.Sprintf("runtime-root-%s", dockerfileName)
+
+	b.Log.Info(ctx, "initialized workspace",
+		"context", absContext,
+		"build_root", b.BuildID,
+		"runtime_root", runtimeRootName,
+	)
+
+	// USES THE DEDICATED BUILD DIR FOR ZFS EXTRACTION
+	b.DatasetMgr = NewDatasetManager(b.BuildDir, b.BuildID, runtimeRootName)
+
 	if b.Force {
 		b.Log.Info(ctx, "force flag provided, annihilating existing build environment", "build_id", b.BuildID)
 		_ = b.DatasetMgr.Destroy()
@@ -144,19 +188,16 @@ func (b *BuildApp) ExecuteSingleInstruction(ctx context.Context, inst Instructio
 
 		resolvedLoc := b.Substitute(inst.Location)
 
-		// DYNAMIC LOCATION RESOLUTION
 		targetDir := b.RootDir
-		activeRootfs := b.RootDir // By default, the payload being built IS the main rootfs
+		activeRootfs := b.RootDir
 
 		if resolvedLoc == "base" {
 			targetDir = filepath.Dir(b.RootDir)
-			// activeRootfs remains b.RootDir
 		} else if resolvedLoc == "boot" {
 			targetDir = filepath.Join(filepath.Dir(b.RootDir), "boot")
-			// activeRootfs remains b.RootDir
 		} else if stagePath, ok := b.StageMounts[resolvedLoc]; ok {
 			targetDir = stagePath
-			activeRootfs = stagePath // An AS stage acts as its own payload
+			activeRootfs = stagePath
 		} else if resolvedLoc != "root" && resolvedLoc != "host" && resolvedLoc != "chroot" && resolvedLoc != "" {
 			targetDir = filepath.Join(b.DatasetMgr.mountPath(""), resolvedLoc)
 			os.MkdirAll(targetDir, 0755)
@@ -173,7 +214,6 @@ func (b *BuildApp) ExecuteSingleInstruction(ctx context.Context, inst Instructio
 	}
 }
 
-// buildEnvironmentMap injects standard env vars AND the Host-Level Cache Datasets.
 func (b *BuildApp) buildEnvironmentMap(activeRootfs string) []string {
 	envMap := make(map[string]string)
 
@@ -186,9 +226,9 @@ func (b *BuildApp) buildEnvironmentMap(activeRootfs string) []string {
 	envMap["BASEDIR"] = filepath.Dir(b.RootDir)
 	envMap["BOOTDIR"] = filepath.Join(filepath.Dir(b.RootDir), "boot")
 	envMap["NAME"] = b.Name
+	// EMITS TO RUNTIME DIR (Mapped to macOS workspace)
 	envMap["OUTDIR"] = filepath.Join(b.RuntimeDir, "images", b.Name)
 
-	// Expose the Phase 1 persistent ZFS cache boundaries to the shell templates
 	envMap["SST_CACHE_APT"] = b.DatasetMgr.CacheDir("apt")
 	envMap["SST_CACHE_APK"] = b.DatasetMgr.CacheDir("apk")
 	envMap["SST_CACHE_DNF"] = b.DatasetMgr.CacheDir("dnf")
@@ -222,9 +262,10 @@ func (b *BuildApp) execHostRun(ctx context.Context, cmdStr string, targetDir str
 	req := sst.ExecRequest{
 		Cmd:  "/bin/sh",
 		Args: []string{"-c", cmdStr},
-		Dir:  filepath.Dir(b.Dockerfile), // Host context executes inside the Dockerfile directory
+		Dir:  filepath.Dir(b.Dockerfile),
 		Env:  env,
-		Mode: sst.ExecCaptured,
+		// CHANGED: Stream output live to the terminal
+		Mode: sst.ExecForeground,
 	}
 	_, err := sst.Exec(ctx, b.Log, req)
 	if err != nil {
@@ -241,7 +282,6 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 		sst.ExecShell(ctx, b.Log, "mount", "--bind", m, target)
 	}
 
-	// 1. ISOLATED DATASET CACHES (Bind Mounts for Package Managers)
 	cachePaths := map[string]string{
 		"apk": "/var/cache/apk",
 		"apt": "/var/cache/apt/archives",
@@ -300,7 +340,6 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 		chrootCmd = fmt.Sprintf("/%s", scriptName)
 	}
 
-	// 2. INJECT PACKAGE MANAGER ENVIRONMENT VARIABLES
 	env := b.buildEnvironmentMap(activeRootfs)
 	env = append(env,
 		"APK_CACHE_DIR=/var/cache/apk",
@@ -313,7 +352,8 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 		Cmd:  "chroot",
 		Args: []string{targetDir, "/bin/sh", "-c", chrootCmd},
 		Env:  env,
-		Mode: sst.ExecCaptured,
+		// CHANGED: Stream output live to the terminal
+		Mode: sst.ExecForeground,
 	}
 	if _, err := sst.Exec(ctx, b.Log, req); err != nil {
 		return fmt.Errorf("chroot command failed: %w", err)
@@ -322,78 +362,51 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 }
 
 func (b *BuildApp) FinalizeVM(ctx context.Context) error {
-	originalName := b.Name
+	// EMITS TO RUNTIME DIR (Mapped to macOS workspace)
+	b.ImageOutput = filepath.Join(b.RuntimeDir, "images", b.Name)
+	if err := os.MkdirAll(b.ImageOutput, 0755); err != nil {
+		return err
+	}
 
+	semanticName := ""
+	upstreamBuildID := ""
 	osInfo, err := ParseOSRelease(b.RootDir)
 	if err == nil {
-		semanticName := GenerateSemanticName(osInfo)
-		baseFilename := strings.TrimSuffix(filepath.Base(b.Dockerfile), filepath.Ext(b.Dockerfile))
-		if b.Name == "" || b.Name == "scratch" || b.Name == baseFilename {
-			b.Log.Info(ctx, "applying semantic name from rootfs", "name", semanticName)
-			b.Name = semanticName
-		}
+		semanticName = GenerateSemanticName(osInfo)
+		upstreamBuildID = osInfo["BUILD_ID"]
+		b.Log.Info(ctx, "parsed os-release from imported image", "semantic_name", semanticName, "upstream_build_id", upstreamBuildID)
 	}
 
-	b.ImageOutput = filepath.Join(b.RuntimeDir, "images", b.Name)
-
-	if originalName != b.Name {
-		oldOutDir := filepath.Join(b.RuntimeDir, "images", originalName)
-
-		if _, err := os.Stat(oldOutDir); err == nil {
-			os.MkdirAll(filepath.Dir(b.ImageOutput), 0755)
-			b.Log.Info(ctx, "renaming output artifacts to match semantic name", "from", oldOutDir, "to", b.ImageOutput)
-
-			if _, err := os.Stat(b.ImageOutput); err == nil {
-				b.Log.Warn(ctx, "destination directory already exists, overwriting", "dest", b.ImageOutput)
-				_ = os.RemoveAll(b.ImageOutput)
-			}
-
-			if err := os.Rename(oldOutDir, b.ImageOutput); err != nil {
-				return fmt.Errorf("failed to rename output directory: %w", err)
-			}
-
-			oldRaw := filepath.Join(b.ImageOutput, originalName+".raw")
-			newRaw := filepath.Join(b.ImageOutput, b.Name+".raw")
-			if _, err := os.Stat(oldRaw); err == nil {
-				_ = os.Rename(oldRaw, newRaw)
-			}
-
-			oldQcow := filepath.Join(b.ImageOutput, originalName+".qcow2")
-			newQcow := filepath.Join(b.ImageOutput, b.Name+".qcow2")
-			if _, err := os.Stat(oldQcow); err == nil {
-				_ = os.Rename(oldQcow, newQcow)
-			}
-
-			oldTar := filepath.Join(b.ImageOutput, originalName+".tar")
-			newTar := filepath.Join(b.ImageOutput, b.Name+".tar")
-			if _, err := os.Stat(oldTar); err == nil {
-				_ = os.Rename(oldTar, newTar)
-			}
-		} else {
-			if err := os.MkdirAll(b.ImageOutput, 0755); err != nil {
-				return err
-			}
-		}
-	} else {
-		if err := os.MkdirAll(b.ImageOutput, 0755); err != nil {
-			return err
-		}
-	}
+	buildID := time.Now().UTC().Format("20060102-150405")
 
 	sb := &ImageSB{
 		Ctx: ctx,
 		Log: b.Log,
 		YamlObject: &mkimagepb.ImageYAML{
-			Name:     b.Name,
-			RawImage: b.Name + ".raw",
+			ApiVersion: "sst.io/v1",
+			Kind:       "Image",
+			Provenance: &mkimagepb.Provenance{
+				Name:            b.Name,
+				BuildId:         buildID,
+				UpstreamOs:      semanticName,
+				UpstreamBuildId: upstreamBuildID,
+			},
+			Storage: &mkimagepb.StoragePlan{
+				RawImage: b.Name + ".raw",
+			},
+			Boot: &mkimagepb.BootStructure{},
 		},
 		SstRuntimeDir: b.RuntimeDir,
 	}
 
 	_ = AnalyseImg(sb)
-	if sb.YamlObject.BootfsDevice != "" {
+	if sb.YamlObject.Boot != nil && sb.YamlObject.Boot.BootfsDevice != "" {
 		_ = ExtractArtifacts(sb)
 	}
+
+	QueuePurification(b.RuntimeDir, []string{
+		filepath.Join(b.ImageOutput, b.Name+".raw"),
+	})
 
 	yo := &sst.YamlObject{
 		Path:   filepath.Join(b.ImageOutput, "image.yaml"),
@@ -441,12 +454,14 @@ func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
 	rootDev := "/dev/vda2"
 	rootType := "ext4"
 	if diags := yoImg.Load(ctx, b.Log); diags == nil || !diags.HasAny() {
-		if imgManifest.RootfsDevice != "" {
-			rootDev = imgManifest.RootfsDevice
-			b.Log.Info(ctx, "inherited rootfs device from base image manifest", "rootfs_device", rootDev)
-		}
-		if imgManifest.RootfsType != "" {
-			rootType = imgManifest.RootfsType
+		if imgManifest.Storage != nil {
+			if imgManifest.Storage.RootfsDevice != "" {
+				rootDev = imgManifest.Storage.RootfsDevice
+				b.Log.Info(ctx, "inherited rootfs device from base image manifest", "rootfs_device", rootDev)
+			}
+			if imgManifest.Storage.RootfsType != "" {
+				rootType = imgManifest.Storage.RootfsType
+			}
 		}
 	} else {
 		b.Log.Warn(ctx, "failed to load base image manifest; falling back to default rootfs", "error", diags.Error())
@@ -498,11 +513,6 @@ func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
 	if diags := yoInst.Save(ctx, b.Log); diags != nil && diags.HasAny() {
 		return diags
 	}
-
-	if err := WriteCIData(ctx, b.Log, instDir, inst); err != nil {
-		b.Log.Warn(ctx, "failed to write advanced cidata", "error", err)
-	}
-	_ = EnsureCIDataISO(ctx, b.Log, instDir)
 
 	QueuePurification(b.RuntimeDir, []string{
 		filepath.Join(instDir, instName+".raw"),

@@ -1,12 +1,45 @@
 package rtsst
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
+
+// goTree is a pure-Go helper that mimics `tree -d` for visual test verification.
+func goTree(root string, prefix string) string {
+	var sb strings.Builder
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return ""
+	}
+
+	var dirs []os.DirEntry
+	for _, e := range entries {
+		if e.IsDir() {
+			dirs = append(dirs, e)
+		}
+	}
+
+	for i, d := range dirs {
+		isLast := i == len(dirs)-1
+		var branch, newPrefix string
+		if isLast {
+			branch = "└── "
+			newPrefix = prefix + "    "
+		} else {
+			branch = "├── "
+			newPrefix = prefix + "│   "
+		}
+		sb.WriteString(prefix + branch + d.Name() + "\n")
+		sb.WriteString(goTree(filepath.Join(root, d.Name()), newPrefix))
+	}
+	return sb.String()
+}
 
 func TestDatasetManager_TopologyAndTeardown(t *testing.T) {
 	// Use a temp directory for the physical mountpoint
@@ -14,9 +47,10 @@ func TestDatasetManager_TopologyAndTeardown(t *testing.T) {
 
 	// Create a manager WITHOUT a Zpool defined (tests the multi-platform physical fallback)
 	mgr := &DatasetManager{
-		Zpool:     "",
-		BuildID:   "test-heist",
-		BasePoint: tmpDir,
+		Zpool:           "",
+		BuildID:         "abcdef123456-web.dockerfile",
+		BasePoint:       tmpDir,
+		RuntimeRootName: "runtime-root-web.dockerfile",
 	}
 
 	// 1. Test Initialization
@@ -41,18 +75,25 @@ func TestDatasetManager_TopologyAndTeardown(t *testing.T) {
 	stagePath, err := mgr.CreateAsRoot("ubuntu-massive")
 	assert.NoError(t, err, "CreateAsRoot should succeed")
 
-	expectedStagePath := filepath.Join(tmpDir, "builds", "build-test-heist", "as-roots", "ubuntu-massive")
+	expectedStagePath := filepath.Join(tmpDir, "builds", "abcdef123456-web.dockerfile", "as-roots", "ubuntu-massive")
 	assert.Equal(t, expectedStagePath, stagePath, "Stage path should match expected layout")
 
 	info, err = os.Stat(stagePath)
 	assert.NoError(t, err, "Stage directory should exist on disk")
 	assert.True(t, info.IsDir())
 
+	// --- VISUAL TREE OUTPUT ---
+	// Prints the directory structure mimicking `tree -d`
+	fmt.Println("\n=== Generated Dataset Topology ===")
+	fmt.Println(filepath.Base(tmpDir) + " (Mock ~/.runtimes)")
+	fmt.Print(goTree(tmpDir, ""))
+	fmt.Println("==================================")
+
 	// 3. Test Nuclear Destruction (--force)
 	err = mgr.Destroy()
 	assert.NoError(t, err, "Destroy should succeed")
 
-	// Verify the ENTIRE build-<ino> directory is gone
+	// Verify the ENTIRE build root directory is gone
 	buildRoot := mgr.mountPath("")
 	_, err = os.Stat(buildRoot)
 	assert.True(t, os.IsNotExist(err), "The entire build directory should be annihilated")

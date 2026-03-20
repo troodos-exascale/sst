@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
@@ -183,14 +184,8 @@ func (r *Runctl) Start(name string) error {
 
 	go func() {
 		for sig := range sigCh {
-			// On ARM (macOS), ACPI isn't available to gracefully power down.
-			// Instead of hanging, we violently kill the VM child process.
-			if runtime.GOARCH == "arm64" || runtime.GOARCH == "arm" {
-				r.Log.Info(r.Ctx, "ARM architecture detected: sending SIGKILL to child VM")
-				_ = cmd.Process.Signal(syscall.SIGKILL)
-			} else {
-				_ = cmd.Process.Signal(sig)
-			}
+			// Simply forward the signal to the supervisor (crosvm wrapper)
+			_ = cmd.Process.Signal(sig)
 		}
 	}()
 
@@ -327,18 +322,60 @@ func (r *Runctl) listCmd() *cobra.Command {
 	return &cobra.Command{
 		Use: "list",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ents, _ := os.ReadDir(rtsst.InstanceRoot())
-			for _, e := range ents {
-				if !e.IsDir() {
-					continue
+			seen := make(map[string]bool)
+
+			// Initialize tabwriter for perfectly aligned columns
+			w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+			fmt.Fprintln(w, "NAME\tSTATE\tIP\tLOCATION")
+
+			printInstances := func(baseDir, tag string) {
+				ents, _ := os.ReadDir(baseDir)
+				for _, e := range ents {
+					// Skip non-directories and hidden folders
+					if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
+						continue
+					}
+
+					instPath := filepath.Join(baseDir, e.Name())
+					if _, err := os.Stat(filepath.Join(instPath, "instance.yaml")); os.IsNotExist(err) {
+						continue
+					}
+
+					// Prefer local over global if names collide
+					if seen[e.Name()] {
+						continue
+					}
+					seen[e.Name()] = true
+
+					lp := filepath.Join(instPath, "lockfile")
+					state := "stopped"
+					ip := "-"
+
+					if info, err := rtsst.ReadLock(lp); err == nil && rtsst.IsPidAlive(info.Pid) {
+						state = "running"
+						// Only attempt to resolve IP if it is actively running
+						if inst, err := r.loadInstance(e.Name()); err == nil && len(inst.Network) > 0 {
+							mac := strings.Split(inst.Network[0], "@")[0]
+							if resolvedIP, err := r.resolveIP(mac); err == nil {
+								ip = resolvedIP
+							}
+						}
+					}
+
+					// Write to tabwriter
+					fmt.Fprintf(w, "%s\t%s\t%s\t[%s]\n", e.Name(), state, ip, tag)
 				}
-				lp := rtsst.LockFilePath(e.Name())
-				state := "stopped"
-				if info, err := rtsst.ReadLock(lp); err == nil && rtsst.IsPidAlive(info.Pid) {
-					state = "running"
-				}
-				fmt.Printf("%s\t%s\n", e.Name(), state)
 			}
+
+			// 1. Scan Local Directory
+			cwd, _ := os.Getwd()
+			printInstances(cwd, "local")
+
+			// 2. Scan Global Directory
+			printInstances(rtsst.InstanceRoot(), "global")
+
+			// Flush outputs the formatted table to stdout
+			w.Flush()
 			return nil
 		},
 	}

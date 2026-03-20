@@ -51,7 +51,14 @@ func runSupervisor() {
 
 	go func() {
 		for sig := range sigCh {
-			_ = cmd.Process.Signal(sig)
+			// macOS/VZ lacks reliable ACPI shutdown for these guests.
+			// To prevent the worker hanging for 120s or ghosting, we translate
+			// standard termination signals into a hard kill for the worker.
+			if sig == syscall.SIGTERM || sig == syscall.SIGINT {
+				_ = cmd.Process.Signal(syscall.SIGKILL)
+			} else {
+				_ = cmd.Process.Signal(sig)
+			}
 		}
 	}()
 
@@ -153,12 +160,12 @@ func runWorker() {
 	f.IntVar(&app.CPUCount, "cpus", 1, "CPU count")
 	f.Uint64Var(&app.MemorySize, "mem", 512, "Memory size (MiB)")
 
-	f.StringSliceVar(&app.Blocks, "block", []string{}, "Block devices (path=...,ro=...)")
-	f.StringSliceVar(&app.Networks, "net", []string{"nat"}, "Network config")
-	f.StringSliceVar(&app.SharedDirs, "shared-dir", []string{}, "Shared directories")
+	f.StringArrayVar(&app.Blocks, "block", []string{}, "Block devices (path=...,ro=...)")
+	f.StringArrayVar(&app.Networks, "net", []string{"nat"}, "Network config")
+	f.StringArrayVar(&app.SharedDirs, "shared-dir", []string{}, "Shared directories")
 
 	f.BoolVar(&app.NestedVirt, "nested-virt", false, "Enable nested virtualization")
-	f.StringSliceVar(&app.CdromPaths, "cdrom", []string{}, "CD-ROMs")
+	f.StringArrayVar(&app.CdromPaths, "cdrom", []string{}, "CD-ROMs")
 	f.BoolVar(&app.Balloon, "balloon", true, "Enable memory ballooning")
 
 	// FIX: Align EFI flags with upstream crosvm

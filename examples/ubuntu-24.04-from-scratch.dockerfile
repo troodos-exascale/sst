@@ -1,21 +1,19 @@
 FROM scratch
 NAME: ubuntu-scratch
 
+# REQUIRED: Declare the argument so the Go engine is allowed to inject it!
+ARG DEB_ARCH
+
 # 1. Bootstrap the root filesystem from Canonical's Ubuntu Base tarball
+GET http://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.4-base-${DEB_ARCH}.tar.gz /ubuntu-base.tar.gz
+
 RUN [host]: |
   set -e
-  echo "--> Bootstrapping Ubuntu Noble (24.04) from scratch into ${ROOTFS}..."
+  echo "--> Extracting cached Ubuntu Noble (24.04) into ${ROOTFS}..."
   
-  # Detect architecture to pull the right tarball (aarch64 -> arm64)
-  ARCH=$(uname -m)
-  if [ "$ARCH" = "aarch64" ]; then UBUNTU_ARCH="arm64"; else UBUNTU_ARCH="amd64"; fi
-  
-  TARBALL="ubuntu-base-24.04.4-base-${UBUNTU_ARCH}.tar.gz"
-  URL="http://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/${TARBALL}"
-  
-  wget -qO "/tmp/${TARBALL}" "$URL"
-  tar -xzf "/tmp/${TARBALL}" -C "${ROOTFS}"
-  rm -f "/tmp/${TARBALL}"
+  # Extract the payload injected by the GET instruction
+  tar -xzf "${ROOTFS}/ubuntu-base.tar.gz" -C "${ROOTFS}"
+  rm -f "${ROOTFS}/ubuntu-base.tar.gz"
 
 # 2. Hydrate the OS for NoCloud VM environments
 INCLUDE ubuntu-nocloud-bootstrap.dockerfile

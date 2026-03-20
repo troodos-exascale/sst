@@ -29,9 +29,6 @@ func Home() string {
 }
 
 func RuntimeDir() string {
-	if env := os.Getenv("SST_RUNTIMEDIR"); env != "" {
-		return env
-	}
 	return filepath.Join(Home(), ".runtimes")
 }
 
@@ -39,8 +36,39 @@ func InstanceRoot() string {
 	return filepath.Join(RuntimeDir(), "instances")
 }
 
+// InstanceDir resolves the absolute path to a runtime instance.
+// It checks the current working directory first, then falls back to the global ~/.runtimes catalog.
 func InstanceDir(name string) string {
-	return filepath.Join(InstanceRoot(), name)
+	// 1. Local CWD check
+	if cwd, err := os.Getwd(); err == nil {
+		// Check if we are at the context root (./instances/<name>)
+		localPath := filepath.Join(cwd, "instances", name)
+		if _, err := os.Stat(filepath.Join(localPath, "instance.yaml")); err == nil {
+			return localPath
+		}
+		// Check if we are already sitting directly inside the instance folder
+		if _, err := os.Stat(filepath.Join(cwd, "instance.yaml")); err == nil {
+			if filepath.Base(cwd) == name {
+				return cwd
+			}
+		}
+	}
+
+	// 2. Global Catalog check (~/.runtimes/instances/<name> -> symlink to host context)
+	globalPath := filepath.Join(Home(), ".runtimes", "instances", name)
+	if info, err := os.Lstat(globalPath); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			if realPath, err := filepath.EvalSymlinks(globalPath); err == nil {
+				return realPath
+			}
+		} else {
+			return globalPath // Legacy fallback if it's an actual directory
+		}
+	}
+
+	// Fallback to CWD to allow standard error surfacing
+	cwd, _ := os.Getwd()
+	return filepath.Join(cwd, "instances", name)
 }
 
 func LockFilePath(name string) string {
@@ -184,7 +212,11 @@ func GetLocalPublicKey() (string, error) {
 	return "", nil
 }
 
-func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *runctlpb.Instance) error {
+func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *runctlpb.Instance, username string) error {
+	if username == "" || username == "root" {
+		return fmt.Errorf("invalid username '%s' for cloud-init: cannot be empty or root", username)
+	}
+
 	cidataDir := filepath.Join(instanceDir, "cidata")
 	if err := os.MkdirAll(cidataDir, 0755); err != nil {
 		return fmt.Errorf("failed to create cidata dir: %w", err)
@@ -193,15 +225,6 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 	pubKey, err := GetLocalPublicKey()
 	if err != nil {
 		return fmt.Errorf("failed to get user's local public key: %w", err)
-	}
-
-	username := os.Getenv("SST_HOST_USER")
-	if username == "" {
-		u, err := user.Current()
-		if err != nil {
-			return fmt.Errorf("failed to get current user: %w", err)
-		}
-		username = u.Username
 	}
 
 	type mountInfo struct {
@@ -216,23 +239,19 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 		if len(parts) == 0 || parts[0] == "" {
 			continue
 		}
-
-		tag := parts[0]
-		guestPath := tag
+		
+		hostDir := parts[0]
+		tag := hostDir 
 		if len(parts) > 1 && parts[1] != "" {
-			guestPath = parts[1]
+			tag = parts[1] 
 		}
-
+		
+		guestPath := tag
 		opts := "rw"
 		if len(parts) > 2 && parts[2] == "ro" {
 			opts = "ro"
 		}
-
-		mounts = append(mounts, mountInfo{
-			tag:       tag,
-			guestPath: guestPath,
-			options:   opts,
-		})
+		mounts = append(mounts, mountInfo{tag: tag, guestPath: guestPath, options: opts})
 	}
 
 	var sb strings.Builder
@@ -249,24 +268,27 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 	sb.WriteString("\nusers:\n")
 	sb.WriteString("  - default\n")
 	fmt.Fprintf(&sb, "  - name: %s\n", username)
-	sb.WriteString("    shell: /bin/sh\n") // CHANGED: explicitly use busybox sh
+	sb.WriteString("    shell: /bin/bash\n")
+	sb.WriteString("    sudo: ALL=(ALL) NOPASSWD:ALL\n") 
 	if pubKey != "" {
 		sb.WriteString("    ssh_authorized_keys:\n")
 		sb.WriteString("      - " + pubKey + "\n")
 	}
 
-	// CHANGED: Removed the chpasswd block completely since we don't need passwords
+	// NEW: bootcmd runs on EVERY boot, ensuring tmpfs directories survive reboots
+	sb.WriteString("\nbootcmd:\n")
+	sb.WriteString("  - mkdir -p /run/sshd\n")
+	sb.WriteString("  - chmod 0755 /run/sshd\n")
 
 	sb.WriteString("\nruncmd:\n")
 	sb.WriteString("  - |\n")
 
-	// CHANGED: Inject user shell via sed (no usermod), passwordless doas (no sudo), and hostname cleanly
 	sb.WriteString(fmt.Sprintf(`    if [ -f /etc/alpine-release ]; then
       mkdir -p /etc/conf.d
       echo 'TTY="hvc0"' > /etc/conf.d/ttyAMA0
       sed -i 's/^ttyAMA0/#ttyAMA0/' /etc/inittab
       
-      # Ensure shell is set using sed since usermod is removed
+      # Ensure shell is set using sed since bash/usermod are removed
       sed -i -e "s#^\(%s:.*:\)[^:]*\$#\1/bin/sh#" /etc/passwd
       
       # Explicit passwordless doas configuration
@@ -279,6 +301,10 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
       
       kill -HUP 1
     fi
+
+    # Proactively announce presence to populate the host's ARP table
+    GW=$(ip route | awk '/default/ {print $3}' | head -n 1)
+    if [ -n "$GW" ]; then ping -c 3 "$GW" >/dev/null 2>&1 || true; fi
 `, username, username, username, inst.Hostname, inst.Hostname))
 
 	for _, m := range mounts {
@@ -288,17 +314,11 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 	}
 
 	userData := sb.String()
-
-	metaData := fmt.Sprintf(
-		"instance-id: %s\nlocal-hostname: %s\n",
-		inst.Hostname,
-		inst.Hostname,
-	)
+	metaData := fmt.Sprintf("instance-id: %s\nlocal-hostname: %s\n", inst.Hostname, inst.Hostname)
 
 	if err := os.WriteFile(filepath.Join(cidataDir, "user-data"), []byte(userData), 0644); err != nil {
 		return fmt.Errorf("failed to write user-data: %w", err)
 	}
-
 	if err := os.WriteFile(filepath.Join(cidataDir, "meta-data"), []byte(metaData), 0644); err != nil {
 		return fmt.Errorf("failed to write meta-data: %w", err)
 	}

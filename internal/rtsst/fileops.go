@@ -41,7 +41,7 @@ func ParseOSRelease(rootfsPath string) (map[string]string, error) {
 	return data, scanner.Err()
 }
 
-// GenerateSemanticName constructs the canonical <ID>-<VERSION>-<VARIANT>-<BUILD> name.
+// GenerateSemanticName constructs the canonical <ID>-<VERSION>-<VARIANT> name.
 func GenerateSemanticName(info map[string]string) string {
 	id := info["ID"]
 	if id == "" {
@@ -56,11 +56,6 @@ func GenerateSemanticName(info map[string]string) string {
 
 	if variant, ok := info["VARIANT_ID"]; ok && variant != "" {
 		name = fmt.Sprintf("%s-%s", name, variant)
-	}
-	if buildID, ok := info["BUILD_ID"]; ok && buildID != "" {
-		// Clean the build ID of unsafe filename characters just in case
-		cleanBuild := strings.ReplaceAll(buildID, ":", "")
-		name = fmt.Sprintf("%s-%s", name, cleanBuild)
 	}
 
 	return name

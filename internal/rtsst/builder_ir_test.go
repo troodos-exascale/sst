@@ -36,7 +36,7 @@ RUN [boot, chroot, aws, ami]: echo "install aws agents"
 	tmpfile.Close()
 
 	log := sst.LogxRoot()
-	builder := NewBuilder(log, nil, tmpfile.Name(), "/tmp")
+	builder := NewBuilder(log, nil, tmpfile.Name(), ".", "/tmp", "/tmp")
 
 	err = builder.Parse(context.Background())
 	assert.NoError(t, err)
@@ -46,7 +46,7 @@ RUN [boot, chroot, aws, ami]: echo "install aws agents"
 
 	for i := range builder.Instructions {
 		inst := &builder.Instructions[i]
-		if strings.Contains(inst.Args, "cp -a ./my-app") {
+		if strings.Contains(inst.Args, "cp -a \"./my-app\"") {
 			copyInst = inst
 		} else if strings.Contains(inst.Args, "standard") {
 			stdRunInst = inst
@@ -60,34 +60,44 @@ RUN [boot, chroot, aws, ami]: echo "install aws agents"
 	}
 
 	assert.NotNil(t, copyInst, "Failed to find desugared COPY instruction")
-	assert.Equal(t, "RUN", copyInst.Type)
-	assert.Equal(t, "root", copyInst.Location)
-	assert.Equal(t, "host", copyInst.Context)
-	assert.Contains(t, copyInst.Args, "cp -a ./my-app \"$DST\"")
+	if copyInst != nil {
+		assert.Equal(t, "RUN", copyInst.Type)
+		assert.Equal(t, "root", copyInst.Location)
+		assert.Equal(t, "host", copyInst.Context)
+		assert.Contains(t, copyInst.Args, "cp -a \"./my-app\" \"$DST\"")
+	}
 
 	assert.NotNil(t, stdRunInst, "Failed to find standard RUN instruction")
-	assert.Equal(t, "RUN", stdRunInst.Type)
-	assert.Equal(t, "root", stdRunInst.Location)
-	assert.Equal(t, "chroot", stdRunInst.Context)
-	assert.Equal(t, []string{"all"}, stdRunInst.Conditions)
+	if stdRunInst != nil {
+		assert.Equal(t, "RUN", stdRunInst.Type)
+		assert.Equal(t, "root", stdRunInst.Location)
+		assert.Equal(t, "chroot", stdRunInst.Context)
+		assert.Equal(t, []string{"all"}, stdRunInst.Conditions)
+	}
 
 	assert.NotNil(t, hostRunInst, "Failed to find RUN [host] instruction")
-	assert.Equal(t, "RUN", hostRunInst.Type)
-	assert.Equal(t, "root", hostRunInst.Location)
-	assert.Equal(t, "host", hostRunInst.Context)
-	assert.Equal(t, []string{"all"}, hostRunInst.Conditions)
+	if hostRunInst != nil {
+		assert.Equal(t, "RUN", hostRunInst.Type)
+		assert.Equal(t, "root", hostRunInst.Location)
+		assert.Equal(t, "host", hostRunInst.Context)
+		assert.Equal(t, []string{"all"}, hostRunInst.Conditions)
+	}
 
 	assert.NotNil(t, buildDiskInst, "Failed to find RUN [base, host, qcow2] instruction")
-	assert.Equal(t, "RUN", buildDiskInst.Type)
-	assert.Equal(t, "base", buildDiskInst.Location)
-	assert.Equal(t, "host", buildDiskInst.Context)
-	assert.Equal(t, []string{"qcow2"}, buildDiskInst.Conditions)
+	if buildDiskInst != nil {
+		assert.Equal(t, "RUN", buildDiskInst.Type)
+		assert.Equal(t, "base", buildDiskInst.Location)
+		assert.Equal(t, "host", buildDiskInst.Context)
+		assert.Equal(t, []string{"qcow2"}, buildDiskInst.Conditions)
+	}
 
 	assert.NotNil(t, awsInst, "Failed to find RUN [boot, chroot, aws, ami] instruction")
-	assert.Equal(t, "RUN", awsInst.Type)
-	assert.Equal(t, "boot", awsInst.Location)
-	assert.Equal(t, "chroot", awsInst.Context)
-	assert.ElementsMatch(t, []string{"aws", "ami"}, awsInst.Conditions)
+	if awsInst != nil {
+		assert.Equal(t, "RUN", awsInst.Type)
+		assert.Equal(t, "boot", awsInst.Location)
+		assert.Equal(t, "chroot", awsInst.Context)
+		assert.ElementsMatch(t, []string{"aws", "ami"}, awsInst.Conditions)
+	}
 }
 
 func TestIRExecutionConditionMatching(t *testing.T) {
@@ -119,7 +129,7 @@ RUN: echo "main"`
 	os.WriteFile(mainPath, []byte(mainContent), 0644)
 
 	log := sst.LogxRoot()
-	builder := NewBuilder(log, nil, mainPath, tmpDir)
+	builder := NewBuilder(log, nil, mainPath, tmpDir, tmpDir, tmpDir)
 
 	err := builder.Parse(context.Background())
 	assert.NoError(t, err)

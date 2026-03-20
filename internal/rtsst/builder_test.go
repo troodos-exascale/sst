@@ -27,7 +27,7 @@ NAME: base-boot-debian`
 
 	log := sst.LogxRoot()
 
-	builder := NewBuilder(log, nil, tmpfile.Name(), "/tmp/dummy-runtimes")
+	builder := NewBuilder(log, nil, tmpfile.Name(), ".", "/tmp/dummy-runtimes", "/tmp/dummy-runtimes")
 
 	err = builder.Parse(context.Background())
 	assert.NoError(t, err)
@@ -74,7 +74,7 @@ ADD https://example.com/binary /usr/local/bin/
 
 	log := sst.LogxRoot()
 
-	builder := NewBuilder(log, nil, tmpfile.Name(), t.TempDir())
+	builder := NewBuilder(log, nil, tmpfile.Name(), ".", t.TempDir(), t.TempDir())
 
 	err = builder.Parse(context.Background())
 	assert.NoError(t, err)

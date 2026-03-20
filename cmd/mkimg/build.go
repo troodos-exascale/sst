@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -11,17 +12,40 @@ import (
 	"github.com/swiss-software-tool/sst/internal/sst"
 )
 
-var buildArgs []string
+var (
+	buildArgs    []string
+	flagFile     string
+	flagBuildDir string
+)
 
 // RunBuildEngine is the universal entrypoint for parsing and executing VAXLang DAGs.
-func RunBuildEngine(ctx context.Context, dockerfile, runtimeDir string, flagForce bool, bArgs map[string]string) error {
+func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runtimeDir string, flagForce bool, bArgs map[string]string) error {
 	log := sst.LogxRoot().Subsystem("mkimage.build")
-	builder := rtsst.NewBuilder(log, nil, dockerfile, runtimeDir)
+	builder := rtsst.NewBuilder(log, nil, dockerfile, contextDir, buildDir, runtimeDir)
 	builder.Force = flagForce
 
 	for k, v := range bArgs {
 		builder.BuildArgs[k] = v
 	}
+
+	// Standardize architecture strings for Dockerfile templates
+	goArch := runtime.GOARCH
+
+	// 1. Debian/Ubuntu family (amd64 / arm64)
+	builder.BuildArgs["ARCH"] = goArch
+	builder.BuildArgs["DEB_ARCH"] = goArch
+
+	// 2. RPM / Alpine family (x86_64 / aarch64)
+	var rpmArch string
+	if goArch == "arm64" {
+		rpmArch = "aarch64"
+	} else if goArch == "amd64" {
+		rpmArch = "x86_64"
+	} else {
+		rpmArch = goArch // Fallback
+	}
+	builder.BuildArgs["RPM_ARCH"] = rpmArch
+	builder.BuildArgs["ALPINE_ARCH"] = rpmArch
 
 	if err := builder.Parse(ctx); err != nil {
 		return err
@@ -30,7 +54,7 @@ func RunBuildEngine(ctx context.Context, dockerfile, runtimeDir string, flagForc
 		return err
 	}
 
-	// NEW: Initialize the ZFS Dataset topology
+	// Initialize the ZFS Dataset topology using the new BuildDir
 	if err := builder.InitEnvironment(ctx); err != nil {
 		return err
 	}
@@ -58,13 +82,18 @@ func RunBuildEngine(ctx context.Context, dockerfile, runtimeDir string, flagForc
 }
 
 var buildCmd = &cobra.Command{
-	Use:   "build <dockerfile>",
+	Use:   "build [context-dir]",
 	Short: "Builds a bootable VM image from a hybrid Dockerfile",
-	Args:  cobra.ExactArgs(1),
+	Args:  cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		runtimeDir := flagRoot
 		if runtimeDir == "" {
 			runtimeDir = rtsst.RuntimeDir()
+		}
+
+		contextDir := "."
+		if len(args) > 0 {
+			contextDir = args[0]
 		}
 
 		bArgs := make(map[string]string)
@@ -77,11 +106,13 @@ var buildCmd = &cobra.Command{
 			}
 		}
 
-		return RunBuildEngine(cmd.Context(), args[0], runtimeDir, flagForce, bArgs)
+		return RunBuildEngine(cmd.Context(), flagFile, contextDir, flagBuildDir, runtimeDir, flagForce, bArgs)
 	},
 }
 
 func init() {
 	buildCmd.Flags().StringSliceVar(&buildArgs, "build-arg", nil, "Set build-time variables (e.g., DEBARCH=amd64)")
+	buildCmd.Flags().StringVarP(&flagFile, "file", "f", "./Dockerfile", "path to the Dockerfile")
+	buildCmd.Flags().StringVarP(&flagBuildDir, "builddir", "b", "/runtimes", "Base directory for ZFS extraction and intermediate builds")
 	rootCmd.AddCommand(buildCmd)
 }

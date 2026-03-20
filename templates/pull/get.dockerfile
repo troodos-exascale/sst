@@ -10,16 +10,17 @@ RUN [$TARGET_STAGE, host]: |
   
   if [ ! -f "$CACHE_FILE" ]; then
     echo "--> GET cache miss: downloading payload..."
-    curl -sSL "${GET_URL}" -o "$CACHE_FILE"
+    curl -fsSL "${GET_URL}" -o "$CACHE_FILE"
   else
     echo "--> GET cache hit: ${GET_URL}"
   fi
   
   DST="${ROOTFS}/${GET_DEST}"
   
-  if [ "${GET_DEST: -1}" = "/" ]; then
-    DST="${DST}$(basename "${GET_URL}" | cut -d? -f1)"
-  fi
+  # POSIX-compliant check for trailing slash
+  case "${GET_DEST}" in
+    */) DST="${DST}$(basename "${GET_URL}" | cut -d? -f1)" ;;
+  esac
   
   mkdir -p "$(dirname "$DST")"
   echo "--> Injecting cached payload to $DST"

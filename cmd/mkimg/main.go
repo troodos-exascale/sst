@@ -1,16 +1,19 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"os/user"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
 
 	"github.com/spf13/cobra"
 	rtsst "github.com/swiss-software-tool/sst/internal/rtsst"
+	"github.com/swiss-software-tool/sst/proto/yaml/runctl/v1"
+	"github.com/swiss-software-tool/sst/internal/sst"
 )
 
 var (
@@ -29,83 +32,145 @@ var rootCmd = &cobra.Command{
 }
 
 func delegateToLinuxVM() {
-	vmName := os.Getenv("SST_BUILD_VM")
-	if vmName == "" {
-		vmName = "ub"
-	}
+	vmBuildHost := "ub"
 
-	// Do not delegate the 'help' command so local usage docs still render instantly
 	if len(os.Args) > 1 && (os.Args[1] == "help" || os.Args[1] == "--help") {
 		return
 	}
 
-	fmt.Printf("--> macOS detected. Transparently delegating command to Linux VM '%s'...\n", vmName)
+	hostContextDir := "."
+	hostDockerfile := ""
+	hostFileArgIndex := -1
+	instanceName := ""
 
-	runctlPath, err := exec.LookPath("runctl")
+	if len(os.Args) >= 3 {
+		for i := len(os.Args) - 1; i >= 2; i-- {
+			if info, err := os.Stat(os.Args[i]); err == nil && info.IsDir() {
+				hostContextDir = os.Args[i]
+				break
+			}
+		}
+		for i := 2; i < len(os.Args); i++ {
+			if (os.Args[i] == "-f" || os.Args[i] == "--file") && i+1 < len(os.Args) {
+				hostDockerfile = os.Args[i+1]
+				hostFileArgIndex = i + 1
+				break
+			}
+		}
+		if os.Args[1] == "instance" {
+			var positionals []string
+			for i := 2; i < len(os.Args); i++ {
+				if strings.HasPrefix(os.Args[i], "-") {
+					if os.Args[i] == "-b" || os.Args[i] == "--builddir" || os.Args[i] == "-d" || os.Args[i] == "--dir" || os.Args[i] == "-s" || os.Args[i] == "--size" {
+						i++
+					}
+					continue
+				}
+				positionals = append(positionals, os.Args[i])
+			}
+			if len(positionals) >= 2 {
+				instanceName = positionals[1]
+			}
+		}
+	}
+
+	if os.Args[1] == "build" && hostDockerfile != "" {
+		hostDest := filepath.Join(hostContextDir, filepath.Base(hostDockerfile))
+		hostAbsDoc, _ := filepath.Abs(hostDockerfile)
+		hostAbsDest, _ := filepath.Abs(hostDest)
+
+		if hostAbsDoc != hostAbsDest {
+			destStat, err := os.Stat(hostAbsDest)
+			if err == nil {
+				docStat, _ := os.Stat(hostAbsDoc)
+				if !os.SameFile(docStat, destStat) {
+					fmt.Fprintf(os.Stderr, "error: '%s' already exists in context dir and is a different file. Aborting to prevent overwrite.\n", filepath.Base(hostAbsDest))
+					os.Exit(1)
+				}
+			} else {
+				if err := os.Link(hostAbsDoc, hostAbsDest); err != nil {
+					fmt.Fprintf(os.Stderr, "error creating hardlink on host: %v\n", err)
+					os.Exit(1)
+				}
+			}
+			os.Args[hostFileArgIndex] = filepath.Base(hostDockerfile)
+		}
+	}
+
+	fmt.Printf("--> macOS detected. Delegating command to Linux VM '%s'...\n", vmBuildHost)
+
+	hostRunctlPath, err := exec.LookPath("runctl")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: runctl not found in PATH for delegation\n")
 		os.Exit(1)
 	}
 
-	// Reconstruct the command for remote execution.
-	// We inject 'sudo' because mkimg requires root privileges on Linux.
-	remoteCmd := []string{"sudo"}
-	if logFmt := os.Getenv("SST_LOG_FORMAT"); logFmt != "" {
-		remoteCmd = append(remoteCmd, "SST_LOG_FORMAT="+logFmt)
+	var vmCmd []string
+	if hostCwd, err := os.Getwd(); err == nil {
+		vmCmd = append(vmCmd, "cd", fmt.Sprintf("'%s'", hostCwd), "&&")
 	}
-
-	// --- NEW: Forward Mac identity to the Linux VM ---
-	if u, err := user.Current(); err == nil {
-		remoteCmd = append(remoteCmd, "SST_HOST_USER="+u.Username)
+	vmCmd = append(vmCmd, "sudo")
+	// Force pretty-printing over the non-TTY SSH connection
+	if logFmt := os.Getenv("SST_LOG_FORMAT"); logFmt != "" {
+		vmCmd = append(vmCmd, fmt.Sprintf("SST_LOG_FORMAT='%s'", logFmt))
 	}
 	if pubKey, err := rtsst.GetLocalPublicKey(); err == nil && pubKey != "" {
-		remoteCmd = append(remoteCmd, fmt.Sprintf("SST_HOST_PUBKEY='%s'", strings.TrimSpace(pubKey)))
+		vmCmd = append(vmCmd, fmt.Sprintf("SST_HOST_PUBKEY='%s'", strings.TrimSpace(pubKey)))
 	}
-	// -------------------------------------------------
 
-	remoteCmd = append(remoteCmd, "mkimg")
-	remoteCmd = append(remoteCmd, os.Args[1:]...)
+	vmCmd = append(vmCmd, "mkimg")
+	vmCmd = append(vmCmd, os.Args[1:]...)
 
-	// Construct the SSH call. We pass the remoteCmd as a single joined string
-	// so runctl executes it seamlessly over SSH.
-	args := []string{runctlPath, "ssh", vmName, strings.Join(remoteCmd, " ")}
+	hostCmd := exec.Command(hostRunctlPath, "ssh", vmBuildHost, strings.Join(vmCmd, " "))
+	hostCmd.Stdin, hostCmd.Stdout, hostCmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 
-	// CHANGED: Use cmd.Run() instead of syscall.Exec so the Mac process stays alive
-	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
+	if err := hostCmd.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "delegation failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	// --- NEW: Process the purification queue natively on the Mac ---
-	runtimeDir := os.Getenv("SST_RUNTIMEDIR")
-	for i, arg := range os.Args {
-		if (arg == "-d" || arg == "--dir") && i+1 < len(os.Args) {
-			runtimeDir = os.Args[i+1]
-		} else if strings.HasPrefix(arg, "--dir=") {
-			runtimeDir = strings.SplitN(arg, "=", 2)[1]
+	// 4. Host Post-Processing (Purification, Native CIDATA, & Catalog Symlink)
+	if os.Args[1] == "build" || os.Args[1] == "instance" {
+		if err := ProcessPurificationQueue(hostContextDir); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: host purification failed: %v\n", err)
 		}
 	}
-	if runtimeDir == "" {
-		runtimeDir = rtsst.RuntimeDir()
+
+	if instanceName != "" {
+		hostAbsContext, _ := filepath.Abs(hostContextDir)
+		targetDir := filepath.Join(hostAbsContext, "instances", instanceName)
+
+		// Natively generate CIDATA on the Mac using the host's actual username
+		inst := &runctlpb.Instance{}
+		yo := &sst.YamlObject{
+			Path:   filepath.Join(targetDir, "instance.yaml"),
+			Schema: "sst.yaml.runctl.v1.Instance",
+			Kind:   "Instance",
+			Msg:    inst,
+		}
+		if diags := yo.Load(context.Background(), sst.LogxRoot()); diags == nil || !diags.HasAny() {
+			u, _ := user.Current()
+			if err := rtsst.WriteCIData(context.Background(), sst.LogxRoot(), targetDir, inst, u.Username); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to generate cidata natively: %v\n", err)
+			}
+			_ = rtsst.EnsureCIDataISO(context.Background(), sst.LogxRoot(), targetDir)
+		}
+
+		symlinkDir := filepath.Join(rtsst.Home(), ".runtimes", "instances")
+		os.MkdirAll(symlinkDir, 0755)
+		symlinkPath := filepath.Join(symlinkDir, instanceName)
+		
+		os.Remove(symlinkPath)
+		os.Symlink(targetDir, symlinkPath)
 	}
 
-	if err := ProcessPurificationQueue(runtimeDir); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: host artifact purification failed: %v\n", err)
-	}
 	os.Exit(0)
 }
 
 func main() {
-	// Intercept execution on macOS
 	if runtime.GOOS == "darwin" {
 		delegateToLinuxVM()
 	}
-
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "mkimage error: %v\n", err)
 		os.Exit(1)
@@ -113,15 +178,16 @@ func main() {
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVarP(&flagRoot, "dir", "d", "", "Runtime root directory (default: $SST_RUNTIMEDIR or ~/.runtimes)")
+	rootCmd.PersistentFlags().StringVarP(&flagRoot, "dir", "d", "", "Runtime root directory (workspace output)")
 	rootCmd.PersistentFlags().BoolVarP(&flagVerbose, "verbose", "v", false, "Verbose logging")
-	rootCmd.PersistentFlags().BoolVarP(&flagForce, "force", "f", false, "Overwrite existing image directory")
+	rootCmd.PersistentFlags().BoolVar(&flagForce, "force", false, "Overwrite existing image directory")
 
 	rootCmd.AddCommand(pullvmCmd())
+	rootCmd.AddCommand(clearCacheCmd)
 
 	instCmd := instanceCmd()
-	instCmd.Flags().StringVarP(&flagSize, "size", "s", "20G", "Target size for the root disk (e.g. 20G, 100GiB)")
-	instCmd.Flags().BoolVar(&flagEfi, "efi", false, "Use EFI bootloader instead of direct Linux kernel boot")
+	instCmd.Flags().StringVarP(&flagSize, "size", "s", "20G", "Target size for the root disk")
+	instCmd.Flags().BoolVar(&flagEfi, "efi", false, "Use EFI bootloader")
 	rootCmd.AddCommand(instCmd)
 
 	rootCmd.AddCommand(extractKernelCmd)
@@ -129,7 +195,7 @@ func init() {
 
 var extractKernelCmd = &cobra.Command{
 	Use:   "extract_kernel <in> <out>",
-	Short: "Extracts an uncompressed raw kernel (vmlinux) from a compressed kernel image",
+	Short: "Extracts an uncompressed raw kernel (vmlinux)",
 	Args:  cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		fmt.Printf("--> Extracting raw kernel from %s to %s\n", args[0], args[1])
@@ -139,8 +205,8 @@ var extractKernelCmd = &cobra.Command{
 
 func pullvmCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "pullvm <upstream-url>",
-		Short: "Pull an upstream VM image and create an SST image directory",
+		Use:   "pullvm <upstream-url-or-local-path>",
+		Short: "Pull an upstream VM image or local archive and create an SST image directory",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			runtimeDir := flagRoot
@@ -148,20 +214,79 @@ func pullvmCmd() *cobra.Command {
 				runtimeDir = rtsst.RuntimeDir()
 			}
 
-			base := filepath.Base(args[0])
+			source := args[0]
+			if !strings.HasPrefix(source, "http://") && !strings.HasPrefix(source, "https://") {
+				if absSource, err := filepath.Abs(source); err == nil {
+					source = absSource
+				}
+			}
+
+			base := filepath.Base(source)
 			name := strings.TrimSuffix(base, filepath.Ext(base))
+			if strings.HasSuffix(base, ".tar.gz") {
+				name = strings.TrimSuffix(name, ".tar")
+			}
 
 			bArgs := map[string]string{
-				"URL":       args[0],
+				"URL":       source,
 				"PULL_NAME": name,
 			}
-			return RunBuildEngine(cmd.Context(), "pullvm.dockerfile", runtimeDir, flagForce, bArgs)
+			return RunBuildEngine(cmd.Context(), "pullpullvm.dockerfile", ".", flagBuildDir, runtimeDir, flagForce, bArgs)
 		},
 	}
 }
 
+var clearCacheCmd = &cobra.Command{
+	Use:   "clear-cache [image-name]",
+	Short: "Clear persistent caches",
+	Args:  cobra.MaximumNArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if runtime.GOOS == "darwin" {
+			fmt.Println("--> macOS detected. Transparently delegating clear-cache to Linux VM...")
+			delegateToLinuxVM()
+			return nil
+		}
+
+		runtimeDir := flagRoot
+		if runtimeDir == "" {
+			runtimeDir = "/runtimes"
+		}
+
+		var buildIDs []string
+		if len(args) == 1 {
+			buildIDs = append(buildIDs, args[0])
+		} else {
+			buildsDir := filepath.Join(runtimeDir, "builds")
+			entries, err := os.ReadDir(buildsDir)
+			if err == nil {
+				for _, e := range entries {
+					if e.IsDir() && strings.HasPrefix(e.Name(), "build-") {
+						buildIDs = append(buildIDs, strings.TrimPrefix(e.Name(), "build-"))
+					}
+				}
+			}
+		}
+
+		if len(buildIDs) == 0 {
+			fmt.Println("--> No caches found to clear.")
+			return nil
+		}
+
+		for _, id := range buildIDs {
+			fmt.Printf("--> Clearing caches for build: %s\n", id)
+			mgr := rtsst.NewDatasetManager(runtimeDir, id, "cache-clear")
+			if err := mgr.ClearCache(); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to clear cache for %s: %v\n", id, err)
+			}
+		}
+
+		fmt.Println("--> Caches cleared successfully.")
+		return nil
+	},
+}
+
 func instanceCmd() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "instance <image> <name>",
 		Short: "Create an instance directory from an image",
 		Args:  cobra.ExactArgs(2),
@@ -175,7 +300,9 @@ func instanceCmd() *cobra.Command {
 				"BASE_IMAGE": args[0],
 				"INST_NAME":  args[1],
 			}
-			return RunBuildEngine(cmd.Context(), "instance.dockerfile", runtimeDir, flagForce, bArgs)
+			return RunBuildEngine(cmd.Context(), "instance.dockerfile", ".", flagBuildDir, runtimeDir, flagForce, bArgs)
 		},
 	}
+	cmd.Flags().StringVarP(&flagBuildDir, "builddir", "b", "/runtimes", "Base directory for ZFS extraction")
+	return cmd
 }

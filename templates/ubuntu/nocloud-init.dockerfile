@@ -1,8 +1,15 @@
+
 RUN: |
   set -e
   export DEBIAN_FRONTEND=noninteractive
   
   echo "--> Hydrating Ubuntu Base with VM kernel and cloud-init..."
+
+  # --- ENABLE APT CACHING ---
+  # Canonical's base tarballs contain anti-caching configurations designed for Docker.
+  # We must obliterate them so our ZFS mount (/var/cache/apt/archives) actually retains the .deb files!
+  rm -f /etc/apt/apt.conf.d/docker-clean
+  echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/01keep-cache
   
   # 1. Update and install core VM components
   apt-get update
@@ -18,6 +25,7 @@ RUN: |
       sudo \
       openssh-server \
       iproute2 \
+      iputils-ping \
       netplan.io
       
   # Install the correct GRUB binaries so boot-efi.dockerfile doesn't fail
@@ -50,13 +58,7 @@ RUN: |
   echo 'GRUB_TERMINAL="console"' >> /etc/default/grub
 
   # 6. Setup netplan to use DHCP on eth0 (crosvm default network)
-  cat << 'EOF' > /etc/netplan/01-netcfg.yaml
-network:
-  version: 2
-  ethernets:
-    eth0:
-      dhcp4: true
-EOF
+  printf "network:\n  version: 2\n  ethernets:\n    eth0:\n      dhcp4: true\n" > /etc/netplan/01-netcfg.yaml
 
   # 7. Grant passwordless sudo to all users (since this is a local dev VM)
   echo "ALL ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/99-nopasswd

@@ -2,6 +2,11 @@
 # 1. The Kernel Forge (The Getaway Engine + ZFS)
 # ==========================================
 FROM ubuntu:24.04 AS kernel-builder
+
+# Cache these massive static tarballs permanently!
+GET https://cdn.kernel.org/pub/linux/kernel/v6.8/linux-6.8.tar.xz /tmp/linux.tar.xz
+GET https://github.com/openzfs/zfs/releases/download/zfs-2.2.3/zfs-2.2.3.tar.gz /tmp/zfs.tar.gz
+
 RUN: |
   # Install kernel AND OpenZFS build dependencies
   apt-get update && apt-get install -y build-essential bc flex bison libelf-dev \
@@ -9,7 +14,7 @@ RUN: |
     libblkid-dev uuid-dev libudev-dev libattr1-dev zlib1g-dev libselinux-dev
 
   # A. Build the Micro-Kernel
-  wget -qO /tmp/linux.tar.xz https://cdn.kernel.org/pub/linux/kernel/v6.8/linux-6.8.tar.xz
+  # The source files were injected into /tmp by the GET instructions
   tar -xf /tmp/linux.tar.xz -C /usr/src/
   cd /usr/src/linux-6.8
 
@@ -38,7 +43,6 @@ RUN: |
 
   # B. Build the out-of-tree ZFS Kernel Modules against our Micro-Kernel
   cd /usr/src
-  wget -qO /tmp/zfs.tar.gz https://github.com/openzfs/zfs/releases/download/zfs-2.2.3/zfs-2.2.3.tar.gz
   tar -xf /tmp/zfs.tar.gz
   cd zfs-2.2.3
 
