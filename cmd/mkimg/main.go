@@ -25,7 +25,7 @@ var (
 )
 
 var rootCmd = &cobra.Command{
-	Use:           "mkimage",
+	Use:           "mkimg",
 	Short:         "Create SST VM image directories from upstream sources",
 	SilenceUsage:  true,
 	SilenceErrors: true,
@@ -36,8 +36,9 @@ func delegateToLinuxVM() {
 
 	if len(os.Args) > 1 {
 		arg := os.Args[1]
-		// NEW: Catch all Cobra completion commands (__complete, __completeNoDesc)
-		if arg == "help" || arg == "--help" || arg == "completion" || strings.HasPrefix(arg, "__complete") {
+		// NEW: Catch completion AND host-native management commands!
+		if arg == "help" || arg == "--help" || arg == "completion" || strings.HasPrefix(arg, "__complete") ||
+			arg == "mv-image" || arg == "mv-instance" || arg == "rm-image" || arg == "rm-instance" || arg == "catalog" {
 			return
 		}
 	}
@@ -113,11 +114,15 @@ func delegateToLinuxVM() {
 	if hostCwd, err := os.Getwd(); err == nil {
 		vmCmd = append(vmCmd, "cd", fmt.Sprintf("'%s'", hostCwd), "&&")
 	}
+	
 	vmCmd = append(vmCmd, "sudo")
 	// Force pretty-printing over the non-TTY SSH connection
-	if logFmt := os.Getenv("SST_LOG_FORMAT"); logFmt != "" {
-		vmCmd = append(vmCmd, fmt.Sprintf("SST_LOG_FORMAT='%s'", logFmt))
+	logFmt := os.Getenv("SST_LOG_FORMAT")
+	if logFmt == "" {
+		logFmt = "text"
 	}
+	vmCmd = append(vmCmd, fmt.Sprintf("SST_LOG_FORMAT='%s'", logFmt))
+	
 	if pubKey, err := rtsst.GetLocalPublicKey(); err == nil && pubKey != "" {
 		vmCmd = append(vmCmd, fmt.Sprintf("SST_HOST_PUBKEY='%s'", strings.TrimSpace(pubKey)))
 	}

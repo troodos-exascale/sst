@@ -464,8 +464,14 @@ func (r *Runctl) sshCmd() *cobra.Command {
 				"-o", "StrictHostKeyChecking=no",
 				"-o", "UserKnownHostsFile=/dev/null",
 				"-o", "LogLevel=ERROR",
-				fmt.Sprintf("%s@%s", u.Username, ip),
 			}
+
+			// NEW: Force PTY allocation so interactive programs (nspawn, bash, vim) don't deadlock over delegation
+			if term.IsTerminal(int(os.Stdin.Fd())) {
+				sshArgs = append(sshArgs, "-t")
+			}
+
+			sshArgs = append(sshArgs, fmt.Sprintf("%s@%s", u.Username, ip))
 
 			if len(args) > 1 {
 				sshArgs = append(sshArgs, args[1:]...)
@@ -475,6 +481,7 @@ func (r *Runctl) sshCmd() *cobra.Command {
 		},
 	}
 }
+
 
 func (r *Runctl) resolveIP(mac string) (string, error) {
 	mac = strings.ToLower(mac)

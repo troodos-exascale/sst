@@ -420,13 +420,21 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		SstRuntimeDir: b.RuntimeDir,
 	}
 
-	// Log if AnalyseImg fails, rather than silently swallowing
-	if err := AnalyseImg(sb); err != nil {
-		b.Log.Warn(ctx, "AnalyseImg failed", "error", err)
-	}
+	// NEW: Check if a raw disk was actually generated before trying to analyze it
+	rawDiskPath := filepath.Join(b.ImageOutput, b.Name+".raw")
+	if _, err := os.Stat(rawDiskPath); err == nil {
+		if err := AnalyseImg(sb); err != nil {
+			b.Log.Warn(ctx, "AnalyseImg failed", "error", err)
+		}
 
-	if sb.YamlObject.Boot != nil && sb.YamlObject.Boot.BootfsDevice != "" {
-		_ = ExtractArtifacts(sb)
+		if sb.YamlObject.Boot != nil && sb.YamlObject.Boot.BootfsDevice != "" {
+			_ = ExtractArtifacts(sb)
+		}
+
+		QueuePurification(b.RuntimeDir, []string{rawDiskPath})
+	} else {
+		b.Log.Info(ctx, "skipping disk analysis (no raw image generated)")
+		sb.YamlObject.Storage.RawImage = "" // Clean up the manifest so it doesn't point to a ghost file
 	}
 
 	yo := &sst.YamlObject{
@@ -439,10 +447,6 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 	if diags := yo.Save(ctx, b.Log); diags != nil && diags.HasAny() {
 		return diags
 	}
-
-	QueuePurification(b.RuntimeDir, []string{
-		filepath.Join(b.ImageOutput, b.Name+".raw"),
-	})
 
 	// NEW: Stamp the Dockerfile with authoritative provenance
 	if b.Dockerfile != "" {
@@ -473,6 +477,7 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 
 	return nil
 }
+
 
 func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
 	instName := b.BuildArgs["INST_NAME"]
