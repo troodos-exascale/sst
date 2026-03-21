@@ -239,13 +239,13 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 		if len(parts) == 0 || parts[0] == "" {
 			continue
 		}
-		
+
 		hostDir := parts[0]
-		tag := hostDir 
+		tag := hostDir
 		if len(parts) > 1 && parts[1] != "" {
-			tag = parts[1] 
+			tag = parts[1]
 		}
-		
+
 		guestPath := tag
 		opts := "rw"
 		if len(parts) > 2 && parts[2] == "ro" {
@@ -269,7 +269,7 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 	sb.WriteString("  - default\n")
 	fmt.Fprintf(&sb, "  - name: %s\n", username)
 	sb.WriteString("    shell: /bin/bash\n")
-	sb.WriteString("    sudo: ALL=(ALL) NOPASSWD:ALL\n") 
+	sb.WriteString("    sudo: ALL=(ALL) NOPASSWD:ALL\n")
 	if pubKey != "" {
 		sb.WriteString("    ssh_authorized_keys:\n")
 		sb.WriteString("      - " + pubKey + "\n")

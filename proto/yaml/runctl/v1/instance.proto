@@ -26,4 +26,5 @@ message Instance {
   repeated string params = 20;
   string escape_sequence = 21;
   string shutdown_timeout = 22;
+  string base_image = 23;
 }

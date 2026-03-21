@@ -27,17 +27,18 @@ var (
 	force bool
 )
 
+// rootCmd is defined here so completion.go can bind to it via init()
+var rootCmd = &cobra.Command{
+	Use:           "runctl",
+	Short:         "Runtime VM controller",
+	SilenceUsage:  true,
+	SilenceErrors: true,
+}
+
 func main() {
 	runtime.GOMAXPROCS(runtime.NumCPU())
 
 	rc := NewRunctl()
-
-	rootCmd := &cobra.Command{
-		Use:           "runctl",
-		Short:         "Runtime VM controller",
-		SilenceUsage:  true,
-		SilenceErrors: true,
-	}
 
 	rootCmd.PersistentFlags().BoolVar(&debug, "debug", false, "enable debug output")
 	rootCmd.PersistentFlags().BoolVar(&force, "force", false, "force operation")
@@ -49,7 +50,7 @@ func main() {
 		rc.resumeCmd(),
 		rc.listCmd(),
 		rc.sshCmd(),
-		rc.setupHostCmd(), // Added host network setup command
+		rc.setupHostCmd(),
 	)
 
 	if err := rootCmd.Execute(); err != nil {
@@ -69,12 +70,38 @@ func NewRunctl() *Runctl {
 	return &Runctl{Ctx: ctx, Log: log}
 }
 
+func (r *Runctl) syncWorkspace() {
+	if cwd, err := os.Getwd(); err == nil {
+		rtsst.SyncCatalog(r.Ctx, r.Log, cwd)
+	}
+}
+
+// instanceCompletion feeds the terminal a list of registered instances for tab-completion
+func (r *Runctl) instanceCompletion(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	if len(args) != 0 {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	names, err := rtsst.ListCatalogNames("instances")
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveError
+	}
+	var matches []string
+	for _, name := range names {
+		if strings.HasPrefix(name, toComplete) {
+			matches = append(matches, name)
+		}
+	}
+	return matches, cobra.ShellCompDirectiveNoFileComp
+}
+
 func (r *Runctl) startCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "start <name>",
-		Short: "Start an instance",
-		Args:  cobra.ExactArgs(1),
+		Use:               "start <name>",
+		Short:             "Start an instance",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: r.instanceCompletion,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			r.syncWorkspace()
 			return r.Start(args[0])
 		},
 	}
@@ -95,7 +122,6 @@ func (r *Runctl) Start(name string) error {
 
 	memMiB, _ := rtsst.ParseMemorySizeMiB(inst.MemorySize, inst.MemorySizeSuffix)
 
-	// --- CROSVM ALIGNED ARGUMENTS ---
 	args := []string{
 		"run",
 		"--cpus", inst.CpuCount,
@@ -129,17 +155,13 @@ func (r *Runctl) Start(name string) error {
 		if len(inst.Params) > 0 {
 			args = append(args, "--params", strings.Join(inst.Params, " "))
 		}
-		// Positional kernel argument at the very end
 		args = append(args, inst.Kernel)
 	} else if inst.Bootloader == "efi" {
-		// FIX: Use upstream crosvm's --pflash argument to pass the UEFI variable store.
-		// The macOS wrapper now natively intercepts this.
 		if inst.EfiVars != "" {
 			args = append(args, "--pflash", inst.EfiVars)
 		}
 	}
 
-	// --- SHIM FOR PROCESS VISIBILITY ---
 	exePath := filepath.Join(instDir, inst.Name)
 	_ = os.Remove(exePath)
 
@@ -184,7 +206,6 @@ func (r *Runctl) Start(name string) error {
 
 	go func() {
 		for sig := range sigCh {
-			// Simply forward the signal to the supervisor (crosvm wrapper)
 			_ = cmd.Process.Signal(sig)
 		}
 	}()
@@ -213,7 +234,6 @@ func (r *Runctl) SetupLinuxNetwork() error {
 
 	script := `
 	set -eu
-	# Grab the real user who invoked sudo, default to current user
 	TARGET_USER=${SUDO_USER:-$(whoami)}
 	
 	echo "Configuring TAP device for user: $TARGET_USER"
@@ -223,11 +243,9 @@ func (r *Runctl) SetupLinuxNetwork() error {
 	ip link set sst_tap up
 	sysctl -w net.ipv4.ip_forward=1 > /dev/null
 
-	# 1. ALLOW DHCP/DNS INPUT FROM VM TO HOST
 	iptables -C INPUT -i sst_tap -j ACCEPT 2>/dev/null || \
 	iptables -I INPUT -i sst_tap -j ACCEPT
 
-	# 2. SETUP NAT FORWARDING
 	HOST_DEV=$(ip route get 8.8.8.8 | awk '{print $5}' | head -n 1)
 	if [ -n "$HOST_DEV" ]; then
 		iptables -t nat -C POSTROUTING -o "$HOST_DEV" -j MASQUERADE 2>/dev/null || \
@@ -240,7 +258,6 @@ func (r *Runctl) SetupLinuxNetwork() error {
 		iptables -A FORWARD -i sst_tap -o "$HOST_DEV" -j ACCEPT
 	fi
 
-# 3. EXPLICIT DNSMASQ CONFIG (Using PID file instead of pgrep)
 	if command -v dnsmasq &>/dev/null; then
 		PIDFILE=/var/run/sst_tap_dnsmasq.pid
 		if [ ! -f "$PIDFILE" ] || ! kill -0 $(cat "$PIDFILE") 2>/dev/null; then
@@ -265,9 +282,13 @@ func (r *Runctl) SetupLinuxNetwork() error {
 
 func (r *Runctl) stopCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:  "stop <name>",
-		Args: cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error { return r.Stop(args[0]) },
+		Use:               "stop <name>",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: r.instanceCompletion,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			r.syncWorkspace()
+			return r.Stop(args[0])
+		},
 	}
 }
 
@@ -282,17 +303,16 @@ func (r *Runctl) Stop(name string) error {
 	}
 
 	r.Log.Info(r.Ctx, "stopping instance", "instance", name, "pid", info.Pid)
-
-	// Always send SIGTERM to the supervisor.
-	// The supervisor will translate this to SIGKILL for the child VM if necessary.
 	return syscall.Kill(info.Pid, syscall.SIGTERM)
 }
 
 func (r *Runctl) pauseCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:  "pause <name>",
-		Args: cobra.ExactArgs(1),
+		Use:               "pause <name>",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: r.instanceCompletion,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			r.syncWorkspace()
 			lp := rtsst.LockFilePath(args[0])
 			info, _ := rtsst.ReadLock(lp)
 			if rtsst.IsPidAlive(info.Pid) {
@@ -305,9 +325,11 @@ func (r *Runctl) pauseCmd() *cobra.Command {
 
 func (r *Runctl) resumeCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:  "resume <name>",
-		Args: cobra.ExactArgs(1),
+		Use:               "resume <name>",
+		Args:              cobra.ExactArgs(1),
+		ValidArgsFunction: r.instanceCompletion,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			r.syncWorkspace()
 			lp := rtsst.LockFilePath(args[0])
 			info, _ := rtsst.ReadLock(lp)
 			if rtsst.IsPidAlive(info.Pid) {
@@ -320,61 +342,79 @@ func (r *Runctl) resumeCmd() *cobra.Command {
 
 func (r *Runctl) listCmd() *cobra.Command {
 	return &cobra.Command{
-		Use: "list",
+		Use:     "list",
+		Aliases: []string{"ls"},
+		Short:   "List all registered instances",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			seen := make(map[string]bool)
+			r.syncWorkspace()
 
-			// Initialize tabwriter for perfectly aligned columns
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-			fmt.Fprintln(w, "NAME\tSTATE\tIP\tLOCATION")
+			fmt.Fprintln(w, "NAME\tSTATE\tIP\tIMAGE\tLOCATION")
 
-			printInstances := func(baseDir, tag string) {
-				ents, _ := os.ReadDir(baseDir)
-				for _, e := range ents {
-					// Skip non-directories and hidden folders
-					if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
-						continue
-					}
-
-					instPath := filepath.Join(baseDir, e.Name())
-					if _, err := os.Stat(filepath.Join(instPath, "instance.yaml")); os.IsNotExist(err) {
-						continue
-					}
-
-					// Prefer local over global if names collide
-					if seen[e.Name()] {
-						continue
-					}
-					seen[e.Name()] = true
-
-					lp := filepath.Join(instPath, "lockfile")
-					state := "stopped"
-					ip := "-"
-
-					if info, err := rtsst.ReadLock(lp); err == nil && rtsst.IsPidAlive(info.Pid) {
-						state = "running"
-						// Only attempt to resolve IP if it is actively running
-						if inst, err := r.loadInstance(e.Name()); err == nil && len(inst.Network) > 0 {
-							mac := strings.Split(inst.Network[0], "@")[0]
-							if resolvedIP, err := r.resolveIP(mac); err == nil {
-								ip = resolvedIP
-							}
-						}
-					}
-
-					// Write to tabwriter
-					fmt.Fprintf(w, "%s\t%s\t%s\t[%s]\n", e.Name(), state, ip, tag)
-				}
+			baseDir := rtsst.InstanceRoot()
+			ents, err := os.ReadDir(baseDir)
+			if err != nil {
+				return nil
 			}
 
-			// 1. Scan Local Directory
-			cwd, _ := os.Getwd()
-			printInstances(cwd, "local")
+			homeDir := rtsst.Home()
 
-			// 2. Scan Global Directory
-			printInstances(rtsst.InstanceRoot(), "global")
+			for _, e := range ents {
+				if strings.HasPrefix(e.Name(), ".") {
+					continue
+				}
 
-			// Flush outputs the formatted table to stdout
+				linkPath := filepath.Join(baseDir, e.Name())
+				realPath := linkPath
+
+				info, err := os.Lstat(linkPath)
+				if err != nil {
+					continue
+				}
+
+				if info.Mode()&os.ModeSymlink != 0 {
+					resolved, err := filepath.EvalSymlinks(linkPath)
+					if err != nil {
+						fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", e.Name(), "dangling", "-", "-", linkPath)
+						continue
+					}
+					realPath = resolved
+				} else if !info.IsDir() {
+					continue
+				}
+
+				if _, err := os.Stat(filepath.Join(realPath, "instance.yaml")); os.IsNotExist(err) {
+					continue
+				}
+
+				lp := filepath.Join(realPath, "lockfile")
+				state := "stopped"
+				ip := "-"
+				imageName := "-"
+
+				inst, loadErr := r.loadInstanceFromDir(realPath)
+				if loadErr == nil && inst.BaseImage != "" {
+					imageName = inst.BaseImage
+				}
+
+				if linfo, err := rtsst.ReadLock(lp); err == nil && rtsst.IsPidAlive(linfo.Pid) {
+					state = "running"
+					if loadErr == nil && len(inst.Network) > 0 {
+						mac := strings.Split(inst.Network[0], "@")[0]
+						if resolvedIP, err := r.resolveIP(mac); err == nil {
+							ip = resolvedIP
+						}
+					}
+				}
+
+				displayLoc := realPath
+				if strings.HasPrefix(realPath, homeDir) {
+					displayLoc = "~" + strings.TrimPrefix(realPath, homeDir)
+				}
+
+				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", e.Name(), state, ip, imageName, displayLoc)
+			}
+
 			w.Flush()
 			return nil
 		},
@@ -383,10 +423,13 @@ func (r *Runctl) listCmd() *cobra.Command {
 
 func (r *Runctl) sshCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "ssh <name>",
-		Short: "SSH into a running instance",
-		Args:  cobra.MinimumNArgs(1),
+		Use:               "ssh <name>",
+		Short:             "SSH into a running instance",
+		Args:              cobra.MinimumNArgs(1),
+		ValidArgsFunction: r.instanceCompletion,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			r.syncWorkspace()
+
 			instName := args[0]
 			inst, err := r.loadInstance(instName)
 			if err != nil {
@@ -396,16 +439,13 @@ func (r *Runctl) sshCmd() *cobra.Command {
 				return fmt.Errorf("instance has no network configured")
 			}
 
-			// Extract the MAC address from the YAML (format: "mac@nat" or just "mac")
 			mac := strings.Split(inst.Network[0], "@")[0]
 
-			// Resolve the IP from the MAC address
 			ip, err := r.resolveIP(mac)
 			if err != nil {
 				return fmt.Errorf("could not resolve IP for instance %s (MAC: %s): %w\nWait a few seconds after boot or ensure it acquired a DHCP lease", instName, mac, err)
 			}
 
-			// Get the current user to use as the default SSH login
 			u, err := user.Current()
 			if err != nil {
 				return err
@@ -427,22 +467,18 @@ func (r *Runctl) sshCmd() *cobra.Command {
 				fmt.Sprintf("%s@%s", u.Username, ip),
 			}
 
-			// <-- NEW: Append any trailing commands provided by the user
 			if len(args) > 1 {
 				sshArgs = append(sshArgs, args[1:]...)
 			}
 
 			return syscall.Exec(sshBin, sshArgs, os.Environ())
-
 		},
 	}
 }
 
-// resolveIP scans DHCP leases and ARP caches to find the IP associated with a MAC address.
 func (r *Runctl) resolveIP(mac string) (string, error) {
 	mac = strings.ToLower(mac)
 
-	// macOS 'arp' and 'bootpd' drop leading zeros (e.g., "09" becomes "9")
 	var macOSMacParts []string
 	for _, p := range strings.Split(mac, ":") {
 		trimmed := strings.TrimLeft(p, "0")
@@ -453,18 +489,15 @@ func (r *Runctl) resolveIP(mac string) (string, error) {
 	}
 	macOSMac := strings.Join(macOSMacParts, ":")
 
-	// 1. Linux: Check our explicit dnsmasq lease file
 	if data, err := os.ReadFile("/var/run/sst_tap_dnsmasq.leases"); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
 			parts := strings.Fields(line)
-			// dnsmasq format: <expiry> <mac> <ip> <hostname> <client_id>
 			if len(parts) >= 3 && strings.ToLower(parts[1]) == mac {
 				return parts[2], nil
 			}
 		}
 	}
 
-	// 2. macOS: Check native bootpd DHCP leases
 	if data, err := os.ReadFile("/var/db/dhcpd_leases"); err == nil {
 		var lastIP string
 		for _, line := range strings.Split(string(data), "\n") {
@@ -480,12 +513,10 @@ func (r *Runctl) resolveIP(mac string) (string, error) {
 		}
 	}
 
-	// 3. Linux: Fallback to modern 'ip neigh'
 	if out, err := exec.Command("ip", "neigh").Output(); err == nil {
 		for _, line := range strings.Split(string(out), "\n") {
 			if strings.Contains(strings.ToLower(line), mac) {
 				parts := strings.Fields(line)
-				// ip neigh format: 192.168.10.85 dev sst_tap lladdr 52:54:... REACHABLE
 				if len(parts) >= 1 {
 					return parts[0], nil
 				}
@@ -493,12 +524,10 @@ func (r *Runctl) resolveIP(mac string) (string, error) {
 		}
 	}
 
-	// 4. macOS / Legacy Linux: Fallback to 'arp -a'
 	if out, err := exec.Command("arp", "-a").Output(); err == nil {
 		for _, line := range strings.Split(string(out), "\n") {
 			lowerLine := strings.ToLower(line)
 			if strings.Contains(lowerLine, mac) || strings.Contains(lowerLine, macOSMac) {
-				// arp -a format: ? (192.168.64.2) at 52:54:b2:b3:b9:9 on bridge100 ifscope [bridge]
 				start := strings.Index(line, "(")
 				end := strings.Index(line, ")")
 				if start != -1 && end != -1 && end > start {
@@ -513,10 +542,10 @@ func (r *Runctl) resolveIP(mac string) (string, error) {
 
 func (r *Runctl) instanceDir(name string) string { return rtsst.InstanceDir(name) }
 
-func (r *Runctl) loadInstance(name string) (*runctlpb.Instance, error) {
+func (r *Runctl) loadInstanceFromDir(dir string) (*runctlpb.Instance, error) {
 	inst := &runctlpb.Instance{}
 	yo := &sst.YamlObject{
-		Path:   filepath.Join(r.instanceDir(name), "instance.yaml"),
+		Path:   filepath.Join(dir, "instance.yaml"),
 		Schema: "sst.yaml.runctl.v1.Instance",
 		Kind:   "Instance",
 		Msg:    inst,
@@ -525,4 +554,8 @@ func (r *Runctl) loadInstance(name string) (*runctlpb.Instance, error) {
 		return nil, diags
 	}
 	return inst, nil
+}
+
+func (r *Runctl) loadInstance(name string) (*runctlpb.Instance, error) {
+	return r.loadInstanceFromDir(r.instanceDir(name))
 }

@@ -362,11 +362,7 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 }
 
 func (b *BuildApp) FinalizeVM(ctx context.Context) error {
-	// EMITS TO RUNTIME DIR (Mapped to macOS workspace)
-	b.ImageOutput = filepath.Join(b.RuntimeDir, "images", b.Name)
-	if err := os.MkdirAll(b.ImageOutput, 0755); err != nil {
-		return err
-	}
+	currentOutput := filepath.Join(b.RuntimeDir, "images", b.Name)
 
 	semanticName := ""
 	upstreamBuildID := ""
@@ -374,7 +370,32 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 	if err == nil {
 		semanticName = GenerateSemanticName(osInfo)
 		upstreamBuildID = osInfo["BUILD_ID"]
-		b.Log.Info(ctx, "parsed os-release from imported image", "semantic_name", semanticName, "upstream_build_id", upstreamBuildID)
+		b.Log.Info(ctx, "parsed os-release from rootfs", "semantic_name", semanticName, "upstream_build_id", upstreamBuildID)
+
+		// Construct the full canonical name: <ID>-<VERSION_ID>[-<VARIANT_ID>]-<NAME>
+		longName := fmt.Sprintf("%s-%s", semanticName, b.Name)
+		newOutput := filepath.Join(b.RuntimeDir, "images", longName)
+
+		// Rename cleanly without leaving symlinks
+		if currentOutput != newOutput {
+			if err := os.Rename(currentOutput, newOutput); err == nil {
+				_ = os.Rename(filepath.Join(newOutput, b.Name+".raw"), filepath.Join(newOutput, longName+".raw"))
+				_ = os.Rename(filepath.Join(newOutput, b.Name+".qcow2"), filepath.Join(newOutput, longName+".qcow2"))
+				_ = os.Rename(filepath.Join(newOutput, b.Name+".tar"), filepath.Join(newOutput, longName+".tar"))
+
+				b.Name = longName
+				currentOutput = newOutput
+			} else if !os.IsNotExist(err) {
+				b.Log.Warn(ctx, "failed to rename output directory to canonical name", "error", err)
+			}
+		}
+	} else {
+		b.Log.Warn(ctx, "could not parse os-release from rootfs; falling back to short name", "error", err)
+	}
+
+	b.ImageOutput = currentOutput
+	if err := os.MkdirAll(b.ImageOutput, 0755); err != nil {
+		return err
 	}
 
 	buildID := time.Now().UTC().Format("20060102-150405")
@@ -399,14 +420,14 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		SstRuntimeDir: b.RuntimeDir,
 	}
 
-	_ = AnalyseImg(sb)
+	// Log if AnalyseImg fails, rather than silently swallowing
+	if err := AnalyseImg(sb); err != nil {
+		b.Log.Warn(ctx, "AnalyseImg failed", "error", err)
+	}
+
 	if sb.YamlObject.Boot != nil && sb.YamlObject.Boot.BootfsDevice != "" {
 		_ = ExtractArtifacts(sb)
 	}
-
-	QueuePurification(b.RuntimeDir, []string{
-		filepath.Join(b.ImageOutput, b.Name+".raw"),
-	})
 
 	yo := &sst.YamlObject{
 		Path:   filepath.Join(b.ImageOutput, "image.yaml"),
@@ -422,6 +443,33 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 	QueuePurification(b.RuntimeDir, []string{
 		filepath.Join(b.ImageOutput, b.Name+".raw"),
 	})
+
+	// NEW: Stamp the Dockerfile with authoritative provenance
+	if b.Dockerfile != "" {
+		if data, err := os.ReadFile(b.Dockerfile); err == nil {
+			lines := strings.Split(string(data), "\n")
+			var newLines []string
+
+			// Inject at the very top
+			newLines = append(newLines, fmt.Sprintf("# CANONICAL_NAME: %s", b.Name))
+			newLines = append(newLines, fmt.Sprintf("# LAST_BUILD: %s", buildID))
+
+			for _, line := range lines {
+				// Strip out older stamps so they don't pile up
+				if strings.HasPrefix(line, "# CANONICAL_NAME:") || strings.HasPrefix(line, "# LAST_BUILD:") {
+					continue
+				}
+				newLines = append(newLines, line)
+			}
+
+			if err := os.WriteFile(b.Dockerfile, []byte(strings.Join(newLines, "\n")), 0644); err != nil {
+				b.Log.Warn(ctx, "failed to stamp dockerfile with provenance", "error", err)
+			} else {
+				b.Log.Info(ctx, "stamped dockerfile with provenance", "file", b.Dockerfile, "canonical_name", b.Name)
+			}
+		}
+		UpdateCatalog(ctx, b.Log, "images", b.Name, b.ImageOutput, buildID)
+	}
 
 	return nil
 }
@@ -477,6 +525,7 @@ func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
 		Kind:       "Instance",
 		Name:       instName,
 		Hostname:   instName,
+		BaseImage:  baseImage,
 		Bootloader: "linux",
 		Kernel:     "kernel",
 		Initrd:     "initrd",
@@ -520,6 +569,9 @@ func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
 	})
 
 	b.Log.Info(ctx, "finalized strict instance manifest", "path", yoInst.Path)
+	// We generate an 8-character hash of the absolute path just in case we need to break a tie.
+	disambiguator := fmt.Sprintf("%x", sha256.Sum256([]byte(instDir)))[:8]
+	UpdateCatalog(ctx, b.Log, "instances", instName, instDir, disambiguator)
 	return nil
 }
 

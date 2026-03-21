@@ -20,6 +20,11 @@ var (
 
 // RunBuildEngine is the universal entrypoint for parsing and executing VAXLang DAGs.
 func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runtimeDir string, flagForce bool, bArgs map[string]string) error {
+	// Gracefully enforce root privileges for native execution
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("mkimg requires root privileges to provision datasets and execute isolated environments. Please run with sudo")
+	}
+
 	log := sst.LogxRoot().Subsystem("mkimage.build")
 	builder := rtsst.NewBuilder(log, nil, dockerfile, contextDir, buildDir, runtimeDir)
 	builder.Force = flagForce

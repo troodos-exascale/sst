@@ -3,17 +3,17 @@ package main
 import (
 	"context"
 	"fmt"
-	"os/user"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
 
 	"github.com/spf13/cobra"
 	rtsst "github.com/swiss-software-tool/sst/internal/rtsst"
-	"github.com/swiss-software-tool/sst/proto/yaml/runctl/v1"
 	"github.com/swiss-software-tool/sst/internal/sst"
+	"github.com/swiss-software-tool/sst/proto/yaml/runctl/v1"
 )
 
 var (
@@ -34,8 +34,12 @@ var rootCmd = &cobra.Command{
 func delegateToLinuxVM() {
 	vmBuildHost := "ub"
 
-	if len(os.Args) > 1 && (os.Args[1] == "help" || os.Args[1] == "--help") {
-		return
+	if len(os.Args) > 1 {
+		arg := os.Args[1]
+		// NEW: Catch all Cobra completion commands (__complete, __completeNoDesc)
+		if arg == "help" || arg == "--help" || arg == "completion" || strings.HasPrefix(arg, "__complete") {
+			return
+		}
 	}
 
 	hostContextDir := "."
@@ -159,7 +163,7 @@ func delegateToLinuxVM() {
 		symlinkDir := filepath.Join(rtsst.Home(), ".runtimes", "instances")
 		os.MkdirAll(symlinkDir, 0755)
 		symlinkPath := filepath.Join(symlinkDir, instanceName)
-		
+
 		os.Remove(symlinkPath)
 		os.Symlink(targetDir, symlinkPath)
 	}
@@ -290,6 +294,23 @@ func instanceCmd() *cobra.Command {
 		Use:   "instance <image> <name>",
 		Short: "Create an instance directory from an image",
 		Args:  cobra.ExactArgs(2),
+		// NEW: Auto-complete the <image> argument using the global registry
+		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+			if len(args) != 0 {
+				return nil, cobra.ShellCompDirectiveNoFileComp
+			}
+			names, err := rtsst.ListCatalogNames("images")
+			if err != nil {
+				return nil, cobra.ShellCompDirectiveError
+			}
+			var matches []string
+			for _, name := range names {
+				if strings.HasPrefix(name, toComplete) {
+					matches = append(matches, name)
+				}
+			}
+			return matches, cobra.ShellCompDirectiveNoFileComp
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			runtimeDir := flagRoot
 			if runtimeDir == "" {

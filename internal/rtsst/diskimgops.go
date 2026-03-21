@@ -100,33 +100,53 @@ func AnalyseImg(sb *ImageSB) error {
 
 	findCandidates = func(devs []BlockDevice) {
 		for _, d := range devs {
-			if (d.Type == "part" || d.Type == "disk") && (d.FSType == "ext4" || d.FSType == "ext2" || d.FSType == "xfs") {
-				parts := strings.Split(d.MajorMinor, ":")
-				if len(parts) < 2 {
-					sb.Log.Warn(sb.Ctx, "Skipping partition with invalid maj:min", "name", d.Name)
-					continue
-				}
-				minor := parts[1]
+			if d.Type == "part" || d.Type == "disk" {
+				// NEW: Force blkid to read filesystem metadata directly, bypassing udev!
+				devPath := "/dev/" + d.Name
+				blkidRes, _ := sst.ExecShell(sb.Ctx, sb.Log, "blkid", "-o", "export", devPath)
 
-				pUuid := d.PartUUID
-				if pUuid == "" {
-					pUuid = d.UUID
+				var fstype, uuid, partuuid string
+				for _, line := range strings.Split(blkidRes.Stdout, "\n") {
+					parts := strings.SplitN(line, "=", 2)
+					if len(parts) == 2 {
+						switch parts[0] {
+						case "TYPE":
+							fstype = parts[1]
+						case "UUID":
+							uuid = parts[1]
+						case "PARTUUID":
+							partuuid = parts[1]
+						}
+					}
 				}
 
-				c := candidate{
-					Name:      d.Name,
-					Start:     d.Start,
-					Size:      d.Size,
-					PartUUID:  pUuid,
-					FsUUID:    d.UUID,
-					PartMinor: minor,
-					FSType:    d.FSType,
+				if fstype == "ext4" || fstype == "ext2" || fstype == "xfs" {
+					parts := strings.Split(d.MajorMinor, ":")
+					if len(parts) < 2 {
+						continue
+					}
+					minor := parts[1]
+
+					pUuid := partuuid
+					if pUuid == "" {
+						pUuid = uuid
+					}
+
+					c := candidate{
+						Name:      d.Name,
+						Start:     d.Start,
+						Size:      d.Size,
+						PartUUID:  pUuid,
+						FsUUID:    uuid,
+						PartMinor: minor,
+						FSType:    fstype,
+					}
+					if c.Start > maxStart {
+						maxStart = c.Start
+					}
+					candidates = append(candidates, c)
+					sb.Log.Info(sb.Ctx, "Found candidate partition", "name", c.Name, "fstype", c.FSType)
 				}
-				if c.Start > maxStart {
-					maxStart = c.Start
-				}
-				candidates = append(candidates, c)
-				sb.Log.Info(sb.Ctx, "Found candidate partition", "name", c.Name, "fstype", c.FSType)
 			}
 			if len(d.Children) > 0 {
 				findCandidates(d.Children)

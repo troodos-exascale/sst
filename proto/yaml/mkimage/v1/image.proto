@@ -15,7 +15,6 @@ message ImageYAML {
    Provenance provenance = 3;
    StoragePlan storage = 4;
    BootStructure boot = 5;
-   InstanceStructure instance = 6;
 }
 
 message Provenance {
@@ -51,18 +50,3 @@ message BootStructure {
    bool bootfs_is_last = 7;
 }
 
-// ============================================================================
-// Instance Definition
-// ============================================================================
-
-message InstanceStructure {
-   string name = 1;
-   string hostname = 2;
-   string cpu_count = 3;
-   string memory_size = 4;
-   string memory_size_suffix = 5;
-   repeated string network = 6;
-   repeated string disk = 7;
-   repeated string rwdisk = 8;
-   repeated string shared_dir = 9;
-}

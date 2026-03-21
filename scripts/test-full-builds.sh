@@ -63,7 +63,18 @@ step_ok
 # Phase 2: Instantiate
 # ---------------------------------------------------------
 step_enter "instantiate_vm"
-run mkimg instance -b "$VM_BUILD_DIR" -d "$VM_WORKSPACE_DIR" "$IMAGE_NAME" "$INSTANCE_NAME" --force
+
+# NEW: Read the authoritative identity directly from the stamped blueprint
+CANONICAL_IMAGE_NAME=$(awk '/^# CANONICAL_NAME:/ {print $3}' "$HOST_DOCKERFILE" | tr -d '\r')
+
+if [[ -z "$CANONICAL_IMAGE_NAME" ]]; then
+    die "Failed to read # CANONICAL_NAME from $HOST_DOCKERFILE. Did the build stamp it?"
+fi
+
+INSTANCE_NAME="test-run-${CANONICAL_IMAGE_NAME}"
+logx info "resolved canonical image from blueprint" image "$CANONICAL_IMAGE_NAME" instance "$INSTANCE_NAME"
+
+run mkimg instance -b "$VM_BUILD_DIR" -d "$VM_WORKSPACE_DIR" "$CANONICAL_IMAGE_NAME" "$INSTANCE_NAME" --force
 step_ok
 
 # ---------------------------------------------------------
@@ -91,7 +102,7 @@ logx info "executing 'uname -a' inside the VM"
 ssh_success=false
 for i in {1..3}; do
     # Execute from context dir to ensure local resolution
-    if (cd "$HOST_CONTEXT_ABS" && runctl ssh "$INSTANCE_NAME" "uname -a"); then
+    if (cd "$HOST_CONTEXT_ABS" && runctl ssh "$INSTANCE_NAME" "sync && uname -a"); then
         ssh_success=true
         break
     fi

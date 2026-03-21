@@ -17,11 +17,18 @@ RUN [host]: |
   rm -rf "${INST_DIR}"
   mkdir -p "${INST_DIR}"
   
+  # NEW: Parse the image's "superblock" (image.yaml) to get the exact raw image filename
+  RAW_IMAGE=$(awk '/raw_image:/ {print $2}' "${SRC_DIR}/image.yaml" | tr -d '"')
+  if [ -z "$RAW_IMAGE" ]; then
+    echo "Error: Could not determine raw_image from ${SRC_DIR}/image.yaml"
+    exit 1
+  fi
+
   echo "--> Copying disk (sparse/clone)..."
   if [ "$(uname)" = "Darwin" ]; then
-    cp -c "${SRC_DIR}/${BASE_IMAGE}.raw" "${INST_DIR}/${INST_NAME}.raw" || cp "${SRC_DIR}/${BASE_IMAGE}.raw" "${INST_DIR}/${INST_NAME}.raw"
+    cp -c "${SRC_DIR}/${RAW_IMAGE}" "${INST_DIR}/${INST_NAME}.raw" || cp "${SRC_DIR}/${RAW_IMAGE}" "${INST_DIR}/${INST_NAME}.raw"
   else
-    cp --sparse=always "${SRC_DIR}/${BASE_IMAGE}.raw" "${INST_DIR}/${INST_NAME}.raw"
+    cp --sparse=always "${SRC_DIR}/${RAW_IMAGE}" "${INST_DIR}/${INST_NAME}.raw"
   fi
   
   # Resolve symlinks so the VM gets physical kernels instead of broken references
