@@ -322,8 +322,25 @@ func instanceCmd() *cobra.Command {
 				runtimeDir = rtsst.RuntimeDir()
 			}
 
+			baseImage := args[0]
+
+			// NEW: Read the authoritative canonical name directly from the blueprint if it exists locally
+			dockerfilePath := baseImage
+			if !strings.HasSuffix(dockerfilePath, ".dockerfile") {
+				dockerfilePath += ".dockerfile"
+			}
+			if data, err := os.ReadFile(dockerfilePath); err == nil {
+				lines := strings.Split(string(data), "\n")
+				for _, line := range lines {
+					if strings.HasPrefix(line, "# CANONICAL_NAME:") {
+						baseImage = strings.TrimSpace(strings.TrimPrefix(line, "# CANONICAL_NAME:"))
+						break
+					}
+				}
+			}
+
 			bArgs := map[string]string{
-				"BASE_IMAGE": args[0],
+				"BASE_IMAGE": baseImage,
 				"INST_NAME":  args[1],
 			}
 			return RunBuildEngine(cmd.Context(), "instance.dockerfile", ".", flagBuildDir, runtimeDir, flagForce, bArgs)

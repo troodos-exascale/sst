@@ -141,3 +141,26 @@ func (d *DatasetManager) ClearCache() error {
 	}
 	return nil
 }
+
+// PromoteTo permanently detaches a dataset from the build hierarchy and moves it to a long-term catalog location.
+func (d *DatasetManager) PromoteTo(subPath, destCategory, destName string) error {
+	srcPath := d.mountPath(subPath)
+	dstPath := filepath.Join(d.BasePoint, destCategory, destName)
+
+	if d.Zpool != "" {
+		srcDS := d.datasetPath(subPath)
+		dstDS := fmt.Sprintf("%s/%s/%s", d.Zpool, destCategory, destName)
+
+		// Ensure parent dataset exists
+		_ = exec.Command("zfs", "create", "-p", filepath.Dir(dstDS)).Run()
+		if err := exec.Command("zfs", "rename", srcDS, dstDS).Run(); err != nil {
+			return fmt.Errorf("zfs rename failed: %w", err)
+		}
+		// Point the dataset to its new permanent physical location
+		_ = exec.Command("zfs", "set", "mountpoint="+dstPath, dstDS).Run()
+		return nil
+	}
+
+	os.MkdirAll(filepath.Dir(dstPath), 0755)
+	return os.Rename(srcPath, dstPath)
+}

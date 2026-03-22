@@ -27,7 +27,6 @@ var (
 	force bool
 )
 
-// rootCmd is defined here so completion.go can bind to it via init()
 var rootCmd = &cobra.Command{
 	Use:           "runctl",
 	Short:         "Runtime VM controller",
@@ -76,7 +75,6 @@ func (r *Runctl) syncWorkspace() {
 	}
 }
 
-// instanceCompletion feeds the terminal a list of registered instances for tab-completion
 func (r *Runctl) instanceCompletion(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 	if len(args) != 0 {
 		return nil, cobra.ShellCompDirectiveNoFileComp
@@ -116,6 +114,11 @@ func (r *Runctl) Start(name string) error {
 	inst, err := r.loadInstance(name)
 	if err != nil {
 		return err
+	}
+
+	// Dynamic Branching based on manifest Bootloader type
+	if inst.Bootloader == "container" {
+		return r.startContainer(inst, instDir)
 	}
 
 	_ = rtsst.EnsureCIDataISO(r.Ctx, r.Log, instDir)
@@ -213,6 +216,97 @@ func (r *Runctl) Start(name string) error {
 	return cmd.Wait()
 }
 
+func (r *Runctl) startContainer(inst *runctlpb.Instance, instDir string) error {
+	rootfs := filepath.Join(instDir, "rootfs")
+	if _, err := os.Stat(rootfs); os.IsNotExist(err) {
+		return fmt.Errorf("container rootfs not found at %s", rootfs)
+	}
+
+	args := []string{
+		"--quiet",
+		"--machine", inst.Name,
+		"--network-bridge=sst_br0",
+		fmt.Sprintf("--directory=%s", rootfs),
+	}
+
+	// Dynamically detect if we are running an LXC System Container or a raw OCI App Container
+	hasSystemd := false
+	if _, err := os.Stat(filepath.Join(rootfs, "lib/systemd/systemd")); err == nil {
+		hasSystemd = true
+	} else if _, err := os.Stat(filepath.Join(rootfs, "sbin/init")); err == nil {
+		hasSystemd = true
+	}
+
+	if hasSystemd {
+		args = append(args, "--boot")
+	} else {
+		args = append(args, "--as-pid2", "/.sst/init", "/bin/sh")
+	}
+	
+
+	if len(inst.Network) > 0 {
+		mac := strings.Split(inst.Network[0], "@")[0]
+		args = append(args, fmt.Sprintf("--network-mac=%s", mac))
+	}
+
+	for _, shareStr := range inst.SharedDir {
+		parts := strings.Split(shareStr, ":")
+		if len(parts) >= 2 {
+			args = append(args, fmt.Sprintf("--bind=%s:%s", parts[0], parts[1]))
+		}
+	}
+
+	exePath := filepath.Join(instDir, inst.Name)
+	_ = os.Remove(exePath)
+
+	nspawnPath, err := exec.LookPath("systemd-nspawn")
+	if err != nil {
+		return fmt.Errorf("systemd-nspawn not found in PATH")
+	}
+
+	if err := os.Symlink(nspawnPath, exePath); err != nil {
+		return fmt.Errorf("failed to create process shim symlink: %w", err)
+	}
+
+	r.Log.Info(r.Ctx, "starting container executor", "mode", map[bool]string{true: "System (init)", false: "App (daemonless)"}[hasSystemd], "bin", "./"+inst.Name, "args", args)
+
+	cmd := exec.CommandContext(r.Ctx, "./"+inst.Name, args...)
+	cmd.Dir = instDir
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	fd := int(os.Stdin.Fd())
+	if term.IsTerminal(fd) {
+		state, err := term.GetState(fd)
+		if err == nil {
+			defer term.Restore(fd, state)
+		}
+	}
+
+	lockPath := rtsst.LockFilePath(inst.Name)
+	lock, err := rtsst.CreateLock(lockPath)
+	if err != nil {
+		return err
+	}
+	defer lock.Remove()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start container process: %w", err)
+	}
+
+	go func() {
+		for sig := range sigCh {
+			_ = cmd.Process.Signal(sig)
+		}
+	}()
+
+	return cmd.Wait()
+}
+
 func (r *Runctl) setupHostCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "setup-host",
@@ -236,43 +330,42 @@ func (r *Runctl) SetupLinuxNetwork() error {
 	set -eu
 	TARGET_USER=${SUDO_USER:-$(whoami)}
 	
-	echo "Configuring TAP device for user: $TARGET_USER"
-
+	echo "Configuring TAP device for VMs: $TARGET_USER"
 	ip link show sst_tap &>/dev/null || ip tuntap add mode tap user "$TARGET_USER" vnet_hdr sst_tap
 	ip addr show sst_tap | grep -q "192.168.10.1/24" || ip addr add 192.168.10.1/24 dev sst_tap
 	ip link set sst_tap up
+
+	echo "Configuring Bridge device for Containers..."
+	ip link show sst_br0 &>/dev/null || ip link add name sst_br0 type bridge
+	ip addr show sst_br0 | grep -q "192.168.11.1/24" || ip addr add 192.168.11.1/24 dev sst_br0
+	ip link set sst_br0 up
+
 	sysctl -w net.ipv4.ip_forward=1 > /dev/null
 
-	iptables -C INPUT -i sst_tap -j ACCEPT 2>/dev/null || \
-	iptables -I INPUT -i sst_tap -j ACCEPT
+	iptables -C INPUT -i sst_tap -j ACCEPT 2>/dev/null || iptables -I INPUT -i sst_tap -j ACCEPT
+	iptables -C INPUT -i sst_br0 -j ACCEPT 2>/dev/null || iptables -I INPUT -i sst_br0 -j ACCEPT
 
 	HOST_DEV=$(ip route get 8.8.8.8 | awk '{print $5}' | head -n 1)
 	if [ -n "$HOST_DEV" ]; then
-		iptables -t nat -C POSTROUTING -o "$HOST_DEV" -j MASQUERADE 2>/dev/null || \
-		iptables -t nat -A POSTROUTING -o "$HOST_DEV" -j MASQUERADE
-		
-		iptables -C FORWARD -i "$HOST_DEV" -o sst_tap -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-		iptables -A FORWARD -i "$HOST_DEV" -o sst_tap -m state --state RELATED,ESTABLISHED -j ACCEPT
-		
-		iptables -C FORWARD -i sst_tap -o "$HOST_DEV" -j ACCEPT 2>/dev/null || \
-		iptables -A FORWARD -i sst_tap -o "$HOST_DEV" -j ACCEPT
+		iptables -t nat -C POSTROUTING -o "$HOST_DEV" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$HOST_DEV" -j MASQUERADE
+		for IFACE in sst_tap sst_br0; do
+			iptables -C FORWARD -i "$HOST_DEV" -o $IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$HOST_DEV" -o $IFACE -m state --state RELATED,ESTABLISHED -j ACCEPT
+			iptables -C FORWARD -i $IFACE -o "$HOST_DEV" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i $IFACE -o "$HOST_DEV" -j ACCEPT
+		done
 	fi
 
 	if command -v dnsmasq &>/dev/null; then
-		PIDFILE=/var/run/sst_tap_dnsmasq.pid
-		if [ ! -f "$PIDFILE" ] || ! kill -0 $(cat "$PIDFILE") 2>/dev/null; then
-			dnsmasq --conf-file=/dev/null \
-			--user=root \
-			--pid-file=$PIDFILE \
-			--dhcp-leasefile=/var/run/sst_tap_dnsmasq.leases \
-			--port=0 \
-			--interface=sst_tap \
-			--listen-address=192.168.10.1 \
-			--bind-interfaces \
-			--dhcp-range=192.168.10.50,192.168.10.200,12h \
-			--dhcp-option=option:router,192.168.10.1 \
-			--dhcp-option=option:dns-server,8.8.8.8 \
-			--except-interface=lo --clear-on-reload
+		if [ ! -f /var/run/sst_tap_dnsmasq.pid ] || ! kill -0 $(cat /var/run/sst_tap_dnsmasq.pid) 2>/dev/null; then
+			dnsmasq --conf-file=/dev/null --user=root --pid-file=/var/run/sst_tap_dnsmasq.pid \
+			--dhcp-leasefile=/var/run/sst_tap_dnsmasq.leases --port=0 --interface=sst_tap \
+			--listen-address=192.168.10.1 --bind-interfaces --dhcp-range=192.168.10.50,192.168.10.200,12h \
+			--dhcp-option=option:router,192.168.10.1 --dhcp-option=option:dns-server,8.8.8.8 --except-interface=lo --clear-on-reload
+		fi
+		if [ ! -f /var/run/sst_br0_dnsmasq.pid ] || ! kill -0 $(cat /var/run/sst_br0_dnsmasq.pid) 2>/dev/null; then
+			dnsmasq --conf-file=/dev/null --user=root --pid-file=/var/run/sst_br0_dnsmasq.pid \
+			--dhcp-leasefile=/var/run/sst_br0_dnsmasq.leases --port=0 --interface=sst_br0 \
+			--listen-address=192.168.11.1 --bind-interfaces --dhcp-range=192.168.11.50,192.168.11.200,12h \
+			--dhcp-option=option:router,192.168.11.1 --dhcp-option=option:dns-server,8.8.8.8 --except-interface=lo --clear-on-reload
 		fi
 	fi
 	`
@@ -466,7 +559,6 @@ func (r *Runctl) sshCmd() *cobra.Command {
 				"-o", "LogLevel=ERROR",
 			}
 
-			// NEW: Force PTY allocation so interactive programs (nspawn, bash, vim) don't deadlock over delegation
 			if term.IsTerminal(int(os.Stdin.Fd())) {
 				sshArgs = append(sshArgs, "-t")
 			}
@@ -482,7 +574,6 @@ func (r *Runctl) sshCmd() *cobra.Command {
 	}
 }
 
-
 func (r *Runctl) resolveIP(mac string) (string, error) {
 	mac = strings.ToLower(mac)
 
@@ -496,7 +587,18 @@ func (r *Runctl) resolveIP(mac string) (string, error) {
 	}
 	macOSMac := strings.Join(macOSMacParts, ":")
 
+	// Check VM Bridge Leases
 	if data, err := os.ReadFile("/var/run/sst_tap_dnsmasq.leases"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			parts := strings.Fields(line)
+			if len(parts) >= 3 && strings.ToLower(parts[1]) == mac {
+				return parts[2], nil
+			}
+		}
+	}
+
+	// Check Container Bridge Leases
+	if data, err := os.ReadFile("/var/run/sst_br0_dnsmasq.leases"); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
 			parts := strings.Fields(line)
 			if len(parts) >= 3 && strings.ToLower(parts[1]) == mac {

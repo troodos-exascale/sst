@@ -23,10 +23,23 @@ RUN [$TARGET_STAGE, host]: |
   mkdir -p "${ROOTFS}"
   tar --numeric-owner -C "${ROOTFS}" -xf "$CACHE_TAR"
   
-  # MATHEMATICAL REPRODUCIBILITY CLAMPS
-  # Clamp all ownership to root:root (UID 0 / GID 0) without following symlinks (-h)
-  # -xdev prevents crawling into active bind-mounts (like /proc or /dev) from previous crashed runs
   find "${ROOTFS}" -xdev -exec chown -h 0:0 {} +
-  
-  # Clamp all timestamps to UNIX Epoch 0 (1970-01-01 00:00:00 UTC)
   find "${ROOTFS}" -xdev -exec touch -h -d @0 {} +
+
+  echo "--> Injecting SST Networking Sidecar..."
+  mkdir -p "${ROOTFS}/.sst"
+  cat << 'EOF' > "${ROOTFS}/.sst/init"
+#!/bin/sh
+# Provide basic networking for daemonless OCI containers
+if command -v u-root >/dev/null 2>&1; then
+    u-root dhclient eth0 &
+elif command -v udhcpc >/dev/null 2>&1; then
+    udhcpc -i eth0 -q &
+elif command -v dhclient >/dev/null 2>&1; then
+    dhclient eth0 &
+fi
+# Hand over execution to the container's primary CMD
+exec "$@"
+EOF
+  chmod +x "${ROOTFS}/.sst/init"
+END: templates/pull/oci.dockerfile

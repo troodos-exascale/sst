@@ -27,6 +27,11 @@ func UpdateCatalog(ctx context.Context, log *sst.Logx, kind, name, targetDir, di
 		return err
 	}
 
+	// NEW: If the artifact is already physically sitting at its catalog path, do nothing!
+	if absTarget == linkPath {
+		return nil
+	}
+
 	info, err := os.Lstat(linkPath)
 	if err == nil {
 		// Entry exists

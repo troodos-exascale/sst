@@ -1,5 +1,5 @@
-# CANONICAL_NAME: built-from-scratch
-# LAST_BUILD: 20260321-134302
+# CANONICAL_NAME: ubuntu-24.04-built-from-scratch
+# LAST_BUILD: 20260321-215620
 FROM scratch
 NAME built-from-scratch
 

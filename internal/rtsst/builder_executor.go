@@ -226,7 +226,6 @@ func (b *BuildApp) buildEnvironmentMap(activeRootfs string) []string {
 	envMap["BASEDIR"] = filepath.Dir(b.RootDir)
 	envMap["BOOTDIR"] = filepath.Join(filepath.Dir(b.RootDir), "boot")
 	envMap["NAME"] = b.Name
-	// EMITS TO RUNTIME DIR (Mapped to macOS workspace)
 	envMap["OUTDIR"] = filepath.Join(b.RuntimeDir, "images", b.Name)
 
 	envMap["SST_CACHE_APT"] = b.DatasetMgr.CacheDir("apt")
@@ -264,7 +263,6 @@ func (b *BuildApp) execHostRun(ctx context.Context, cmdStr string, targetDir str
 		Args: []string{"-c", cmdStr},
 		Dir:  filepath.Dir(b.Dockerfile),
 		Env:  env,
-		// CHANGED: Stream output live to the terminal
 		Mode: sst.ExecForeground,
 	}
 	_, err := sst.Exec(ctx, b.Log, req)
@@ -352,7 +350,6 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 		Cmd:  "chroot",
 		Args: []string{targetDir, "/bin/sh", "-c", chrootCmd},
 		Env:  env,
-		// CHANGED: Stream output live to the terminal
 		Mode: sst.ExecForeground,
 	}
 	if _, err := sst.Exec(ctx, b.Log, req); err != nil {
@@ -362,8 +359,6 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 }
 
 func (b *BuildApp) FinalizeVM(ctx context.Context) error {
-	currentOutput := filepath.Join(b.RuntimeDir, "images", b.Name)
-
 	semanticName := ""
 	upstreamBuildID := ""
 	osInfo, err := ParseOSRelease(b.RootDir)
@@ -371,29 +366,18 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		semanticName = GenerateSemanticName(osInfo)
 		upstreamBuildID = osInfo["BUILD_ID"]
 		b.Log.Info(ctx, "parsed os-release from rootfs", "semantic_name", semanticName, "upstream_build_id", upstreamBuildID)
-
-		// Construct the full canonical name: <ID>-<VERSION_ID>[-<VARIANT_ID>]-<NAME>
-		longName := fmt.Sprintf("%s-%s", semanticName, b.Name)
-		newOutput := filepath.Join(b.RuntimeDir, "images", longName)
-
-		// Rename cleanly without leaving symlinks
-		if currentOutput != newOutput {
-			if err := os.Rename(currentOutput, newOutput); err == nil {
-				_ = os.Rename(filepath.Join(newOutput, b.Name+".raw"), filepath.Join(newOutput, longName+".raw"))
-				_ = os.Rename(filepath.Join(newOutput, b.Name+".qcow2"), filepath.Join(newOutput, longName+".qcow2"))
-				_ = os.Rename(filepath.Join(newOutput, b.Name+".tar"), filepath.Join(newOutput, longName+".tar"))
-
-				b.Name = longName
-				currentOutput = newOutput
-			} else if !os.IsNotExist(err) {
-				b.Log.Warn(ctx, "failed to rename output directory to canonical name", "error", err)
-			}
-		}
 	} else {
 		b.Log.Warn(ctx, "could not parse os-release from rootfs; falling back to short name", "error", err)
 	}
 
-	b.ImageOutput = currentOutput
+	longName := b.Name
+	if semanticName != "" {
+		longName = fmt.Sprintf("%s-%s", semanticName, b.Name)
+	}
+
+	// This is where image.yaml will be written
+	finalOutputDir := filepath.Join(b.RuntimeDir, "images", longName)
+	b.ImageOutput = finalOutputDir
 	if err := os.MkdirAll(b.ImageOutput, 0755); err != nil {
 		return err
 	}
@@ -420,9 +404,10 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		SstRuntimeDir: b.RuntimeDir,
 	}
 
-	// NEW: Check if a raw disk was actually generated before trying to analyze it
+	// Dynamic Branching: Did the templates emit a block device?
 	rawDiskPath := filepath.Join(b.ImageOutput, b.Name+".raw")
 	if _, err := os.Stat(rawDiskPath); err == nil {
+		// It's a Hardware VM (Layer 3/4)
 		if err := AnalyseImg(sb); err != nil {
 			b.Log.Warn(ctx, "AnalyseImg failed", "error", err)
 		}
@@ -432,9 +417,25 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		}
 
 		QueuePurification(b.RuntimeDir, []string{rawDiskPath})
+		
+		if b.Name != longName {
+			_ = os.Rename(filepath.Join(finalOutputDir, b.Name+".raw"), filepath.Join(finalOutputDir, longName+".raw"))
+			_ = os.Rename(filepath.Join(finalOutputDir, b.Name+".qcow2"), filepath.Join(finalOutputDir, longName+".qcow2"))
+			sb.YamlObject.Storage.RawImage = longName + ".raw"
+			b.Name = longName
+		}
 	} else {
-		b.Log.Info(ctx, "skipping disk analysis (no raw image generated)")
-		sb.YamlObject.Storage.RawImage = "" // Clean up the manifest so it doesn't point to a ghost file
+		// It's a Container! (Layer 1/2). Promote the underlying ZFS dataset physically.
+		b.Log.Info(ctx, "skipping disk analysis (no block device generated, resolving as container)")
+		sb.YamlObject.Storage.RawImage = "" 
+		b.Name = longName
+
+		rootfsDest := filepath.Join(b.ImageOutput, "rootfs")
+		// FIX: Correctly access RuntimeRootName through DatasetMgr
+		if err := b.DatasetMgr.PromoteTo(b.DatasetMgr.RuntimeRootName, "images", longName+"/rootfs"); err != nil {
+			b.Log.Warn(ctx, "failed to promote ZFS dataset natively", "error", err)
+			_ = os.Rename(b.RootDir, rootfsDest)
+		}
 	}
 
 	yo := &sst.YamlObject{
@@ -448,36 +449,26 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		return diags
 	}
 
-	// NEW: Stamp the Dockerfile with authoritative provenance
 	if b.Dockerfile != "" {
 		if data, err := os.ReadFile(b.Dockerfile); err == nil {
 			lines := strings.Split(string(data), "\n")
 			var newLines []string
-
-			// Inject at the very top
 			newLines = append(newLines, fmt.Sprintf("# CANONICAL_NAME: %s", b.Name))
 			newLines = append(newLines, fmt.Sprintf("# LAST_BUILD: %s", buildID))
 
 			for _, line := range lines {
-				// Strip out older stamps so they don't pile up
 				if strings.HasPrefix(line, "# CANONICAL_NAME:") || strings.HasPrefix(line, "# LAST_BUILD:") {
 					continue
 				}
 				newLines = append(newLines, line)
 			}
-
-			if err := os.WriteFile(b.Dockerfile, []byte(strings.Join(newLines, "\n")), 0644); err != nil {
-				b.Log.Warn(ctx, "failed to stamp dockerfile with provenance", "error", err)
-			} else {
-				b.Log.Info(ctx, "stamped dockerfile with provenance", "file", b.Dockerfile, "canonical_name", b.Name)
-			}
+			_ = os.WriteFile(b.Dockerfile, []byte(strings.Join(newLines, "\n")), 0644)
 		}
 		UpdateCatalog(ctx, b.Log, "images", b.Name, b.ImageOutput, buildID)
 	}
 
 	return nil
 }
-
 
 func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
 	instName := b.BuildArgs["INST_NAME"]
@@ -504,13 +495,16 @@ func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
 		Msg:    imgManifest,
 	}
 
+	isContainer := false
 	rootDev := "/dev/vda2"
 	rootType := "ext4"
+	
 	if diags := yoImg.Load(ctx, b.Log); diags == nil || !diags.HasAny() {
-		if imgManifest.Storage != nil {
+		if imgManifest.Storage == nil || imgManifest.Storage.RawImage == "" {
+			isContainer = true
+		} else {
 			if imgManifest.Storage.RootfsDevice != "" {
 				rootDev = imgManifest.Storage.RootfsDevice
-				b.Log.Info(ctx, "inherited rootfs device from base image manifest", "rootfs_device", rootDev)
 			}
 			if imgManifest.Storage.RootfsType != "" {
 				rootType = imgManifest.Storage.RootfsType
@@ -531,10 +525,22 @@ func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
 		Name:       instName,
 		Hostname:   instName,
 		BaseImage:  baseImage,
-		Bootloader: "linux",
-		Kernel:     "kernel",
-		Initrd:     "initrd",
-		Params: []string{
+		MemorySize: "4096",
+		MemorySizeSuffix: "MiB",
+		CpuCount:   "4",
+		Network:    []string{mac + "@nat"},
+	}
+
+	if isContainer {
+		inst.Bootloader = "container"
+		b.Log.Info(ctx, "configured manifest for container execution", "instance", instName)
+	} else {
+		inst.Bootloader = "linux"
+		inst.Kernel = "kernel"
+		inst.Initrd = "initrd"
+		inst.Disk = []string{"cidata.iso"}
+		inst.Rwdisk = []string{instName + ".raw"}
+		inst.Params = []string{
 			"console=hvc0",
 			"oops=panic",
 			"panic=10",
@@ -543,13 +549,8 @@ func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
 			"cpuidle.off=1",
 			"root=" + rootDev,
 			"rootfstype=" + rootType,
-		},
-		Disk:             []string{"cidata.iso"},
-		Rwdisk:           []string{instName + ".raw"},
-		Network:          []string{mac + "@nat"},
-		MemorySize:       "4096",
-		MemorySizeSuffix: "MiB",
-		CpuCount:         "4",
+		}
+		b.Log.Info(ctx, "configured manifest for hardware vm execution", "instance", instName)
 	}
 
 	instDir := filepath.Join(b.RuntimeDir, "instances", instName)
@@ -568,13 +569,13 @@ func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
 		return diags
 	}
 
-	QueuePurification(b.RuntimeDir, []string{
-		filepath.Join(instDir, instName+".raw"),
-		filepath.Join(instDir, "cidata.iso"),
-	})
+	if !isContainer {
+		QueuePurification(b.RuntimeDir, []string{
+			filepath.Join(instDir, instName+".raw"),
+			filepath.Join(instDir, "cidata.iso"),
+		})
+	}
 
-	b.Log.Info(ctx, "finalized strict instance manifest", "path", yoInst.Path)
-	// We generate an 8-character hash of the absolute path just in case we need to break a tie.
 	disambiguator := fmt.Sprintf("%x", sha256.Sum256([]byte(instDir)))[:8]
 	UpdateCatalog(ctx, b.Log, "instances", instName, instDir, disambiguator)
 	return nil
