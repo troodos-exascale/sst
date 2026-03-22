@@ -419,6 +419,11 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 				b.Instructions = append(b.Instructions, Instruction{Type: "ARG", Args: "FROM_SOURCE=" + source})
 				b.Instructions = append(b.Instructions, Instruction{Type: "ARG", Args: "TARGET_STAGE=" + asName})
 
+				// NEW: Completely bypass OCI resolution for scratch images
+				if source == "scratch" {
+					continue
+				}
+
 				resolvedPath, err := b.resolveIncludePath(absPath, "pull/oci")
 
 				if err == nil {
@@ -429,7 +434,7 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 				}
 				continue
 			}
-
+			
 			if baseType == "GET" {
 				parts := strings.Fields(args)
 				if len(parts) < 2 {

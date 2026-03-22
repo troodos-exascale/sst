@@ -370,13 +370,27 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		b.Log.Warn(ctx, "could not parse os-release from rootfs; falling back to short name", "error", err)
 	}
 
-	longName := b.Name
+	originalName := b.Name
+	longName := originalName
 	if semanticName != "" {
-		longName = fmt.Sprintf("%s-%s", semanticName, b.Name)
+		longName = fmt.Sprintf("%s-%s", semanticName, originalName)
 	}
 
-	// This is where image.yaml will be written
+	originalOutputDir := filepath.Join(b.RuntimeDir, "images", originalName)
 	finalOutputDir := filepath.Join(b.RuntimeDir, "images", longName)
+
+	// 1. Move the directory and inner files FIRST, before we evaluate them
+	if originalOutputDir != finalOutputDir {
+		if err := os.Rename(originalOutputDir, finalOutputDir); err != nil && !os.IsNotExist(err) {
+			b.Log.Warn(ctx, "failed to rename output directory to semantic name", "error", err)
+		}
+		
+		_ = os.Rename(filepath.Join(finalOutputDir, originalName+".raw"), filepath.Join(finalOutputDir, longName+".raw"))
+		_ = os.Rename(filepath.Join(finalOutputDir, originalName+".qcow2"), filepath.Join(finalOutputDir, longName+".qcow2"))
+		
+		b.Name = longName // Update the builder's name so everything downstream matches
+	}
+
 	b.ImageOutput = finalOutputDir
 	if err := os.MkdirAll(b.ImageOutput, 0755); err != nil {
 		return err
@@ -417,22 +431,13 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		}
 
 		QueuePurification(b.RuntimeDir, []string{rawDiskPath})
-		
-		if b.Name != longName {
-			_ = os.Rename(filepath.Join(finalOutputDir, b.Name+".raw"), filepath.Join(finalOutputDir, longName+".raw"))
-			_ = os.Rename(filepath.Join(finalOutputDir, b.Name+".qcow2"), filepath.Join(finalOutputDir, longName+".qcow2"))
-			sb.YamlObject.Storage.RawImage = longName + ".raw"
-			b.Name = longName
-		}
 	} else {
 		// It's a Container! (Layer 1/2). Promote the underlying ZFS dataset physically.
 		b.Log.Info(ctx, "skipping disk analysis (no block device generated, resolving as container)")
 		sb.YamlObject.Storage.RawImage = "" 
-		b.Name = longName
 
 		rootfsDest := filepath.Join(b.ImageOutput, "rootfs")
-		// FIX: Correctly access RuntimeRootName through DatasetMgr
-		if err := b.DatasetMgr.PromoteTo(b.DatasetMgr.RuntimeRootName, "images", longName+"/rootfs"); err != nil {
+		if err := b.DatasetMgr.PromoteTo(b.DatasetMgr.RuntimeRootName, "images", b.Name+"/rootfs"); err != nil {
 			b.Log.Warn(ctx, "failed to promote ZFS dataset natively", "error", err)
 			_ = os.Rename(b.RootDir, rootfsDest)
 		}
@@ -469,6 +474,7 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 
 	return nil
 }
+
 
 func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
 	instName := b.BuildArgs["INST_NAME"]

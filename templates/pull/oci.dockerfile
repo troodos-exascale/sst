@@ -29,17 +29,16 @@ RUN [$TARGET_STAGE, host]: |
   echo "--> Injecting SST Networking Sidecar..."
   mkdir -p "${ROOTFS}/.sst"
   cat << 'EOF' > "${ROOTFS}/.sst/init"
-#!/bin/sh
-# Provide basic networking for daemonless OCI containers
-if command -v u-root >/dev/null 2>&1; then
-    u-root dhclient eth0 &
-elif command -v udhcpc >/dev/null 2>&1; then
-    udhcpc -i eth0 -q &
-elif command -v dhclient >/dev/null 2>&1; then
-    dhclient eth0 &
-fi
-# Hand over execution to the container's primary CMD
-exec "$@"
-EOF
+  #!/bin/sh
+  # Provide basic networking for daemonless OCI containers
+  if command -v u-root >/dev/null 2>&1; then
+      u-root dhclient eth0 &
+  elif command -v udhcpc >/dev/null 2>&1; then
+      udhcpc -i eth0 -q &
+  elif command -v dhclient >/dev/null 2>&1; then
+      dhclient eth0 &
+  fi
+  # Hand over execution to the container's primary CMD
+  exec "$@"
+  EOF
   chmod +x "${ROOTFS}/.sst/init"
-END: templates/pull/oci.dockerfile
