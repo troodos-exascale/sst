@@ -110,16 +110,25 @@ func (d *DatasetManager) CacheDir(cacheName string) string {
 
 // Destroy completely annihilates the build dataset and its physical directory.
 // It uses a recursive ZFS destroy to cleanly unmount and wipe the entire tree.
+// Destroy completely annihilates the build dataset and its physical directory.
+// It uses a recursive ZFS destroy to cleanly unmount and wipe the entire tree.
 func (d *DatasetManager) Destroy() error {
+	mountPath := d.mountPath("")
+
+	// SAFETY FIRST: Sever any dangling bind mounts (like /dev/pts or /sys)
+	// to prevent os.RemoveAll from traversing into and destroying the host OS!
+	_ = exec.Command("umount", "-R", mountPath).Run()
+
 	// 1. Annihilate the ZFS datasets (if ZFS is active)
 	if dsPath := d.datasetPath(""); dsPath != "" {
 		cmd := exec.Command("zfs", "destroy", "-r", dsPath)
 		_ = cmd.Run() // We ignore the error because the dataset might not exist yet
 	}
 
-	// 2. Annihilate the physical host directory
-	return os.RemoveAll(d.mountPath(""))
+	// 2. Annihilate the physical host directory safely
+	return os.RemoveAll(mountPath)
 }
+
 
 // ClearCache destroys and recreates only the persistent cache datasets.
 func (d *DatasetManager) ClearCache() error {

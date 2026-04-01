@@ -300,12 +300,14 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 		return fmt.Errorf("circular INCLUDE detected: %s", absPath)
 	}
 	visited[absPath] = true
+	defer delete(visited, absPath) // <-- ADD THIS LINE
 
 	f, err := os.Open(absPath)
 	if err != nil {
 		return fmt.Errorf("failed to open Dockerfile %s: %w", absPath, err)
 	}
 	defer f.Close()
+    
 
 	scanner := bufio.NewScanner(f)
 	var currentBlock []string
