@@ -72,11 +72,12 @@ type StepsContext struct {
 
 // StepsRunState is the superblock / inode of a steps execution.
 type StepsRunState struct {
-	Name      string
-	Steps     []Step
-	State     StepState
-	persist   bool
-	statePath string
+	Name       string
+	Steps      []Step
+	State      StepState
+	StartIndex int // Instructs the runner to fast-forward to this index (0-based)
+	persist    bool
+	statePath  string
 
 	// Legacy logger callback (kept for compatibility).
 	// New structured logging uses LogxRoot() internally.
@@ -142,6 +143,13 @@ func (r *StepsRunState) runAll() error {
 
 		stepSub := runSub + "." + sanitizeForNamespace(stepName)
 		stepLog := LogxRoot().Subsystem(stepSub).With("run", r.Name, "step", stepName, "step_idx", stepIdx)
+
+		// Fast-forward mechanic for resumable builds
+		if i < r.StartIndex {
+			r.logf("SKIP %02d %s (Cached)", stepIdx, stepName)
+			stepLog.Info(runCtx, "step.skipped.cached")
+			continue
+		}
 
 		// Set SST_CALL_PATH for the duration of this step.
 		prevCallPath, hadPrev := os.LookupEnv("SST_CALL_PATH")

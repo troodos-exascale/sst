@@ -84,7 +84,7 @@ RUN [$TARGET_STAGE]: |
   
   echo "--> Building Go userland (bb format)..."
   # Running inside the repo guarantees Go module resolution works flawlessly
-  /go/bin/u-root -build=bb -o /tmp/initramfs.cpio core cmds/exp/dhclient
+  /go/bin/u-root -build=bb -o /tmp/initramfs.cpio core
   
 
 # ==========================================

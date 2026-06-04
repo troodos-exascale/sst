@@ -28,10 +28,17 @@ RUN [base, host, raw, qcow2]: |
   echo "--> Mounting and syncing rootfs..."
   mkdir -p "$MNT"
   mount "${LOOP}p2" "$MNT"
-  mkdir -p "$MNT/boot/efi"
-  mount "${LOOP}p1" "$MNT/boot/efi"
+  
+  # 1. Rsync the rootfs FIRST so it only touches the ext4 partition
   rsync -aHAX "${ROOTFS}/" "$MNT/"
   
+  # 2. Now mount the FAT32 EFI partition over the synced directory
+  mkdir -p "$MNT/boot/efi"
+  mount "${LOOP}p1" "$MNT/boot/efi"
+  
+  # 3. Force the parent grub directory to exist so grub-install doesn't panic
+  mkdir -p "$MNT/boot/grub"
+
   echo "--> Writing /etc/fstab..."
   echo "/dev/vda2 / ext4 rw,relatime 0 1" > "$MNT/etc/fstab"
   echo "/dev/vda1 /boot/efi vfat defaults 0 2" >> "$MNT/etc/fstab"

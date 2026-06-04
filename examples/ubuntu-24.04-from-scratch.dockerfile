@@ -1,7 +1,7 @@
-# CANONICAL_NAME: ubuntu-24.04-built-from-scratch
-# LAST_BUILD: 20260322-103347
+# CANONICAL_NAME: ubuntu-24.04-built-from-scratch-final
+# LAST_BUILD: 20260430-013607
 FROM scratch
-NAME built-from-scratch
+NAME built-from-scratch-final
 
 # REQUIRED: Declare the argument so the Go engine is allowed to inject it!
 ARG DEB_ARCH
