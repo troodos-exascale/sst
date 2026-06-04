@@ -6,3 +6,5 @@
 /runctl/runctl
 
 **/*.pb.go
+tests
+docs

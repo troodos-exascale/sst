@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -120,11 +119,13 @@ func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runti
 		}
 		if divergence == -1 {
 			if bState.Status == "building" || bState.Status == "OK" {
-				fmt.Println("✅ Build is up to date. No changed steps.")
-				fmt.Printf("To force a cache refresh from step N, run: mkimg build --restart N -f %s\n", filepath.Base(builder.Dockerfile))
-				return nil
+				// We fast-forward past the IR steps, but critically, we DO NOT exit.
+				// This ensures FINALIZE MANIFEST executes to safely emit outputs.
+				fmt.Println("✅ Build IR is up to date. Re-evaluating manifest outputs...")
+				startIndex = len(builder.Instructions)
+			} else {
+				startIndex = len(builder.Instructions)
 			}
-			startIndex = len(builder.Instructions)
 		} else {
 			startIndex = divergence
 			log.Info(ctx, "detected hash divergence or failure", "step", startIndex)

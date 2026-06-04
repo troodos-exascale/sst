@@ -15,8 +15,6 @@ import (
 	runctlpb "github.com/swiss-software-tool/sst/proto/yaml/runctl/v1"
 )
 
-// --- State Management ---
-
 type BuildStepState struct {
 	Hash    string `json:"hash"`
 	Status  string `json:"status"`
@@ -81,8 +79,6 @@ func wrapWithTee(logFile string, cmd string, args ...string) (string, []string, 
 	bashArgs = append(bashArgs, args...)
 	return "bash", bashArgs, []string{"LOGFILE=" + logFile}
 }
-
-// --- Execution Engine ---
 
 func (b *BuildApp) InitEnvironment(ctx context.Context) error {
 	absContext, err := filepath.Abs(b.ContextDir)
@@ -236,7 +232,7 @@ func (b *BuildApp) ExecuteSingleInstruction(ctx context.Context, inst Instructio
 			b.Volumes[strings.Trim(strings.TrimSpace(vol), `"`)] = struct{}{}
 		}
 	case "FROM", "NAME", "VMOUT", "EMIT", "COPY", "ADD":
-		// Handled structurally during PreProcess
+		// handled in preprocess
 	case "RUN":
 		if !b.shouldExecute(inst.Conditions) {
 			b.Log.Info(ctx, "skipping instruction (condition mismatch)", "conditions", inst.Conditions, "emits", b.Emits)
@@ -567,7 +563,6 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		return diags
 	}
 
-	// NEW: Write blueprint templates into the image directory
 	blueprintDir := filepath.Join(b.ImageOutput, "blueprint")
 	os.MkdirAll(blueprintDir, 0755)
 
@@ -591,7 +586,6 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		UpdateCatalog(ctx, b.Log, "images", b.Name, b.ImageOutput, buildID)
 	}
 
-	// Copy all included files
 	for relPath, absPath := range b.IncludedFiles {
 		targetRel := relPath
 		if !strings.HasSuffix(targetRel, ".dockerfile") {
@@ -599,7 +593,9 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		}
 		destPath := filepath.Join(blueprintDir, targetRel)
 		os.MkdirAll(filepath.Dir(destPath), 0755)
-		_ = CopyFile(absPath, destPath)
+		if data, err := os.ReadFile(absPath); err == nil {
+			_ = os.WriteFile(destPath, data, 0644)
+		}
 	}
 
 	return nil
@@ -634,6 +630,7 @@ func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
 	rootDev := "/dev/vda2"
 	rootType := "ext4"
 	
+	// RESTORED YESTERDAY'S EXACT BEHAVIOR
 	if diags := yoImg.Load(ctx, b.Log); diags == nil || !diags.HasAny() {
 		if imgManifest.Storage == nil || imgManifest.Storage.RawImage == "" {
 			isContainer = true
@@ -704,13 +701,14 @@ func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
 		return diags
 	}
 
-	// NEW: Write blueprint templates into the instance directory
 	blueprintDir := filepath.Join(instDir, "blueprint")
 	os.MkdirAll(blueprintDir, 0755)
 
 	if b.Dockerfile != "" {
 		destPath := filepath.Join(blueprintDir, filepath.Base(b.Dockerfile))
-		_ = CopyFile(b.Dockerfile, destPath)
+		if data, err := os.ReadFile(b.Dockerfile); err == nil {
+			_ = os.WriteFile(destPath, data, 0644)
+		}
 	}
 
 	for relPath, absPath := range b.IncludedFiles {
@@ -720,7 +718,9 @@ func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
 		}
 		destPath := filepath.Join(blueprintDir, targetRel)
 		os.MkdirAll(filepath.Dir(destPath), 0755)
-		_ = CopyFile(absPath, destPath)
+		if data, err := os.ReadFile(absPath); err == nil {
+			_ = os.WriteFile(destPath, data, 0644)
+		}
 	}
 
 	if !isContainer {
