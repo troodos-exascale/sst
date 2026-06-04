@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -16,11 +18,14 @@ var (
 	buildArgs    []string
 	flagFile     string
 	flagBuildDir string
+
+	flagRestart int
+	flagShow    bool
+	flagSource  string
 )
 
 // RunBuildEngine is the universal entrypoint for parsing and executing VAXLang DAGs.
 func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runtimeDir string, flagForce bool, bArgs map[string]string) error {
-	// Gracefully enforce root privileges for native execution
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("mkimg requires root privileges to provision datasets and execute isolated environments. Please run with sudo")
 	}
@@ -33,21 +38,18 @@ func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runti
 		builder.BuildArgs[k] = v
 	}
 
-	// Standardize architecture strings for Dockerfile templates
 	goArch := runtime.GOARCH
 
-	// 1. Debian/Ubuntu family (amd64 / arm64)
 	builder.BuildArgs["ARCH"] = goArch
 	builder.BuildArgs["DEB_ARCH"] = goArch
 
-	// 2. RPM / Alpine family (x86_64 / aarch64)
 	var rpmArch string
 	if goArch == "arm64" {
 		rpmArch = "aarch64"
 	} else if goArch == "amd64" {
 		rpmArch = "x86_64"
 	} else {
-		rpmArch = goArch // Fallback
+		rpmArch = goArch 
 	}
 	builder.BuildArgs["RPM_ARCH"] = rpmArch
 	builder.BuildArgs["ALPINE_ARCH"] = rpmArch
@@ -59,23 +61,128 @@ func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runti
 		return err
 	}
 
-	// Initialize the ZFS Dataset topology using the new BuildDir
+	if flagSource != "" {
+		parts := strings.Split(flagSource, ",")
+		start, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+		if err != nil {
+			return fmt.Errorf("invalid source step index: %s", parts[0])
+		}
+		end := start
+		if len(parts) > 1 {
+			if parsedEnd, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil {
+				end = parsedEnd
+			}
+		}
+		fmt.Printf("--- IR Source (Steps %d to %d) ---\n", start, end)
+		for _, inst := range builder.Instructions {
+			if inst.Index >= start && inst.Index <= end {
+				fmt.Printf("[Step %02d] %s %s\n", inst.Index, inst.Type, inst.Args)
+			}
+		}
+		return nil
+	}
+
 	if err := builder.InitEnvironment(ctx); err != nil {
 		return err
 	}
 
+	bState, _ := builder.LoadState()
+
+	if flagShow {
+		fmt.Printf("--- Build Summary: %s ---\n", builder.Name)
+		for _, inst := range builder.Instructions {
+			step, ok := bState.Steps[inst.Index]
+			if ok {
+				fmt.Printf("[Step %02d] %-8s | Log: %s\n", inst.Index, step.Status, step.LogPath)
+			} else {
+				fmt.Printf("[Step %02d] PENDING  | %s\n", inst.Index, inst.Type)
+			}
+		}
+		return nil
+	}
+
+	startIndex := 0
+
+	if flagForce {
+		startIndex = 0
+		_ = builder.SaveState(&rtsst.BuildState{Status: "new", Steps: make(map[int]rtsst.BuildStepState)})
+	} else if flagRestart >= 0 {
+		startIndex = flagRestart
+		log.Info(ctx, "manual restart requested", "step", startIndex)
+	} else {
+		divergence := -1
+		for i, inst := range builder.Instructions {
+			savedStep, ok := bState.Steps[i]
+			if !ok || savedStep.Hash != inst.Hash || savedStep.Status != "OK" {
+				divergence = i
+				break
+			}
+		}
+		if divergence == -1 {
+			if bState.Status == "building" || bState.Status == "OK" {
+				fmt.Println("✅ Build is up to date. No changed steps.")
+				fmt.Printf("To force a cache refresh from step N, run: mkimg build --restart N -f %s\n", filepath.Base(builder.Dockerfile))
+				return nil
+			}
+			startIndex = len(builder.Instructions)
+		} else {
+			startIndex = divergence
+			log.Info(ctx, "detected hash divergence or failure", "step", startIndex)
+		}
+	}
+
+	for i := 0; i < startIndex; i++ {
+		inst := builder.Instructions[i]
+
+		cleanArgs := inst.Args
+		if inst.Type != "RUN" {
+			cleanArgs = strings.SplitN(builder.Substitute(inst.Args), " #", 2)[0]
+			cleanArgs = strings.TrimSpace(cleanArgs)
+		}
+
+		switch inst.Type {
+		case "WORKDIR":
+			builder.Workdir = builder.Substitute(cleanArgs)
+		case "USER":
+			builder.User = builder.Substitute(cleanArgs)
+		case "RUN":
+			if strings.HasPrefix(inst.Args, "sys.provision_dataset") {
+				parts := strings.Fields(inst.Args)
+				for _, p := range parts {
+					if strings.HasPrefix(p, "--target=") {
+						target := strings.TrimPrefix(p, "--target=")
+						builder.StageMounts[target] = builder.DatasetMgr.MountPath("as-roots/" + target)
+					}
+				}
+			}
+		}
+	}
+
+	if startIndex > 0 && startIndex <= len(builder.Instructions) && len(builder.StageMounts) > 0 {
+		prevInst := builder.Instructions[startIndex-1]
+		hashStub := ""
+		if len(prevInst.Hash) >= 8 {
+			hashStub = prevInst.Hash[:8]
+		}
+		tag := fmt.Sprintf("step_%02d_hash_%s", prevInst.Index, hashStub)
+		log.Info(ctx, "rolling back active datasets to previous valid state", "tag", tag)
+		for stage := range builder.StageMounts {
+			_ = builder.DatasetMgr.RollbackDataset("as-roots/"+stage, tag)
+		}
+	}
+
 	runner := sst.StepsInit("mkimage.build")
+	runner.StartIndex = startIndex
 
 	for i, inst := range builder.Instructions {
 		instruction := inst
-		stepName := fmt.Sprintf("%s %02d", instruction.Type, i+1)
+		stepName := fmt.Sprintf("%s %02d", instruction.Type, i)
 
 		runner.StepsAdd(stepName, func(c *sst.StepsContext, _ sst.StepState) error {
 			return builder.ExecuteSingleInstruction(ctx, instruction)
 		})
 	}
 
-	// Finalize writes the declarative image.yaml at the end of the graph
 	runner.StepsAdd("FINALIZE MANIFEST", func(c *sst.StepsContext, _ sst.StepState) error {
 		if strings.HasSuffix(builder.Dockerfile, "instance.dockerfile") {
 			return builder.FinalizeInstance(ctx)
@@ -119,5 +226,10 @@ func init() {
 	buildCmd.Flags().StringSliceVar(&buildArgs, "build-arg", nil, "Set build-time variables (e.g., DEBARCH=amd64)")
 	buildCmd.Flags().StringVarP(&flagFile, "file", "f", "./Dockerfile", "path to the Dockerfile")
 	buildCmd.Flags().StringVarP(&flagBuildDir, "builddir", "b", "/runtimes", "Base directory for ZFS extraction and intermediate builds")
+
+	buildCmd.Flags().IntVarP(&flagRestart, "restart", "r", -1, "Restart build from specific step index")
+	buildCmd.Flags().BoolVarP(&flagShow, "show", "s", false, "Show output summary of all build steps")
+	buildCmd.Flags().StringVar(&flagSource, "source", "", "Show IR step(s) source (e.g. '3' or '3,5')")
+
 	rootCmd.AddCommand(buildCmd)
 }

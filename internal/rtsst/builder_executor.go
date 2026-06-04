@@ -34,7 +34,7 @@ func (b *BuildApp) LoadState() (*BuildState, error) {
 	if b.DatasetMgr == nil {
 		return &BuildState{LastSuccessfulStep: -1, Status: "new", Steps: make(map[int]BuildStepState)}, nil
 	}
-	path := filepath.Join(b.DatasetMgr.mountPath(""), "state.json")
+	path := filepath.Join(b.DatasetMgr.MountPath(""), "state.json")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return &BuildState{LastSuccessfulStep: -1, Status: "new", Steps: make(map[int]BuildStepState)}, nil
@@ -51,9 +51,9 @@ func (b *BuildApp) LoadState() (*BuildState, error) {
 
 func (b *BuildApp) SaveState(s *BuildState) error {
 	if b.DatasetMgr == nil {
-		return nil // Safe mock isolation for unit tests
+		return nil 
 	}
-	path := filepath.Join(b.DatasetMgr.mountPath(""), "state.json")
+	path := filepath.Join(b.DatasetMgr.MountPath(""), "state.json")
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
@@ -73,8 +73,6 @@ func (b *BuildApp) SnapshotActiveDatasets(ctx context.Context, tag string) {
 	}
 }
 
-// wrapWithTee intercepts the shell command string and seamlessly pipes it 
-// into a log file while preserving exact command-line arguments and pipe exit codes.
 func wrapWithTee(logFile string, cmd string, args ...string) (string, []string, []string) {
 	if logFile == "" {
 		return cmd, args, nil
@@ -97,25 +95,7 @@ func (b *BuildApp) InitEnvironment(ctx context.Context) error {
 		return fmt.Errorf("failed to resolve absolute path of dockerfile: %w", err)
 	}
 
-	targetDockerfilePath := filepath.Join(absContext, filepath.Base(absDockerfilePath))
-
-	if absDockerfilePath != targetDockerfilePath {
-		err = os.Link(absDockerfilePath, targetDockerfilePath)
-		if err != nil {
-			if os.IsExist(err) {
-				srcInfo, statErr1 := os.Stat(absDockerfilePath)
-				dstInfo, statErr2 := os.Stat(targetDockerfilePath)
-				if statErr1 != nil || statErr2 != nil || !os.SameFile(srcInfo, dstInfo) {
-					return fmt.Errorf("dockerfile name collision: %s already exists in context directory but points to a different file", filepath.Base(absDockerfilePath))
-				}
-			} else {
-				return fmt.Errorf("failed to hardlink dockerfile into context directory (cross-device link?): %w", err)
-			}
-		}
-		b.Log.Info(ctx, "hardlinked dockerfile into context workspace", "src", absDockerfilePath, "dst", targetDockerfilePath)
-	}
-
-	b.Dockerfile = targetDockerfilePath
+	b.Dockerfile = absDockerfilePath
 
 	hashBytes := sha256.Sum256([]byte(absContext))
 	contextHash := fmt.Sprintf("%x", hashBytes)[:12]
@@ -131,7 +111,6 @@ func (b *BuildApp) InitEnvironment(ctx context.Context) error {
 		"runtime_root", runtimeRootName,
 	)
 
-	// USES THE DEDICATED BUILD DIR FOR ZFS EXTRACTION
 	b.DatasetMgr = NewDatasetManager(b.BuildDir, b.BuildID, runtimeRootName)
 
 	if b.Force {
@@ -186,7 +165,7 @@ func (b *BuildApp) ExecuteSingleInstruction(ctx context.Context, inst Instructio
 
 	if b.DatasetMgr != nil {
 		bState, _ = b.LoadState()
-		logsDir = filepath.Join(b.DatasetMgr.mountPath(""), "logs")
+		logsDir = filepath.Join(b.DatasetMgr.MountPath(""), "logs")
 		os.MkdirAll(logsDir, 0755)
 
 		hashStub := ""
@@ -278,7 +257,7 @@ func (b *BuildApp) ExecuteSingleInstruction(ctx context.Context, inst Instructio
 					activeRootfs = stagePath
 				} else if resolvedLoc != "root" && resolvedLoc != "host" && resolvedLoc != "chroot" && resolvedLoc != "" {
 					if b.DatasetMgr != nil {
-						targetDir = filepath.Join(b.DatasetMgr.mountPath(""), resolvedLoc)
+						targetDir = filepath.Join(b.DatasetMgr.MountPath(""), resolvedLoc)
 					}
 					os.MkdirAll(targetDir, 0755)
 				}
@@ -296,7 +275,6 @@ func (b *BuildApp) ExecuteSingleInstruction(ctx context.Context, inst Instructio
 		execErr = fmt.Errorf("unknown instruction type: %s", inst.Type)
 	}
 
-	// Update State & Snapshot ONLY if managed by DatasetMgr (insulating tests)
 	if b.DatasetMgr != nil && bState != nil {
 		status := "OK"
 		if execErr != nil {
@@ -319,7 +297,6 @@ func (b *BuildApp) ExecuteSingleInstruction(ctx context.Context, inst Instructio
 
 		_ = b.SaveState(bState)
 
-		// Create metadata log
 		metaData := map[string]interface{}{
 			"index":  inst.Index,
 			"type":   inst.Type,
@@ -331,7 +308,6 @@ func (b *BuildApp) ExecuteSingleInstruction(ctx context.Context, inst Instructio
 			_ = os.WriteFile(metaFile, metaBytes, 0644)
 		}
 
-		// Snapshot active datasets upon successful execution
 		if execErr == nil {
 			snapshotTag := fmt.Sprintf("step_%02d_hash_%s", inst.Index, inst.Hash[:8])
 			b.SnapshotActiveDatasets(ctx, snapshotTag)
@@ -516,7 +492,6 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 	originalOutputDir := filepath.Join(b.RuntimeDir, "images", originalName)
 	finalOutputDir := filepath.Join(b.RuntimeDir, "images", longName)
 
-	// 1. Move the directory and inner files FIRST, before we evaluate them
 	if originalOutputDir != finalOutputDir {
 		if err := os.Rename(originalOutputDir, finalOutputDir); err != nil && !os.IsNotExist(err) {
 			b.Log.Warn(ctx, "failed to rename output directory to semantic name", "error", err)
@@ -525,7 +500,7 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		_ = os.Rename(filepath.Join(finalOutputDir, originalName+".raw"), filepath.Join(finalOutputDir, longName+".raw"))
 		_ = os.Rename(filepath.Join(finalOutputDir, originalName+".qcow2"), filepath.Join(finalOutputDir, longName+".qcow2"))
 		
-		b.Name = longName // Update the builder's name so everything downstream matches
+		b.Name = longName
 	}
 
 	b.ImageOutput = finalOutputDir
@@ -555,10 +530,8 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		SstRuntimeDir: b.RuntimeDir,
 	}
 
-	// Dynamic Branching: Did the templates emit a block device?
 	rawDiskPath := filepath.Join(b.ImageOutput, b.Name+".raw")
 	if _, err := os.Stat(rawDiskPath); err == nil {
-		// It's a Hardware VM (Layer 3/4)
 		if err := AnalyseImg(sb); err != nil {
 			b.Log.Warn(ctx, "AnalyseImg failed", "error", err)
 		}
@@ -569,7 +542,6 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 
 		QueuePurification(b.RuntimeDir, []string{rawDiskPath})
 	} else {
-		// It's a Container! (Layer 1/2). Promote the underlying ZFS dataset physically.
 		b.Log.Info(ctx, "skipping disk analysis (no block device generated, resolving as container)")
 		sb.YamlObject.Storage.RawImage = "" 
 
@@ -595,6 +567,10 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		return diags
 	}
 
+	// NEW: Write blueprint templates into the image directory
+	blueprintDir := filepath.Join(b.ImageOutput, "blueprint")
+	os.MkdirAll(blueprintDir, 0755)
+
 	if b.Dockerfile != "" {
 		if data, err := os.ReadFile(b.Dockerfile); err == nil {
 			lines := strings.Split(string(data), "\n")
@@ -608,9 +584,22 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 				}
 				newLines = append(newLines, line)
 			}
-			_ = os.WriteFile(b.Dockerfile, []byte(strings.Join(newLines, "\n")), 0644)
+			
+			destPath := filepath.Join(blueprintDir, filepath.Base(b.Dockerfile))
+			_ = os.WriteFile(destPath, []byte(strings.Join(newLines, "\n")), 0644)
 		}
 		UpdateCatalog(ctx, b.Log, "images", b.Name, b.ImageOutput, buildID)
+	}
+
+	// Copy all included files
+	for relPath, absPath := range b.IncludedFiles {
+		targetRel := relPath
+		if !strings.HasSuffix(targetRel, ".dockerfile") {
+			targetRel += ".dockerfile"
+		}
+		destPath := filepath.Join(blueprintDir, targetRel)
+		os.MkdirAll(filepath.Dir(destPath), 0755)
+		_ = CopyFile(absPath, destPath)
 	}
 
 	return nil
@@ -713,6 +702,25 @@ func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
 
 	if diags := yoInst.Save(ctx, b.Log); diags != nil && diags.HasAny() {
 		return diags
+	}
+
+	// NEW: Write blueprint templates into the instance directory
+	blueprintDir := filepath.Join(instDir, "blueprint")
+	os.MkdirAll(blueprintDir, 0755)
+
+	if b.Dockerfile != "" {
+		destPath := filepath.Join(blueprintDir, filepath.Base(b.Dockerfile))
+		_ = CopyFile(b.Dockerfile, destPath)
+	}
+
+	for relPath, absPath := range b.IncludedFiles {
+		targetRel := relPath
+		if !strings.HasSuffix(targetRel, ".dockerfile") {
+			targetRel += ".dockerfile"
+		}
+		destPath := filepath.Join(blueprintDir, targetRel)
+		os.MkdirAll(filepath.Dir(destPath), 0755)
+		_ = CopyFile(absPath, destPath)
 	}
 
 	if !isContainer {

@@ -18,7 +18,6 @@ type DatasetManager struct {
 
 // NewDatasetManager creates a new DatasetManager.
 func NewDatasetManager(runtimeDir, buildID, runtimeRootName string) *DatasetManager {
-	// Detect ZFS pool if requested via env, else empty for standard directories
 	zpool := os.Getenv("SST_ZPOOL")
 	return &DatasetManager{
 		Zpool:           zpool,
@@ -28,49 +27,41 @@ func NewDatasetManager(runtimeDir, buildID, runtimeRootName string) *DatasetMana
 	}
 }
 
-// datasetPath returns the fully qualified ZFS dataset path.
 func (d *DatasetManager) datasetPath(subPath string) string {
 	if d.Zpool == "" {
-		return "" // No ZFS available, use physical directories only
+		return ""
 	}
-	// Avoid trailing slash if subPath is empty
 	if subPath == "" {
 		return fmt.Sprintf("%s/builds/%s", d.Zpool, d.BuildID)
 	}
 	return fmt.Sprintf("%s/builds/%s/%s", d.Zpool, d.BuildID, subPath)
 }
 
-// mountPath returns the physical host directory.
-func (d *DatasetManager) mountPath(subPath string) string {
+// MountPath returns the physical host directory.
+func (d *DatasetManager) MountPath(subPath string) string {
 	return filepath.Join(d.BasePoint, "builds", d.BuildID, subPath)
 }
 
-// create idempotently provisions the path, trying ZFS first.
 func (d *DatasetManager) create(subPath string) error {
-	physicalPath := d.mountPath(subPath)
+	physicalPath := d.MountPath(subPath)
 
 	if dsPath := d.datasetPath(subPath); dsPath != "" {
 		cmd := exec.Command("zfs", "create", "-p", dsPath)
 		if err := cmd.Run(); err != nil {
-			// Ignore if it already exists. ProcessState checks ensure we don't panic on missing zfs binary
 			if !strings.Contains(err.Error(), "already exists") && cmd.ProcessState != nil && cmd.ProcessState.ExitCode() != 1 {
-				// Fallthrough to standard mkdir
+				// Fallthrough
 			}
 		}
 	}
 
-	// Always ensure physical directory exists (serves as mountpoint or fallback)
 	return os.MkdirAll(physicalPath, 0755)
 }
 
-// InitBuildEnvironment provisions the base dataset and the persistent caches.
 func (d *DatasetManager) InitBuildEnvironment() error {
-	// 1. The Base Build Root
 	if err := d.create(""); err != nil {
 		return err
 	}
 
-	// 2. The Cache Topologies (Persistent across resumes)
 	caches := []string{"cache/apt", "cache/apk", "cache/get", "cache/from"}
 	for _, cache := range caches {
 		if err := d.create(cache); err != nil {
@@ -78,7 +69,6 @@ func (d *DatasetManager) InitBuildEnvironment() error {
 		}
 	}
 
-	// 3. The Stage & Target Topologies (Ephemeral, wiped on clean start)
 	if err := d.create("as-roots"); err != nil {
 		return err
 	}
@@ -89,58 +79,45 @@ func (d *DatasetManager) InitBuildEnvironment() error {
 	return nil
 }
 
-// CreateAsRoot provisions a dedicated dataset for a named build stage.
 func (d *DatasetManager) CreateAsRoot(stageName string) (string, error) {
 	subPath := fmt.Sprintf("as-roots/%s", stageName)
 	if err := d.create(subPath); err != nil {
 		return "", fmt.Errorf("failed to create AS dataset for %s: %w", stageName, err)
 	}
-	return d.mountPath(subPath), nil
+	return d.MountPath(subPath), nil
 }
 
-// RuntimeRoot returns the primary output root dataset.
 func (d *DatasetManager) RuntimeRoot() string {
-	return d.mountPath(d.RuntimeRootName)
+	return d.MountPath(d.RuntimeRootName)
 }
 
-// CacheDir returns the path for a specific persistent cache.
 func (d *DatasetManager) CacheDir(cacheName string) string {
-	return d.mountPath(fmt.Sprintf("cache/%s", cacheName))
+	return d.MountPath(fmt.Sprintf("cache/%s", cacheName))
 }
 
-// Destroy completely annihilates the build dataset and its physical directory.
-// It uses a recursive ZFS destroy to cleanly unmount and wipe the entire tree.
 func (d *DatasetManager) Destroy() error {
-	mountPath := d.mountPath("")
+	mountPath := d.MountPath("")
 
-	// SAFETY FIRST: Sever any dangling bind mounts (like /dev/pts or /sys)
-	// to prevent os.RemoveAll from traversing into and destroying the host OS!
 	_ = exec.Command("umount", "-R", mountPath).Run()
 
-	// 1. Annihilate the ZFS datasets (if ZFS is active)
 	if dsPath := d.datasetPath(""); dsPath != "" {
 		cmd := exec.Command("zfs", "destroy", "-r", dsPath)
-		_ = cmd.Run() // We ignore the error because the dataset might not exist yet
+		_ = cmd.Run() 
 	}
 
-	// 2. Annihilate the physical host directory safely
 	return os.RemoveAll(mountPath)
 }
 
-// ClearCache destroys and recreates only the persistent cache datasets.
 func (d *DatasetManager) ClearCache() error {
 	caches := []string{"cache/apt", "cache/apk", "cache/get", "cache/from", "cache/dnf"}
 	for _, cache := range caches {
-		// 1. Annihilate the ZFS dataset (if ZFS is active)
 		if dsPath := d.datasetPath(cache); dsPath != "" {
 			cmd := exec.Command("zfs", "destroy", "-r", dsPath)
-			_ = cmd.Run() // Ignore error if it doesn't exist
+			_ = cmd.Run()
 		}
 
-		// 2. Annihilate the physical host directory
-		_ = os.RemoveAll(d.mountPath(cache))
+		_ = os.RemoveAll(d.MountPath(cache))
 
-		// 3. Recreate it fresh
 		if err := d.create(cache); err != nil {
 			return fmt.Errorf("failed to recreate cache %s: %w", cache, err)
 		}
@@ -148,21 +125,18 @@ func (d *DatasetManager) ClearCache() error {
 	return nil
 }
 
-// PromoteTo permanently detaches a dataset from the build hierarchy and moves it to a long-term catalog location.
 func (d *DatasetManager) PromoteTo(subPath, destCategory, destName string) error {
-	srcPath := d.mountPath(subPath)
+	srcPath := d.MountPath(subPath)
 	dstPath := filepath.Join(d.BasePoint, destCategory, destName)
 
 	if d.Zpool != "" {
 		srcDS := d.datasetPath(subPath)
 		dstDS := fmt.Sprintf("%s/%s/%s", d.Zpool, destCategory, destName)
 
-		// Ensure parent dataset exists
 		_ = exec.Command("zfs", "create", "-p", filepath.Dir(dstDS)).Run()
 		if err := exec.Command("zfs", "rename", srcDS, dstDS).Run(); err != nil {
 			return fmt.Errorf("zfs rename failed: %w", err)
 		}
-		// Point the dataset to its new permanent physical location
 		_ = exec.Command("zfs", "set", "mountpoint="+dstPath, dstDS).Run()
 		return nil
 	}
@@ -171,16 +145,13 @@ func (d *DatasetManager) PromoteTo(subPath, destCategory, destName string) error
 	return os.Rename(srcPath, dstPath)
 }
 
-// SnapshotDataset creates a ZFS snapshot of the specified sub-dataset.
-// The tag should typically be something like "step_02_hash_abcdef".
 func (d *DatasetManager) SnapshotDataset(subPath, tag string) error {
 	if d.Zpool == "" {
-		return nil // Non-ZFS environments implicitly bypass snapshotting
+		return nil
 	}
 	dsPath := d.datasetPath(subPath)
 	cmd := exec.Command("zfs", "snapshot", fmt.Sprintf("%s@%s", dsPath, tag))
 	if out, err := cmd.CombinedOutput(); err != nil {
-		// It is safe to ignore if the snapshot already exists, though our hashes should prevent this.
 		if !strings.Contains(string(out), "already exists") {
 			return fmt.Errorf("zfs snapshot failed: %w, output: %s", err, string(out))
 		}
@@ -188,14 +159,11 @@ func (d *DatasetManager) SnapshotDataset(subPath, tag string) error {
 	return nil
 }
 
-// RollbackDataset rolls back the specified sub-dataset to a previously created ZFS snapshot.
 func (d *DatasetManager) RollbackDataset(subPath, tag string) error {
 	if d.Zpool == "" {
-		return nil // Non-ZFS environments cannot rollback.
+		return nil
 	}
 	dsPath := d.datasetPath(subPath)
-	// -r: recursively destroy any snapshots more recent than the one specified
-	// -f: force unmount of any clone file systems that are to be destroyed
 	cmd := exec.Command("zfs", "rollback", "-r", "-f", fmt.Sprintf("%s@%s", dsPath, tag))
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("zfs rollback failed: %w, output: %s", err, string(out))

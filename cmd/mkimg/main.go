@@ -36,7 +36,6 @@ func delegateToLinuxVM() {
 
 	if len(os.Args) > 1 {
 		arg := os.Args[1]
-		// NEW: Catch completion AND host-native management commands!
 		if arg == "help" || arg == "--help" || arg == "completion" || strings.HasPrefix(arg, "__complete") ||
 			arg == "mv-image" || arg == "mv-instance" || arg == "rm-image" || arg == "rm-instance" || arg == "catalog" {
 			return
@@ -44,21 +43,12 @@ func delegateToLinuxVM() {
 	}
 
 	hostContextDir := "."
-	hostDockerfile := ""
-	hostFileArgIndex := -1
 	instanceName := ""
 
 	if len(os.Args) >= 3 {
 		for i := len(os.Args) - 1; i >= 2; i-- {
 			if info, err := os.Stat(os.Args[i]); err == nil && info.IsDir() {
 				hostContextDir = os.Args[i]
-				break
-			}
-		}
-		for i := 2; i < len(os.Args); i++ {
-			if (os.Args[i] == "-f" || os.Args[i] == "--file") && i+1 < len(os.Args) {
-				hostDockerfile = os.Args[i+1]
-				hostFileArgIndex = i + 1
 				break
 			}
 		}
@@ -79,29 +69,6 @@ func delegateToLinuxVM() {
 		}
 	}
 
-	if os.Args[1] == "build" && hostDockerfile != "" {
-		hostDest := filepath.Join(hostContextDir, filepath.Base(hostDockerfile))
-		hostAbsDoc, _ := filepath.Abs(hostDockerfile)
-		hostAbsDest, _ := filepath.Abs(hostDest)
-
-		if hostAbsDoc != hostAbsDest {
-			destStat, err := os.Stat(hostAbsDest)
-			if err == nil {
-				docStat, _ := os.Stat(hostAbsDoc)
-				if !os.SameFile(docStat, destStat) {
-					fmt.Fprintf(os.Stderr, "error: '%s' already exists in context dir and is a different file. Aborting to prevent overwrite.\n", filepath.Base(hostAbsDest))
-					os.Exit(1)
-				}
-			} else {
-				if err := os.Link(hostAbsDoc, hostAbsDest); err != nil {
-					fmt.Fprintf(os.Stderr, "error creating hardlink on host: %v\n", err)
-					os.Exit(1)
-				}
-			}
-			os.Args[hostFileArgIndex] = filepath.Base(hostDockerfile)
-		}
-	}
-
 	fmt.Printf("--> macOS detected. Delegating command to Linux VM '%s'...\n", vmBuildHost)
 
 	hostRunctlPath, err := exec.LookPath("runctl")
@@ -116,7 +83,6 @@ func delegateToLinuxVM() {
 	}
 	
 	vmCmd = append(vmCmd, "sudo")
-	// Force pretty-printing over the non-TTY SSH connection
 	logFmt := os.Getenv("SST_LOG_FORMAT")
 	if logFmt == "" {
 		logFmt = "text"
@@ -138,7 +104,6 @@ func delegateToLinuxVM() {
 		os.Exit(1)
 	}
 
-	// 4. Host Post-Processing (Purification, Native CIDATA, & Catalog Symlink)
 	if os.Args[1] == "build" || os.Args[1] == "instance" {
 		if err := ProcessPurificationQueue(hostContextDir); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: host purification failed: %v\n", err)
@@ -149,7 +114,6 @@ func delegateToLinuxVM() {
 		hostAbsContext, _ := filepath.Abs(hostContextDir)
 		targetDir := filepath.Join(hostAbsContext, "instances", instanceName)
 
-		// Natively generate CIDATA on the Mac using the host's actual username
 		inst := &runctlpb.Instance{}
 		yo := &sst.YamlObject{
 			Path:   filepath.Join(targetDir, "instance.yaml"),
@@ -299,7 +263,6 @@ func instanceCmd() *cobra.Command {
 		Use:   "instance <image> <name>",
 		Short: "Create an instance directory from an image",
 		Args:  cobra.ExactArgs(2),
-		// NEW: Auto-complete the <image> argument using the global registry
 		ValidArgsFunction: func(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 			if len(args) != 0 {
 				return nil, cobra.ShellCompDirectiveNoFileComp
@@ -324,7 +287,6 @@ func instanceCmd() *cobra.Command {
 
 			baseImage := args[0]
 
-			// NEW: Read the authoritative canonical name directly from the blueprint if it exists locally
 			dockerfilePath := baseImage
 			if !strings.HasSuffix(dockerfilePath, ".dockerfile") {
 				dockerfilePath += ".dockerfile"

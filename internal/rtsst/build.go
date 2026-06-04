@@ -34,6 +34,7 @@ type BuildApp struct {
 	Name         string
 	Emits        []string
 	Instructions []Instruction
+	IncludedFiles map[string]string // NEW: Tracks relative include path to resolved absolute path
 
 	BuildArgs map[string]string
 	Args      map[string]string
@@ -60,21 +61,22 @@ type BuildApp struct {
 
 func NewBuilder(log *sst.Logx, files sst.Files, dockerfile, contextDir, buildDir, runtimeDir string) *BuildApp {
 	return &BuildApp{
-		Log:          log.Subsystem("rtsst-builder"),
-		Files:        files,
-		ContextDir:   contextDir,
-		Dockerfile:   dockerfile,
-		BuildDir:     buildDir,
-		RuntimeDir:   runtimeDir,
-		BuildArgs:    make(map[string]string),
-		Args:         make(map[string]string),
-		Env:          make(map[string]string),
-		Labels:       make(map[string]string),
-		Volumes:      make(map[string]struct{}),
-		ExposedPorts: make(map[string]struct{}),
-		StageMounts:  make(map[string]string),
-		Workdir:      "/",
-		User:         "root",
+		Log:           log.Subsystem("rtsst-builder"),
+		Files:         files,
+		ContextDir:    contextDir,
+		Dockerfile:    dockerfile,
+		BuildDir:      buildDir,
+		RuntimeDir:    runtimeDir,
+		IncludedFiles: make(map[string]string),
+		BuildArgs:     make(map[string]string),
+		Args:          make(map[string]string),
+		Env:           make(map[string]string),
+		Labels:        make(map[string]string),
+		Volumes:       make(map[string]struct{}),
+		ExposedPorts:  make(map[string]struct{}),
+		StageMounts:   make(map[string]string),
+		Workdir:       "/",
+		User:          "root",
 	}
 }
 
@@ -215,67 +217,27 @@ func (b *BuildApp) resolveIncludePath(currentFile, target string) (string, error
 		targetWithExt += ".dockerfile"
 	}
 
+	// 1. Check local context directory
 	localPathExact := filepath.Join(b.ContextDir, target)
 	localPathExt := filepath.Join(b.ContextDir, targetWithExt)
 
-	var foundLocal string
-	var localInfo os.FileInfo
-	if info, err := os.Stat(localPathExact); err == nil {
-		foundLocal = localPathExact
-		localInfo = info
-	} else if info, err := os.Stat(localPathExt); err == nil {
-		foundLocal = localPathExt
-		localInfo = info
+	if _, err := os.Stat(localPathExact); err == nil {
+		return localPathExact, nil
+	}
+	if _, err := os.Stat(localPathExt); err == nil {
+		return localPathExt, nil
 	}
 
+	// 2. Check system templates directory
 	stdDir := "/usr/local/share/mkimg/templates"
 	stdPathExact := filepath.Join(stdDir, target)
 	stdPathExt := filepath.Join(stdDir, targetWithExt)
 
-	var foundStd string
-	var stdInfo os.FileInfo
-	if info, err := os.Stat(stdPathExact); err == nil {
-		foundStd = stdPathExact
-		stdInfo = info
-	} else if info, err := os.Stat(stdPathExt); err == nil {
-		foundStd = stdPathExt
-		stdInfo = info
+	if _, err := os.Stat(stdPathExact); err == nil {
+		return stdPathExact, nil
 	}
-
-	if foundLocal != "" && foundStd != "" {
-		if stdInfo.ModTime().After(localInfo.ModTime()) {
-			if b.Force {
-				b.Log.Info(context.Background(), "overwriting stale local template with newer system template (--force)", "file", foundLocal)
-				if err := CopyFile(foundStd, foundLocal); err != nil {
-					return "", fmt.Errorf("failed to update stale template: %w", err)
-				}
-			} else {
-				b.Log.Warn(context.Background(), "local template is older than the system template. Use --force to update it.", "file", foundLocal)
-			}
-		}
-		return foundLocal, nil
-	}
-
-	if foundLocal != "" {
-		return foundLocal, nil
-	}
-
-	if foundStd != "" {
-		frozenPath := localPathExt
-		if filepath.Ext(foundStd) != ".dockerfile" {
-			frozenPath = localPathExact
-		}
-
-		if err := os.MkdirAll(filepath.Dir(frozenPath), 0755); err != nil {
-			return "", fmt.Errorf("failed to create directory for frozen template: %w", err)
-		}
-
-		if err := CopyFile(foundStd, frozenPath); err != nil {
-			return "", fmt.Errorf("failed to freeze system template to workspace: %w", err)
-		}
-
-		b.Log.Info(context.Background(), "froze system template into local workspace", "src", foundStd, "dst", frozenPath)
-		return frozenPath, nil
+	if _, err := os.Stat(stdPathExt); err == nil {
+		return stdPathExt, nil
 	}
 
 	return "", fmt.Errorf("include file not found locally or in system templates: %s", target)
@@ -376,6 +338,7 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 				if err != nil {
 					return err
 				}
+				b.IncludedFiles[args] = resolvedPath
 				b.Log.Info(ctx, "parsing included file", "file", resolvedPath)
 				if err := b.parseFile(ctx, resolvedPath, visited); err != nil {
 					return err
@@ -388,11 +351,10 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 				formats := strings.Split(args, ",")
 				for _, f := range formats {
 					format := strings.TrimSpace(f)
-					resolvedPath, err := b.resolveIncludePath(absPath, "emit/"+format)
-					if err != nil {
-						resolvedPath, err = b.resolveIncludePath(absPath, "emit/"+format)
-					}
+					relPath := "emit/" + format
+					resolvedPath, err := b.resolveIncludePath(absPath, relPath)
 					if err == nil {
+						b.IncludedFiles[relPath] = resolvedPath
 						b.Log.Info(ctx, "desugaring EMIT to INCLUDE", "format", format, "file", resolvedPath)
 						if err := b.parseFile(ctx, resolvedPath, visited); err != nil {
 							return err
@@ -425,14 +387,15 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 				b.Instructions = append(b.Instructions, Instruction{Type: "ARG", Args: "FROM_SOURCE=" + source})
 				b.Instructions = append(b.Instructions, Instruction{Type: "ARG", Args: "TARGET_STAGE=" + asName})
 
-				// Completely bypass OCI resolution for scratch images
 				if source == "scratch" {
 					continue
 				}
 
-				resolvedPath, err := b.resolveIncludePath(absPath, "pull/oci")
+				relPath := "pull/oci"
+				resolvedPath, err := b.resolveIncludePath(absPath, relPath)
 
 				if err == nil {
+					b.IncludedFiles[relPath] = resolvedPath
 					b.Log.Info(ctx, "desugaring FROM to INCLUDE", "file", resolvedPath)
 					if err := b.parseFile(ctx, resolvedPath, visited); err != nil {
 						return err
@@ -457,9 +420,11 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 				b.Instructions = append(b.Instructions, Instruction{Type: "ARG", Args: "GET_DEST=" + strings.Join(parts[1:], " ")})
 				b.Instructions = append(b.Instructions, Instruction{Type: "ARG", Args: "TARGET_STAGE=" + targetLoc})
 
-				resolvedPath, err := b.resolveIncludePath(absPath, "pull/get")
+				relPath := "pull/get"
+				resolvedPath, err := b.resolveIncludePath(absPath, relPath)
 
 				if err == nil {
+					b.IncludedFiles[relPath] = resolvedPath
 					b.Log.Info(ctx, "desugaring GET to INCLUDE", "file", resolvedPath)
 					if err := b.parseFile(ctx, resolvedPath, visited); err != nil {
 						return err
@@ -565,7 +530,6 @@ func (b *BuildApp) PreProcess(ctx context.Context) error {
 		return fmt.Errorf("no FROM instruction found in Dockerfile")
 	}
 
-	// Compute hashes to prepare for resumability checks
 	b.ComputeHashes()
 
 	return nil
@@ -575,7 +539,6 @@ func (b *BuildApp) ComputeHashes() {
 	h := sha256.New()
 	h.Write([]byte(b.BaseImage))
 
-	// Ensure build arguments hash deterministically
 	var keys []string
 	for k := range b.BuildArgs {
 		keys = append(keys, k)

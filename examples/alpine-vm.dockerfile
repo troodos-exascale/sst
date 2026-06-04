@@ -1,5 +1,5 @@
-# CANONICAL_NAME: alpine-3.22.3-alpine-vm
-# LAST_BUILD: 20260322-103520
+# CANONICAL_NAME: alpine-3.22.4-alpine-vm
+# LAST_BUILD: 20260604-070740
 FROM alpine:3.22
 NAME: alpine-vm
 
