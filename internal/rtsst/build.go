@@ -3,21 +3,26 @@ package rtsst
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/swiss-software-tool/sst/internal/sst"
 )
 
 type Instruction struct {
+	Index      int    // Indicates sequential execution order
 	Type       string
 	Args       string
 	Location   string
 	Context    string
 	Conditions []string
+	Hash       string // The cascading cryptographic signature of this step and its ancestors
 }
 
 type BuildApp struct {
@@ -300,14 +305,13 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 		return fmt.Errorf("circular INCLUDE detected: %s", absPath)
 	}
 	visited[absPath] = true
-	defer delete(visited, absPath) // <-- ADD THIS LINE
+	defer delete(visited, absPath)
 
 	f, err := os.Open(absPath)
 	if err != nil {
 		return fmt.Errorf("failed to open Dockerfile %s: %w", absPath, err)
 	}
 	defer f.Close()
-    
 
 	scanner := bufio.NewScanner(f)
 	var currentBlock []string
@@ -421,7 +425,7 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 				b.Instructions = append(b.Instructions, Instruction{Type: "ARG", Args: "FROM_SOURCE=" + source})
 				b.Instructions = append(b.Instructions, Instruction{Type: "ARG", Args: "TARGET_STAGE=" + asName})
 
-				// NEW: Completely bypass OCI resolution for scratch images
+				// Completely bypass OCI resolution for scratch images
 				if source == "scratch" {
 					continue
 				}
@@ -436,7 +440,7 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 				}
 				continue
 			}
-			
+
 			if baseType == "GET" {
 				parts := strings.Fields(args)
 				if len(parts) < 2 {
@@ -561,7 +565,42 @@ func (b *BuildApp) PreProcess(ctx context.Context) error {
 		return fmt.Errorf("no FROM instruction found in Dockerfile")
 	}
 
+	// Compute hashes to prepare for resumability checks
+	b.ComputeHashes()
+
 	return nil
+}
+
+func (b *BuildApp) ComputeHashes() {
+	h := sha256.New()
+	h.Write([]byte(b.BaseImage))
+
+	// Ensure build arguments hash deterministically
+	var keys []string
+	for k := range b.BuildArgs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		h.Write([]byte(k + "=" + b.BuildArgs[k]))
+	}
+
+	prevHash := hex.EncodeToString(h.Sum(nil))
+
+	for i := range b.Instructions {
+		b.Instructions[i].Index = i
+
+		h := sha256.New()
+		h.Write([]byte(prevHash))
+		h.Write([]byte(b.Instructions[i].Type))
+		h.Write([]byte(b.Instructions[i].Args))
+		h.Write([]byte(b.Instructions[i].Context))
+		h.Write([]byte(b.Instructions[i].Location))
+		h.Write([]byte(strings.Join(b.Instructions[i].Conditions, ",")))
+
+		prevHash = hex.EncodeToString(h.Sum(nil))
+		b.Instructions[i].Hash = prevHash
+	}
 }
 
 func (b *BuildApp) Substitute(val string) string {

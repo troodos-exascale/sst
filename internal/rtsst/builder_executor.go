@@ -3,6 +3,7 @@ package rtsst
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,77 @@ import (
 	mkimagepb "github.com/swiss-software-tool/sst/proto/yaml/mkimage/v1"
 	runctlpb "github.com/swiss-software-tool/sst/proto/yaml/runctl/v1"
 )
+
+// --- State Management ---
+
+type BuildStepState struct {
+	Hash    string `json:"hash"`
+	Status  string `json:"status"`
+	LogPath string `json:"log_path,omitempty"`
+}
+
+type BuildState struct {
+	LastSuccessfulStep int                    `json:"last_successful_step"`
+	Status             string                 `json:"status"`
+	FailedAtStep       int                    `json:"failed_at_step,omitempty"`
+	Steps              map[int]BuildStepState `json:"steps"`
+}
+
+func (b *BuildApp) LoadState() (*BuildState, error) {
+	if b.DatasetMgr == nil {
+		return &BuildState{LastSuccessfulStep: -1, Status: "new", Steps: make(map[int]BuildStepState)}, nil
+	}
+	path := filepath.Join(b.DatasetMgr.mountPath(""), "state.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return &BuildState{LastSuccessfulStep: -1, Status: "new", Steps: make(map[int]BuildStepState)}, nil
+	}
+	var s BuildState
+	if err := json.Unmarshal(data, &s); err != nil {
+		return &BuildState{LastSuccessfulStep: -1, Status: "new", Steps: make(map[int]BuildStepState)}, nil
+	}
+	if s.Steps == nil {
+		s.Steps = make(map[int]BuildStepState)
+	}
+	return &s, nil
+}
+
+func (b *BuildApp) SaveState(s *BuildState) error {
+	if b.DatasetMgr == nil {
+		return nil // Safe mock isolation for unit tests
+	}
+	path := filepath.Join(b.DatasetMgr.mountPath(""), "state.json")
+	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0644)
+}
+
+func (b *BuildApp) SnapshotActiveDatasets(ctx context.Context, tag string) {
+	if b.DatasetMgr == nil {
+		return
+	}
+	for stage := range b.StageMounts {
+		err := b.DatasetMgr.SnapshotDataset("as-roots/"+stage, tag)
+		if err != nil {
+			b.Log.Warn(ctx, "failed to snapshot dataset", "stage", stage, "tag", tag, "error", err)
+		}
+	}
+}
+
+// wrapWithTee intercepts the shell command string and seamlessly pipes it 
+// into a log file while preserving exact command-line arguments and pipe exit codes.
+func wrapWithTee(logFile string, cmd string, args ...string) (string, []string, []string) {
+	if logFile == "" {
+		return cmd, args, nil
+	}
+	bashArgs := []string{"-c", `set -o pipefail; "$@" 2>&1 | tee -a "$LOGFILE"`, "_", cmd}
+	bashArgs = append(bashArgs, args...)
+	return "bash", bashArgs, []string{"LOGFILE=" + logFile}
+}
+
+// --- Execution Engine ---
 
 func (b *BuildApp) InitEnvironment(ctx context.Context) error {
 	absContext, err := filepath.Abs(b.ContextDir)
@@ -109,6 +181,23 @@ func (b *BuildApp) execProvisionDataset(ctx context.Context, args string) error 
 }
 
 func (b *BuildApp) ExecuteSingleInstruction(ctx context.Context, inst Instruction) error {
+	var bState *BuildState
+	var logsDir, logFile, metaFile string
+
+	if b.DatasetMgr != nil {
+		bState, _ = b.LoadState()
+		logsDir = filepath.Join(b.DatasetMgr.mountPath(""), "logs")
+		os.MkdirAll(logsDir, 0755)
+
+		hashStub := ""
+		if len(inst.Hash) >= 8 {
+			hashStub = inst.Hash[:8]
+		}
+		
+		logFile = filepath.Join(logsDir, fmt.Sprintf("%02d_%s_%s.log", inst.Index, hashStub, strings.ToLower(inst.Type)))
+		metaFile = filepath.Join(logsDir, fmt.Sprintf("%02d_%s_meta.json", inst.Index, hashStub))
+	}
+
 	var args string
 	if inst.Type == "RUN" {
 		args = inst.Args
@@ -122,6 +211,8 @@ func (b *BuildApp) ExecuteSingleInstruction(ctx context.Context, inst Instructio
 		cleanArgs = strings.TrimSpace(cleanArgs)
 	}
 
+	var execErr error
+
 	switch inst.Type {
 	case "ARG":
 		parts := strings.SplitN(cleanArgs, "=", 2)
@@ -130,7 +221,6 @@ func (b *BuildApp) ExecuteSingleInstruction(ctx context.Context, inst Instructio
 		} else if val, ok := b.BuildArgs[parts[0]]; ok {
 			b.Args[parts[0]] = val
 		}
-		return nil
 	case "ENV":
 		parts := strings.SplitN(cleanArgs, "=", 2)
 		if len(parts) == 2 {
@@ -141,25 +231,19 @@ func (b *BuildApp) ExecuteSingleInstruction(ctx context.Context, inst Instructio
 				b.Env[parts[0]] = parts[1]
 			}
 		}
-		return nil
 	case "WORKDIR":
 		b.Workdir = b.Substitute(cleanArgs)
-		return nil
 	case "USER":
 		b.User = b.Substitute(cleanArgs)
-		return nil
 	case "CMD":
 		b.Cmd = b.Substitute(cleanArgs)
-		return nil
 	case "ENTRYPOINT":
 		b.EntryPoint = b.Substitute(cleanArgs)
-		return nil
 	case "LABEL":
 		parts := strings.SplitN(cleanArgs, "=", 2)
 		if len(parts) == 2 {
 			b.Labels[strings.Trim(parts[0], `"`)] = strings.Trim(parts[1], `"`)
 		}
-		return nil
 	case "EXPOSE":
 		for _, port := range strings.Fields(cleanArgs) {
 			if !strings.Contains(port, "/") {
@@ -167,51 +251,94 @@ func (b *BuildApp) ExecuteSingleInstruction(ctx context.Context, inst Instructio
 			}
 			b.ExposedPorts[port] = struct{}{}
 		}
-		return nil
 	case "VOLUME":
 		clean := strings.TrimPrefix(strings.TrimSuffix(cleanArgs, "]"), "[")
 		for _, vol := range strings.Split(clean, ",") {
 			b.Volumes[strings.Trim(strings.TrimSpace(vol), `"`)] = struct{}{}
 		}
-		return nil
 	case "FROM", "NAME", "VMOUT", "EMIT", "COPY", "ADD":
-		return nil
+		// Handled structurally during PreProcess
 	case "RUN":
 		if !b.shouldExecute(inst.Conditions) {
 			b.Log.Info(ctx, "skipping instruction (condition mismatch)", "conditions", inst.Conditions, "emits", b.Emits)
-			return nil
+		} else {
+			if strings.HasPrefix(inst.Args, "sys.provision_dataset") {
+				execErr = b.execProvisionDataset(ctx, inst.Args)
+			} else {
+				resolvedLoc := b.Substitute(inst.Location)
+				targetDir := b.RootDir
+				activeRootfs := b.RootDir
+
+				if resolvedLoc == "base" {
+					targetDir = filepath.Dir(b.RootDir)
+				} else if resolvedLoc == "boot" {
+					targetDir = filepath.Join(filepath.Dir(b.RootDir), "boot")
+				} else if stagePath, ok := b.StageMounts[resolvedLoc]; ok {
+					targetDir = stagePath
+					activeRootfs = stagePath
+				} else if resolvedLoc != "root" && resolvedLoc != "host" && resolvedLoc != "chroot" && resolvedLoc != "" {
+					if b.DatasetMgr != nil {
+						targetDir = filepath.Join(b.DatasetMgr.mountPath(""), resolvedLoc)
+					}
+					os.MkdirAll(targetDir, 0755)
+				}
+
+				b.Log.Info(ctx, "evaluating RUN directive", "context", inst.Context, "dir", targetDir)
+
+				if inst.Context == "host" {
+					execErr = b.execHostRun(ctx, args, targetDir, activeRootfs, logFile)
+				} else {
+					execErr = b.execChrootRun(ctx, args, targetDir, activeRootfs, logFile)
+				}
+			}
 		}
-
-		if strings.HasPrefix(inst.Args, "sys.provision_dataset") {
-			return b.execProvisionDataset(ctx, inst.Args)
-		}
-
-		resolvedLoc := b.Substitute(inst.Location)
-
-		targetDir := b.RootDir
-		activeRootfs := b.RootDir
-
-		if resolvedLoc == "base" {
-			targetDir = filepath.Dir(b.RootDir)
-		} else if resolvedLoc == "boot" {
-			targetDir = filepath.Join(filepath.Dir(b.RootDir), "boot")
-		} else if stagePath, ok := b.StageMounts[resolvedLoc]; ok {
-			targetDir = stagePath
-			activeRootfs = stagePath
-		} else if resolvedLoc != "root" && resolvedLoc != "host" && resolvedLoc != "chroot" && resolvedLoc != "" {
-			targetDir = filepath.Join(b.DatasetMgr.mountPath(""), resolvedLoc)
-			os.MkdirAll(targetDir, 0755)
-		}
-
-		b.Log.Info(ctx, "evaluating RUN directive", "context", inst.Context, "dir", targetDir)
-
-		if inst.Context == "host" {
-			return b.execHostRun(ctx, args, targetDir, activeRootfs)
-		}
-		return b.execChrootRun(ctx, args, targetDir, activeRootfs)
 	default:
-		return fmt.Errorf("unknown instruction type: %s", inst.Type)
+		execErr = fmt.Errorf("unknown instruction type: %s", inst.Type)
 	}
+
+	// Update State & Snapshot ONLY if managed by DatasetMgr (insulating tests)
+	if b.DatasetMgr != nil && bState != nil {
+		status := "OK"
+		if execErr != nil {
+			status = "FAIL"
+		}
+
+		bState.Steps[inst.Index] = BuildStepState{
+			Hash:    inst.Hash,
+			Status:  status,
+			LogPath: logFile,
+		}
+
+		if execErr == nil {
+			bState.LastSuccessfulStep = inst.Index
+			bState.Status = "building"
+		} else {
+			bState.Status = "failed"
+			bState.FailedAtStep = inst.Index
+		}
+
+		_ = b.SaveState(bState)
+
+		// Create metadata log
+		metaData := map[string]interface{}{
+			"index":  inst.Index,
+			"type":   inst.Type,
+			"args":   inst.Args,
+			"hash":   inst.Hash,
+			"status": status,
+		}
+		if metaBytes, err := json.MarshalIndent(metaData, "", "  "); err == nil {
+			_ = os.WriteFile(metaFile, metaBytes, 0644)
+		}
+
+		// Snapshot active datasets upon successful execution
+		if execErr == nil {
+			snapshotTag := fmt.Sprintf("step_%02d_hash_%s", inst.Index, inst.Hash[:8])
+			b.SnapshotActiveDatasets(ctx, snapshotTag)
+		}
+	}
+
+	return execErr
 }
 
 func (b *BuildApp) buildEnvironmentMap(activeRootfs string) []string {
@@ -228,11 +355,13 @@ func (b *BuildApp) buildEnvironmentMap(activeRootfs string) []string {
 	envMap["NAME"] = b.Name
 	envMap["OUTDIR"] = filepath.Join(b.RuntimeDir, "images", b.Name)
 
-	envMap["SST_CACHE_APT"] = b.DatasetMgr.CacheDir("apt")
-	envMap["SST_CACHE_APK"] = b.DatasetMgr.CacheDir("apk")
-	envMap["SST_CACHE_DNF"] = b.DatasetMgr.CacheDir("dnf")
-	envMap["SST_CACHE_GET"] = b.DatasetMgr.CacheDir("get")
-	envMap["SST_CACHE_FROM"] = b.DatasetMgr.CacheDir("from")
+	if b.DatasetMgr != nil {
+		envMap["SST_CACHE_APT"] = b.DatasetMgr.CacheDir("apt")
+		envMap["SST_CACHE_APK"] = b.DatasetMgr.CacheDir("apk")
+		envMap["SST_CACHE_DNF"] = b.DatasetMgr.CacheDir("dnf")
+		envMap["SST_CACHE_GET"] = b.DatasetMgr.CacheDir("get")
+		envMap["SST_CACHE_FROM"] = b.DatasetMgr.CacheDir("from")
+	}
 
 	for k, v := range b.Env {
 		envMap[k] = v
@@ -251,16 +380,19 @@ func (b *BuildApp) buildEnvironmentMap(activeRootfs string) []string {
 	return envs
 }
 
-func (b *BuildApp) execHostRun(ctx context.Context, cmdStr string, targetDir string, activeRootfs string) error {
+func (b *BuildApp) execHostRun(ctx context.Context, cmdStr string, targetDir string, activeRootfs string, logFile string) error {
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		return err
 	}
 
+	cmdToRun, argsToRun, extraEnv := wrapWithTee(logFile, "/bin/sh", "-c", cmdStr)
+	
 	env := b.buildEnvironmentMap(activeRootfs)
+	env = append(env, extraEnv...)
 
 	req := sst.ExecRequest{
-		Cmd:  "/bin/sh",
-		Args: []string{"-c", cmdStr},
+		Cmd:  cmdToRun,
+		Args: argsToRun,
 		Dir:  filepath.Dir(b.Dockerfile),
 		Env:  env,
 		Mode: sst.ExecForeground,
@@ -272,7 +404,7 @@ func (b *BuildApp) execHostRun(ctx context.Context, cmdStr string, targetDir str
 	return nil
 }
 
-func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir string, activeRootfs string) error {
+func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir string, activeRootfs string, logFile string) error {
 	mounts := []string{"/dev", "/dev/pts", "/proc", "/sys"}
 	for _, m := range mounts {
 		target := filepath.Join(targetDir, m)
@@ -287,15 +419,17 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 	}
 
 	var activeCacheMounts []string
-	for name, guestPath := range cachePaths {
-		hostDir := b.DatasetMgr.CacheDir(name)
-		os.MkdirAll(hostDir, 0755)
+	if b.DatasetMgr != nil {
+		for name, guestPath := range cachePaths {
+			hostDir := b.DatasetMgr.CacheDir(name)
+			os.MkdirAll(hostDir, 0755)
 
-		target := filepath.Join(targetDir, guestPath)
-		os.MkdirAll(target, 0755)
+			target := filepath.Join(targetDir, guestPath)
+			os.MkdirAll(target, 0755)
 
-		if _, err := sst.ExecShell(ctx, b.Log, "mount", "--bind", hostDir, target); err == nil {
-			activeCacheMounts = append(activeCacheMounts, target)
+			if _, err := sst.ExecShell(ctx, b.Log, "mount", "--bind", hostDir, target); err == nil {
+				activeCacheMounts = append(activeCacheMounts, target)
+			}
 		}
 	}
 
@@ -338,6 +472,8 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 		chrootCmd = fmt.Sprintf("/%s", scriptName)
 	}
 
+	cmdToRun, argsToRun, extraEnv := wrapWithTee(logFile, "chroot", targetDir, "/bin/sh", "-c", chrootCmd)
+
 	env := b.buildEnvironmentMap(activeRootfs)
 	env = append(env,
 		"APK_CACHE_DIR=/var/cache/apk",
@@ -345,10 +481,11 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 		"DNF_CACHE_DIR=/var/cache/dnf",
 		"YUM_CACHE_DIR=/var/cache/dnf",
 	)
+	env = append(env, extraEnv...)
 
 	req := sst.ExecRequest{
-		Cmd:  "chroot",
-		Args: []string{targetDir, "/bin/sh", "-c", chrootCmd},
+		Cmd:  cmdToRun,
+		Args: argsToRun,
 		Env:  env,
 		Mode: sst.ExecForeground,
 	}
@@ -437,8 +574,12 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		sb.YamlObject.Storage.RawImage = "" 
 
 		rootfsDest := filepath.Join(b.ImageOutput, "rootfs")
-		if err := b.DatasetMgr.PromoteTo(b.DatasetMgr.RuntimeRootName, "images", b.Name+"/rootfs"); err != nil {
-			b.Log.Warn(ctx, "failed to promote ZFS dataset natively", "error", err)
+		if b.DatasetMgr != nil {
+			if err := b.DatasetMgr.PromoteTo(b.DatasetMgr.RuntimeRootName, "images", b.Name+"/rootfs"); err != nil {
+				b.Log.Warn(ctx, "failed to promote ZFS dataset natively", "error", err)
+				_ = os.Rename(b.RootDir, rootfsDest)
+			}
+		} else {
 			_ = os.Rename(b.RootDir, rootfsDest)
 		}
 	}
@@ -474,7 +615,6 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 
 	return nil
 }
-
 
 func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
 	instName := b.BuildArgs["INST_NAME"]
