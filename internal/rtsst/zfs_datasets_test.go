@@ -82,6 +82,13 @@ func TestDatasetManager_TopologyAndTeardown(t *testing.T) {
 	assert.NoError(t, err, "Stage directory should exist on disk")
 	assert.True(t, info.IsDir())
 
+	// 3. Test Snapshot/Rollback Stubs (Zpool == "")
+	err = mgr.SnapshotDataset("as-roots/ubuntu-massive", "step_02")
+	assert.NoError(t, err, "Snapshot on empty Zpool should silently no-op")
+
+	err = mgr.RollbackDataset("as-roots/ubuntu-massive", "step_02")
+	assert.NoError(t, err, "Rollback on empty Zpool should silently no-op")
+
 	// --- VISUAL TREE OUTPUT ---
 	// Prints the directory structure mimicking `tree -d`
 	fmt.Println("\n=== Generated Dataset Topology ===")
@@ -89,7 +96,7 @@ func TestDatasetManager_TopologyAndTeardown(t *testing.T) {
 	fmt.Print(goTree(tmpDir, ""))
 	fmt.Println("==================================")
 
-	// 3. Test Nuclear Destruction (--force)
+	// 4. Test Nuclear Destruction (--force)
 	err = mgr.Destroy()
 	assert.NoError(t, err, "Destroy should succeed")
 

@@ -110,8 +110,6 @@ func (d *DatasetManager) CacheDir(cacheName string) string {
 
 // Destroy completely annihilates the build dataset and its physical directory.
 // It uses a recursive ZFS destroy to cleanly unmount and wipe the entire tree.
-// Destroy completely annihilates the build dataset and its physical directory.
-// It uses a recursive ZFS destroy to cleanly unmount and wipe the entire tree.
 func (d *DatasetManager) Destroy() error {
 	mountPath := d.mountPath("")
 
@@ -128,7 +126,6 @@ func (d *DatasetManager) Destroy() error {
 	// 2. Annihilate the physical host directory safely
 	return os.RemoveAll(mountPath)
 }
-
 
 // ClearCache destroys and recreates only the persistent cache datasets.
 func (d *DatasetManager) ClearCache() error {
@@ -172,4 +169,36 @@ func (d *DatasetManager) PromoteTo(subPath, destCategory, destName string) error
 
 	os.MkdirAll(filepath.Dir(dstPath), 0755)
 	return os.Rename(srcPath, dstPath)
+}
+
+// SnapshotDataset creates a ZFS snapshot of the specified sub-dataset.
+// The tag should typically be something like "step_02_hash_abcdef".
+func (d *DatasetManager) SnapshotDataset(subPath, tag string) error {
+	if d.Zpool == "" {
+		return nil // Non-ZFS environments implicitly bypass snapshotting
+	}
+	dsPath := d.datasetPath(subPath)
+	cmd := exec.Command("zfs", "snapshot", fmt.Sprintf("%s@%s", dsPath, tag))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		// It is safe to ignore if the snapshot already exists, though our hashes should prevent this.
+		if !strings.Contains(string(out), "already exists") {
+			return fmt.Errorf("zfs snapshot failed: %w, output: %s", err, string(out))
+		}
+	}
+	return nil
+}
+
+// RollbackDataset rolls back the specified sub-dataset to a previously created ZFS snapshot.
+func (d *DatasetManager) RollbackDataset(subPath, tag string) error {
+	if d.Zpool == "" {
+		return nil // Non-ZFS environments cannot rollback.
+	}
+	dsPath := d.datasetPath(subPath)
+	// -r: recursively destroy any snapshots more recent than the one specified
+	// -f: force unmount of any clone file systems that are to be destroyed
+	cmd := exec.Command("zfs", "rollback", "-r", "-f", fmt.Sprintf("%s@%s", dsPath, tag))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("zfs rollback failed: %w, output: %s", err, string(out))
+	}
+	return nil
 }
