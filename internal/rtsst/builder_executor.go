@@ -112,6 +112,13 @@ func (b *BuildApp) InitEnvironment(ctx context.Context) error {
 	if b.Force {
 		b.Log.Info(ctx, "force flag provided, annihilating existing build environment", "build_id", b.BuildID)
 		_ = b.DatasetMgr.Destroy()
+		
+		// If building an image, aggressively wipe the output directory before any steps run
+		if b.Name != "" && !strings.HasSuffix(b.Dockerfile, "instance.dockerfile") {
+			outDir := filepath.Join(b.RuntimeDir, "images", b.Name)
+			b.Log.Info(ctx, "force flag provided, wiping output directory", "dir", outDir)
+			_ = os.RemoveAll(outDir)
+		}
 	}
 
 	if err := b.DatasetMgr.InitBuildEnvironment(); err != nil {
@@ -232,7 +239,7 @@ func (b *BuildApp) ExecuteSingleInstruction(ctx context.Context, inst Instructio
 			b.Volumes[strings.Trim(strings.TrimSpace(vol), `"`)] = struct{}{}
 		}
 	case "FROM", "NAME", "VMOUT", "EMIT", "COPY", "ADD":
-		// handled in preprocess
+		// Handled structurally during PreProcess
 	case "RUN":
 		if !b.shouldExecute(inst.Conditions) {
 			b.Log.Info(ctx, "skipping instruction (condition mismatch)", "conditions", inst.Conditions, "emits", b.Emits)
@@ -474,32 +481,12 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 	if err == nil {
 		semanticName = GenerateSemanticName(osInfo)
 		upstreamBuildID = osInfo["BUILD_ID"]
-		b.Log.Info(ctx, "parsed os-release from rootfs", "semantic_name", semanticName, "upstream_build_id", upstreamBuildID)
+		b.Log.Info(ctx, "parsed os-release from native ZFS rootfs", "semantic_name", semanticName, "upstream_build_id", upstreamBuildID)
 	} else {
-		b.Log.Warn(ctx, "could not parse os-release from rootfs; falling back to short name", "error", err)
+		b.Log.Warn(ctx, "could not parse os-release from native rootfs; falling back to short name", "error", err)
 	}
 
-	originalName := b.Name
-	longName := originalName
-	if semanticName != "" {
-		longName = fmt.Sprintf("%s-%s", semanticName, originalName)
-	}
-
-	originalOutputDir := filepath.Join(b.RuntimeDir, "images", originalName)
-	finalOutputDir := filepath.Join(b.RuntimeDir, "images", longName)
-
-	if originalOutputDir != finalOutputDir {
-		if err := os.Rename(originalOutputDir, finalOutputDir); err != nil && !os.IsNotExist(err) {
-			b.Log.Warn(ctx, "failed to rename output directory to semantic name", "error", err)
-		}
-		
-		_ = os.Rename(filepath.Join(finalOutputDir, originalName+".raw"), filepath.Join(finalOutputDir, longName+".raw"))
-		_ = os.Rename(filepath.Join(finalOutputDir, originalName+".qcow2"), filepath.Join(finalOutputDir, longName+".qcow2"))
-		
-		b.Name = longName
-	}
-
-	b.ImageOutput = finalOutputDir
+	b.ImageOutput = filepath.Join(b.RuntimeDir, "images", b.Name)
 	if err := os.MkdirAll(b.ImageOutput, 0755); err != nil {
 		return err
 	}
@@ -515,7 +502,7 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 			Provenance: &mkimagepb.Provenance{
 				Name:            b.Name,
 				BuildId:         buildID,
-				UpstreamOs:      semanticName,
+				UpstreamOs:      semanticName, // Recorded for tracking, but not used for paths!
 				UpstreamBuildId: upstreamBuildID,
 			},
 			Storage: &mkimagepb.StoragePlan{
@@ -528,17 +515,73 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 
 	rawDiskPath := filepath.Join(b.ImageOutput, b.Name+".raw")
 	if _, err := os.Stat(rawDiskPath); err == nil {
-		if err := AnalyseImg(sb); err != nil {
-			b.Log.Warn(ctx, "AnalyseImg failed", "error", err)
+		// It's a Hardware VM (Layer 3/4)
+		b.Log.Info(ctx, "populating manifest declaratively from build state (skipping block analysis)")
+
+		// 1. Declarative Partition Layout
+		hasEFI := false
+		for relPath := range b.IncludedFiles {
+			if strings.Contains(relPath, "boot-efi") || strings.Contains(relPath, "efiboot") {
+				hasEFI = true
+				break
+			}
+		}
+		// Fallback check against the physical ZFS boot directory
+		if _, err := os.Stat(filepath.Join(b.RootDir, "boot", "efi")); err == nil {
+			hasEFI = true
 		}
 
-		if sb.YamlObject.Boot != nil && sb.YamlObject.Boot.BootfsDevice != "" {
-			_ = ExtractArtifacts(sb)
+		if hasEFI {
+			sb.YamlObject.Storage.RootfsDevice = "/dev/vda2"
+			sb.YamlObject.Storage.RootfsType = "ext4"
+			sb.YamlObject.Boot.BootfsDevice = "/dev/vda1"
+			sb.YamlObject.Boot.BootfsType = "vfat"
+		} else {
+			sb.YamlObject.Storage.RootfsDevice = "/dev/vda"
+			sb.YamlObject.Storage.RootfsType = "ext4"
+			sb.YamlObject.Boot.BootfsDevice = "/dev/vda"
+			sb.YamlObject.Boot.BootfsType = "ext4"
+		}
+
+		// 2. Extract Kernel/Initrd natively from ZFS workspace (if not already extracted by EMIT)
+		kernelExists := false
+		if _, err := os.Stat(filepath.Join(b.ImageOutput, "kernel")); err == nil {
+			sb.YamlObject.Boot.Kernel = "kernel"
+			kernelExists = true
+		}
+		initrdExists := false
+		if _, err := os.Stat(filepath.Join(b.ImageOutput, "initrd")); err == nil {
+			sb.YamlObject.Boot.Initrd = "initrd"
+			initrdExists = true
+		}
+
+		if !kernelExists || !initrdExists {
+			b.Log.Info(ctx, "locating kernel binaries natively in ZFS dataset")
+			bootDir := filepath.Join(b.RootDir, "boot")
+			
+			kernelPath, initrdPath, ok := scanPartitionForArtifacts(bootDir)
+			if !ok {
+				kernelPath, initrdPath, ok = scanPartitionForArtifacts(b.RootDir)
+			}
+			
+			if ok {
+				b.Log.Info(ctx, "extracting kernel directly from workspace", "kernel", filepath.Base(kernelPath))
+				kName, iName, err := copyArtifacts(kernelPath, initrdPath, b.ImageOutput)
+				if err != nil {
+					b.Log.Warn(ctx, "native artifact extraction failed", "error", err)
+				} else {
+					sb.YamlObject.Boot.Kernel = kName
+					sb.YamlObject.Boot.Initrd = iName
+				}
+			} else {
+				b.Log.Warn(ctx, "could not locate kernel/initrd binaries in native workspace")
+			}
 		}
 
 		QueuePurification(b.RuntimeDir, []string{rawDiskPath})
 	} else {
-		b.Log.Info(ctx, "skipping disk analysis (no block device generated, resolving as container)")
+		// It's a Container! (Layer 1/2). Promote the underlying ZFS dataset physically.
+		b.Log.Info(ctx, "resolving artifact as OCI container dataset")
 		sb.YamlObject.Storage.RawImage = "" 
 
 		rootfsDest := filepath.Join(b.ImageOutput, "rootfs")
@@ -598,6 +641,9 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		}
 	}
 
+	// Print the helpful workflow hint directly to the user
+	b.Log.Info(ctx, "✅ Build complete!", "next_step", fmt.Sprintf("mkimg instance %s <your-instance-name>", b.Name))
+
 	return nil
 }
 
@@ -630,7 +676,6 @@ func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
 	rootDev := "/dev/vda2"
 	rootType := "ext4"
 	
-	// RESTORED YESTERDAY'S EXACT BEHAVIOR
 	if diags := yoImg.Load(ctx, b.Log); diags == nil || !diags.HasAny() {
 		if imgManifest.Storage == nil || imgManifest.Storage.RawImage == "" {
 			isContainer = true
