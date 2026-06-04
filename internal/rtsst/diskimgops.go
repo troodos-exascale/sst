@@ -7,31 +7,66 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
 	sst "github.com/swiss-software-tool/sst/internal/sst"
 	mkimagepb "github.com/swiss-software-tool/sst/proto/yaml/mkimage/v1"
 )
 
-// resolvePartitionByUUID scans the specific NBD device for the partition matching the UUID
-func resolvePartitionByUUID(ctx context.Context, nbdDev string, targetUUID string) (string, error) {
-	cmd := exec.CommandContext(ctx, "blkid", "-s", "UUID", "-o", "device", "-t", "UUID="+targetUUID)
-	out, err := cmd.Output()
+// findPartitionByTag securely scopes a UUID/PARTUUID search to the children of a specific loop device,
+// bypassing global blkid queries to avoid collisions with the host VM's own identical partitions.
+func findPartitionByTag(ctx context.Context, log *sst.Logx, baseDev, tagKey, tagValue string) (string, error) {
+	res, err := sst.ExecShell(ctx, log, "lsblk", "-J", "-o", "NAME,TYPE", baseDev)
 	if err != nil {
-		return "", fmt.Errorf("failed to find partition with UUID %s on %s: %w", targetUUID, nbdDev, err)
+		return "", fmt.Errorf("lsblk failed: %w", err)
 	}
 
-	devicePath := strings.TrimSpace(string(out))
-	if devicePath == "" || !strings.HasPrefix(devicePath, nbdDev) {
-		return "", fmt.Errorf("resolved device %s does not match expected NBD base %s", devicePath, nbdDev)
+	type blockDev struct {
+		Name     string     `json:"name"`
+		Type     string     `json:"type"`
+		Children []blockDev `json:"children,omitempty"`
+	}
+	var output struct {
+		BlockDevices []blockDev `json:"blockdevices"`
 	}
 
-	return devicePath, nil
+	if err := json.Unmarshal([]byte(res.Stdout), &output); err != nil {
+		return "", fmt.Errorf("failed to parse lsblk output: %w", err)
+	}
+
+	var devs []string
+	var collect func(children []blockDev)
+	collect = func(children []blockDev) {
+		for _, c := range children {
+			if c.Type == "part" || c.Type == "loop" || c.Type == "disk" {
+				devs = append(devs, "/dev/"+c.Name)
+			}
+			collect(c.Children)
+		}
+	}
+	collect(output.BlockDevices)
+
+	// Explicitly probe each child device directly to bypass udev symlink latency
+	for _, dev := range devs {
+		blkidRes, _ := sst.ExecShell(ctx, log, "blkid", "-o", "export", dev)
+		for _, line := range strings.Split(blkidRes.Stdout, "\n") {
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 && strings.EqualFold(parts[0], tagKey) {
+				if strings.EqualFold(parts[1], tagValue) {
+					return dev, nil
+				}
+			}
+		}
+	}
+
+	return "", fmt.Errorf("no partition found with %s=%s on %s", tagKey, tagValue, baseDev)
+}
+
+func resolvePartitionByUUID(ctx context.Context, log *sst.Logx, baseDev string, targetUUID string) (string, error) {
+	return findPartitionByTag(ctx, log, baseDev, "UUID", targetUUID)
 }
 
 type ImageSB struct {
@@ -41,23 +76,36 @@ type ImageSB struct {
 	SstRuntimeDir string
 }
 
+// vdaName safely translates a loop device name to a Virtio block device name.
+// Examples: "loop0" -> "/dev/vda", "loop0p1" -> "/dev/vda1", "loop2p5" -> "/dev/vda5"
+func vdaName(devName string) string {
+	devName = strings.TrimPrefix(devName, "/dev/")
+	
+	// "loop" has a 'p' at index 3. We strictly want the last 'p' if it denotes a partition.
+	lastP := strings.LastIndex(devName, "p")
+	if lastP > 3 {
+		return "/dev/vda" + devName[lastP+1:]
+	}
+	return "/dev/vda"
+}
+
 func AnalyseImg(sb *ImageSB) error {
 	rawImage := filepath.Join(sb.SstRuntimeDir, "images", sb.YamlObject.Provenance.Name, sb.YamlObject.Storage.RawImage)
 
-	sb.Log.Info(sb.Ctx, "Attaching image to NBD for analysis", "image", rawImage)
+	sb.Log.Info(sb.Ctx, "Attaching image to loop device for analysis", "image", rawImage)
 
-	nbdDev, err := attachNBD(sb.Ctx, sb.Log, rawImage)
+	loopDev, err := attachLoop(sb.Ctx, sb.Log, rawImage)
 	if err != nil {
-		return fmt.Errorf("failed to attach nbd device: %w", err)
+		return fmt.Errorf("failed to attach loop device: %w", err)
 	}
 	defer func() {
-		if err := detachNBD(sb.Ctx, sb.Log, nbdDev); err != nil {
-			sb.Log.Warn(sb.Ctx, "Failed to detach NBD device", "device", nbdDev, "error", err)
+		if err := detachLoop(sb.Ctx, sb.Log, loopDev); err != nil {
+			sb.Log.Warn(sb.Ctx, "Failed to detach loop device", "device", loopDev, "error", err)
 		}
 	}()
 
-	sb.Log.Info(sb.Ctx, "Scanning partitions with lsblk", "device", nbdDev)
-	res, err := sst.ExecShell(sb.Ctx, sb.Log, "lsblk", "-J", "-b", "-o", "NAME,START,SIZE,FSTYPE,PARTUUID,TYPE,MAJ:MIN,UUID", nbdDev)
+	sb.Log.Info(sb.Ctx, "Scanning partitions with lsblk", "device", loopDev)
+	res, err := sst.ExecShell(sb.Ctx, sb.Log, "lsblk", "-J", "-b", "-o", "NAME,START,SIZE,FSTYPE,PARTUUID,TYPE,MAJ:MIN,UUID", loopDev)
 	if err != nil {
 		return fmt.Errorf("lsblk execution failed: %w", err)
 	}
@@ -85,13 +133,12 @@ func AnalyseImg(sb *ImageSB) error {
 	}
 
 	type candidate struct {
-		Name      string
-		Start     uint64
-		Size      uint64
-		PartUUID  string
-		FsUUID    string
-		PartMinor string
-		FSType    string
+		Name     string
+		Start    uint64
+		Size     uint64
+		PartUUID string
+		FsUUID   string
+		FSType   string
 	}
 	var candidates []candidate
 	var maxStart uint64
@@ -100,8 +147,9 @@ func AnalyseImg(sb *ImageSB) error {
 
 	findCandidates = func(devs []BlockDevice) {
 		for _, d := range devs {
-			if d.Type == "part" || d.Type == "disk" {
-				// NEW: Force blkid to read filesystem metadata directly, bypassing udev!
+			// TYPE "loop" captures unpartitioned raw filesystems (like Ubuntu .img)
+			if d.Type == "part" || d.Type == "disk" || d.Type == "loop" {
+				// Force blkid to read filesystem metadata directly, bypassing udev symlinks!
 				devPath := "/dev/" + d.Name
 				blkidRes, _ := sst.ExecShell(sb.Ctx, sb.Log, "blkid", "-o", "export", devPath)
 
@@ -121,25 +169,18 @@ func AnalyseImg(sb *ImageSB) error {
 				}
 
 				if fstype == "ext4" || fstype == "ext2" || fstype == "xfs" {
-					parts := strings.Split(d.MajorMinor, ":")
-					if len(parts) < 2 {
-						continue
-					}
-					minor := parts[1]
-
 					pUuid := partuuid
 					if pUuid == "" {
 						pUuid = uuid
 					}
 
 					c := candidate{
-						Name:      d.Name,
-						Start:     d.Start,
-						Size:      d.Size,
-						PartUUID:  pUuid,
-						FsUUID:    uuid,
-						PartMinor: minor,
-						FSType:    fstype,
+						Name:     d.Name,
+						Start:    d.Start,
+						Size:     d.Size,
+						PartUUID: pUuid,
+						FsUUID:   uuid,
+						FSType:   fstype,
 					}
 					if c.Start > maxStart {
 						maxStart = c.Start
@@ -167,7 +208,7 @@ func AnalyseImg(sb *ImageSB) error {
 	rootPart := candidates[0]
 	sb.YamlObject.Storage.RootfsPartUuid = rootPart.PartUUID
 	sb.YamlObject.Storage.RootfsUuid = rootPart.FsUUID
-	sb.YamlObject.Storage.RootfsDevice = "/dev/vda" + rootPart.PartMinor
+	sb.YamlObject.Storage.RootfsDevice = vdaName(rootPart.Name)
 	sb.YamlObject.Storage.RootfsType = rootPart.FSType
 	sb.YamlObject.Storage.RootfsSize = fmt.Sprintf("%d%s", rootPart.Size, "B")
 
@@ -190,7 +231,7 @@ func AnalyseImg(sb *ImageSB) error {
 		bootPart := candidates[len(candidates)-1]
 		sb.YamlObject.Boot.BootfsPartUuid = bootPart.PartUUID
 		sb.YamlObject.Boot.BootfsType = bootPart.FSType
-		sb.YamlObject.Boot.BootfsDevice = "/dev/vda" + bootPart.PartMinor
+		sb.YamlObject.Boot.BootfsDevice = vdaName(bootPart.Name)
 		sb.YamlObject.Boot.BootfsUuid = bootPart.FsUUID
 		sb.Log.Info(sb.Ctx, "Identified Bootfs (Smallest)",
 			"part_uuid", sb.YamlObject.Boot.BootfsPartUuid,
@@ -203,7 +244,7 @@ func AnalyseImg(sb *ImageSB) error {
 		sb.YamlObject.Boot.BootfsPartUuid = rootPart.PartUUID
 		sb.YamlObject.Boot.BootfsType = rootPart.FSType
 		sb.YamlObject.Boot.BootfsUuid = rootPart.FsUUID
-		sb.YamlObject.Boot.BootfsDevice = "/dev/vda" + rootPart.PartMinor
+		sb.YamlObject.Boot.BootfsDevice = vdaName(rootPart.Name)
 		sb.Log.Info(sb.Ctx, "Only one Linux partition found; assuming /boot is part of rootfs",
 			"bootfs_uuid", sb.YamlObject.Boot.BootfsPartUuid)
 	}
@@ -224,21 +265,21 @@ func ExtractArtifacts(sb *ImageSB) error {
 		"bootfs_part_uuid", bootfsPartUuid,
 	)
 
-	nbdDev, err := attachNBD(sb.Ctx, sb.Log, rawImage)
+	loopDev, err := attachLoop(sb.Ctx, sb.Log, rawImage)
 	if err != nil {
-		sb.Log.Diagnose(sb.Ctx, "NBD_ATTACH_FAILED", "failed to attach disk image",
+		sb.Log.Diagnose(sb.Ctx, "LOOP_ATTACH_FAILED", "failed to attach disk image",
 			"image", rawImage,
 			"error", err.Error(),
 		)
 		return err
 	}
 	defer func() {
-		if err := detachNBD(sb.Ctx, sb.Log, nbdDev); err != nil {
-			sb.Log.Warn(sb.Ctx, "Failed to detach NBD device", "device", nbdDev, "error", err)
+		if err := detachLoop(sb.Ctx, sb.Log, loopDev); err != nil {
+			sb.Log.Warn(sb.Ctx, "Failed to detach loop device", "device", loopDev, "error", err)
 		}
 	}()
 
-	partDev, err := resolveBootPartitionDevice(sb.YamlObject, nbdDev)
+	partDev, err := resolveBootPartitionDevice(sb.Ctx, sb.Log, sb.YamlObject, loopDev)
 	if err != nil {
 		return err
 	}
@@ -269,9 +310,9 @@ func ExtractArtifacts(sb *ImageSB) error {
 
 	rootUUID := sb.YamlObject.Storage.RootfsUuid
 	if rootUUID != "" {
-		rootNbdDev, err := resolvePartitionByUUID(sb.Ctx, nbdDev, rootUUID)
-		if err == nil && rootNbdDev != "" {
-			rootMnt, err := mountPartition(sb.Ctx, sb.Log, rootNbdDev)
+		rootLoopDev, err := resolvePartitionByUUID(sb.Ctx, sb.Log, loopDev, rootUUID)
+		if err == nil && rootLoopDev != "" {
+			rootMnt, err := mountPartition(sb.Ctx, sb.Log, rootLoopDev)
 			if err == nil {
 				defer unmountPartition(sb.Ctx, sb.Log, rootMnt)
 
@@ -288,19 +329,19 @@ func ExtractArtifacts(sb *ImageSB) error {
 				}
 			}
 		} else {
-			sb.Log.Warn(sb.Ctx, "could not resolve NBD partition by UUID", "uuid", rootUUID, "error", err)
+			sb.Log.Warn(sb.Ctx, "could not resolve loop partition by UUID", "uuid", rootUUID, "error", err)
 		}
 	}
 
 	return nil
 }
 
-func resolveBootPartitionDevice(img *mkimagepb.ImageYAML, nbdDev string) (string, error) {
+func resolveBootPartitionDevice(ctx context.Context, log *sst.Logx, img *mkimagepb.ImageYAML, baseDev string) (string, error) {
 	if img.Boot != nil && img.Boot.BootfsPartUuid != "" {
 		if img.Boot.BootfsPartUuid == img.Boot.BootfsUuid {
-			return nbdDev, nil
+			return baseDev, nil // Unpartitioned raw volume
 		}
-		return "/dev/disk/by-partuuid/" + img.Boot.BootfsPartUuid, nil
+		return findPartitionByTag(ctx, log, baseDev, "PARTUUID", img.Boot.BootfsPartUuid)
 	}
 	return "", fmt.Errorf("bootfs info missing")
 }
@@ -333,58 +374,26 @@ func ParseMemorySizeMiB(sizeStr, suffix string) (uint64, error) {
 	}
 }
 
-func attachNBD(ctx context.Context, log *sst.Logx, image string) (string, error) {
-	_, _ = sst.ExecShell(ctx, log, "modprobe", "nbd", "max_part=16")
-	_, _ = sst.ExecShell(ctx, log, "qemu-nbd", "-d", "/dev/nbd0")
-
-	if _, err := sst.ExecShell(ctx, log,
-		"qemu-nbd", "-f", "raw", "--connect=/dev/nbd0", image); err != nil {
-		return "", err
+func attachLoop(ctx context.Context, log *sst.Logx, image string) (string, error) {
+	// -P ensures the kernel scans the partition table synchronously.
+	res, err := sst.ExecShell(ctx, log, "losetup", "-fP", "--show", image)
+	if err != nil {
+		return "", fmt.Errorf("losetup failed: %w", err)
+	}
+	dev := strings.TrimSpace(res.Stdout)
+	if dev == "" {
+		return "", fmt.Errorf("losetup returned empty device name")
 	}
 
-	_, _ = sst.ExecShell(ctx, log, "blockdev", "--rereadpt", "/dev/nbd0")
-
-	dev := "/dev/nbd0"
-	partitionDetected := false
-
-	// Fixed robust polling block without udevadm settle
-	for i := 0; i < 20; i++ {
-		if out, err := sst.ExecShell(ctx, log, "blkid", dev); err == nil && len(out.Stdout) > 0 {
-			partitionDetected = true
-			break
-		}
-		if out, err := sst.ExecShell(ctx, log, "blkid", dev+"p1"); err == nil && len(out.Stdout) > 0 {
-			partitionDetected = true
-			break
-		}
-		if _, err := os.Stat(dev + "p1"); err == nil {
-			partitionDetected = true
-			break
-		}
-		if _, err := os.Stat(dev + "p15"); err == nil {
-			partitionDetected = true
-			break
-		}
-		if _, err := os.Stat("/sys/block/nbd0/nbd0p1"); err == nil {
-			partitionDetected = true
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		case <-time.After(250 * time.Millisecond):
-		}
-	}
-
-	if !partitionDetected {
-		log.Warn(ctx, "attachNBD: timed out waiting for partitions to appear", "device", dev)
-	}
+	// Tell the kernel to definitively re-read the partition table. 
+	// This acts as a barrier, ensuring any /dev/loopXpY nodes exist before we return.
+	_, _ = sst.ExecShell(ctx, log, "blockdev", "--rereadpt", dev)
 
 	return dev, nil
 }
 
-func detachNBD(ctx context.Context, log *sst.Logx, dev string) error {
-	_, err := sst.ExecShell(ctx, log, "qemu-nbd", "-d", dev)
+func detachLoop(ctx context.Context, log *sst.Logx, dev string) error {
+	_, err := sst.ExecShell(ctx, log, "losetup", "-d", dev)
 	return err
 }
 
@@ -394,8 +403,7 @@ func mountPartition(ctx context.Context, log *sst.Logx, dev string) (string, err
 		return "", err
 	}
 
-	if _, err := sst.ExecShell(ctx, log,
-		"mount", "-o", "ro", dev, dir); err != nil {
+	if _, err := sst.ExecShell(ctx, log, "mount", "-o", "ro", dev, dir); err != nil {
 		_ = os.RemoveAll(dir)
 		return "", err
 	}
