@@ -75,9 +75,17 @@ RUN [$TARGET_STAGE]: |
   export PATH=/usr/local/go/bin:$GOPATH/bin:$PATH
   mkdir -p /go/bin /go/src
   
-  echo "--> Cloning u-root source..."
-  git clone https://github.com/u-root/u-root /go/src/github.com/u-root/u-root
-  cd /go/src/github.com/u-root/u-root
+  echo "--> Preparing u-root source..."
+  if [ -d "/go/src/github.com/u-root/u-root/.git" ]; then
+      echo "--> u-root already cloned, pulling latest..."
+      cd /go/src/github.com/u-root/u-root
+      git pull
+  else
+      echo "--> Cloning u-root source..."
+      rm -rf /go/src/github.com/u-root/u-root
+      git clone https://github.com/u-root/u-root /go/src/github.com/u-root/u-root
+      cd /go/src/github.com/u-root/u-root
+  fi
   
   echo "--> Installing u-root builder..."
   go install .

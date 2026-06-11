@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -141,7 +142,10 @@ func summariseFindRepo(app *summariseApp) error {
 }
 
 func summariseListFiles(app *summariseApp) error {
-	cmd := exec.Command("git", "ls-files", "-z")
+	// -c: cached (tracked files)
+	// -o: others (untracked files)
+	// --exclude-standard: respect .gitignore
+	cmd := exec.Command("git", "ls-files", "-z", "-c", "-o", "--exclude-standard")
 	cmd.Dir = app.repoRoot
 	out, err := cmd.Output()
 	if err != nil {
@@ -160,15 +164,22 @@ func summariseListFiles(app *summariseApp) error {
 
 func summariseWriteResult(app *summariseApp) error {
 	for _, f := range app.files {
-		fmt.Fprintf(&app.builder, "FILE: %s\n", f)
 		data, err := os.ReadFile(filepath.Join(app.repoRoot, f))
 		if err != nil {
-			fmt.Fprintf(&app.builder, "--- ERROR: %v ---\n", err)
-		} else {
-			app.builder.Write(data)
-			if len(data) > 0 && data[len(data)-1] != '\n' {
-				app.builder.WriteByte('\n')
-			}
+			fmt.Fprintf(&app.builder, "FILE: %s\n--- ERROR: %v ---\nEND: %s\n\n", f, err, f)
+			continue
+		}
+
+		// Quick heuristic to skip binaries: check for null bytes
+		if bytes.Contains(data, []byte{0}) {
+			fmt.Fprintf(&app.builder, "FILE: %s\n--- SKIPPED BINARY FILE ---\nEND: %s\n\n", f, f)
+			continue
+		}
+
+		fmt.Fprintf(&app.builder, "FILE: %s\n", f)
+		app.builder.Write(data)
+		if len(data) > 0 && data[len(data)-1] != '\n' {
+			app.builder.WriteByte('\n')
 		}
 		fmt.Fprintf(&app.builder, "END: %s\n\n", f)
 	}
@@ -191,6 +202,7 @@ func summariseAppendLsTree(app *summariseApp) error {
 	}
 	return nil
 }
+
 func summariseWriteOutput(app *summariseApp) error {
 	out := app.outputPath
 	if out == "-" {
