@@ -2,9 +2,7 @@ package gitpm
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,12 +22,13 @@ func TestE2E_Gitpm_TimeTravel_REPL(t *testing.T) {
 	manifestPath := filepath.Join(tmpDir, "demo-package.yaml")
 	initialManifest := `schema: v1.3
 kind: package
-name: demo-pkg
-version: 1.0
+metadata:
+  name: demo-pkg
+  version: "1.0"
 source:
   method: local
-build:
-  steps:
+phases:
+  build:
     - run: |
         echo "Step 1: Downloading huge file..."
         echo "heavy payload data" > payload.txt
@@ -56,8 +55,6 @@ build:
 		cmdArgs := append([]string{binPath}, args...)
 		cmd := exec.Command("bash", "-c", strings.Join(cmdArgs, " "))
 		cmd.Dir = tmpDir
-		
-		// Force hermetic build directory for the test and enable text logs
 		cmd.Env = append(os.Environ(), 
 			"SST_LOG_FORMAT=text",
 			"SST_PACKAGE_BUILD_DIR=buildroot",
@@ -68,7 +65,7 @@ build:
 		cmd.Stderr = &out
 		err := cmd.Run()
 		
-		fmt.Println(out.String())
+		fmt.Print(out.String())
 		return out.String(), err
 	}
 
@@ -82,29 +79,31 @@ build:
 	}
 
 	fmt.Println("\n========================================================")
-	fmt.Println("🎬 SCENE 2: The following demonstrates how gitpm --debug makes debugging a pleasure")
+	fmt.Println("🎬 SCENE 2: The following demonstrates how gitpm makes debugging a pleasure")
 	fmt.Println("========================================================")
-
-	_, _ = runCmd("Run with debug tracing", "build", "--debug", "-f", "demo-package.yaml")
 
 	outList, _ := runCmd("Inspect the execution graph", "build", "-f", "demo-package.yaml", "--list")
 	if !strings.Contains(outList, "[06] PENDING | exit 1") {
 		t.Fatalf("Expected AST Node 06 to be the pending 'exit 1' command.")
 	}
 
-	_, _ = runCmd("Time-travel to the exact moment before failure", "build", "-f", "demo-package.yaml", "--revert", "05")
+	_, _ = runCmd("Time-travel to the exact moment before failure", "build", "-f", "demo-package.yaml", "--revert", "06")
 
 	fmt.Printf("\n\033[36m# Correct the code in the YAML manifest...\033[0m\n")
-	fmt.Printf("\033[32m$ sed -i 's/exit 1/echo \"Fixed!\"/' demo-package.yaml\033[0m\n")
-	fixedManifest := strings.Replace(initialManifest, "exit 1", "echo \"Fixed!\"", 1)
+	fmt.Printf("\033[32m$ sed -i 's/.*Simulating a typo error.*/echo \"Fixed!\"/' demo-package.yaml\033[0m\n")
+	fmt.Printf("\033[32m$ sed -i '/exit 1/d' demo-package.yaml\033[0m\n")
+	
+	badBlock := "echo \"Simulating a typo error now...\"\n        exit 1"
+	goodBlock := "echo \"Fixed!\""
+	fixedManifest := strings.Replace(initialManifest, badBlock, goodBlock, 1)
 	_ = os.WriteFile(manifestPath, []byte(fixedManifest), 0644)
 
 	outCont, err := runCmd("Resume execution using cached disk state", "build", "-f", "demo-package.yaml", "--cont")
 	if err != nil {
 		t.Fatalf("Continue command failed: %v", err)
 	}
-	if !strings.Contains(outCont, "Artifact packaged") {
-		t.Fatalf("Expected successful packaging")
+	if !strings.Contains(outCont, "Fixed!") {
+		t.Fatalf("Expected successful execution of fixed command")
 	}
 
 	debPath := filepath.Join(tmpDir, "dist", "demo-pkg_1.0_arm64.deb")
@@ -129,19 +128,4 @@ build:
 	}
 
 	fmt.Println("\n✅ CUT! That's a wrap.")
-}
-
-func fileSHA256(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
-		return "", err
-	}
-
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }

@@ -9,32 +9,19 @@ import (
 	"time"
 )
 
-// Result holds the outcome of an Action or Probe.
 type Result struct {
 	Value interface{}
 	Error error
 }
 
-// Action is a function that performs a single unit of work.
 type Action func(ctx context.Context) (interface{}, error)
-
-// Probe evaluates if the intended state already exists in the world.
-// Returns true if the state matches the desired outcome (Action can be skipped).
 type Probe func(ctx context.Context) (bool, error)
-
-// Restore safely resets the environment to the expected starting state
-// (e.g., capturing forensic data, then performing a ZFS rollback).
 type Restore func(ctx context.Context) error
-
-// Interpreter processes the result of an Action (or skipped execution)
-// and dynamically generates the next steps/capsules.
 type Interpreter func(result *Result) (continuation []*Context, err error)
 
-// Context defines a single, self-contained node in a task graph (a "Protosh" capsule).
 type Context struct {
-	ID               string // Unique identifier for resume/state tracking
+	ID               string
 	Description      string
-	
 	Probe            Probe
 	Restore          Restore
 	Action           Action
@@ -43,7 +30,6 @@ type Context struct {
 	InterpretOnError bool
 }
 
-// Runner is the engine that executes a graph of Contexts.
 type Runner struct {
 	Log     *Logx
 	DryRun  bool
@@ -51,7 +37,6 @@ type Runner struct {
 	Silent  bool
 	Debug   bool
 
-	// State and Resume fields
 	StatePath string
 	State     map[string]interface{}
 	Completed map[string]bool
@@ -69,7 +54,7 @@ func (r *Runner) loadState() error {
 	}
 	data, err := os.ReadFile(r.StatePath)
 	if err != nil {
-		return nil // Not an error if the state file doesn't exist yet
+		return nil
 	}
 	var p persistedGraphState
 	if err := json.Unmarshal(data, &p); err != nil {
@@ -103,7 +88,6 @@ func (r *Runner) saveState() error {
 	return os.WriteFile(r.StatePath, data, 0o644)
 }
 
-// Run is the main entry point for the executor.
 func (r *Runner) Run(ctx context.Context, rootCtx *Context) error {
 	if r.State == nil {
 		r.State = make(map[string]interface{})
@@ -125,18 +109,16 @@ func (r *Runner) Run(ctx context.Context, rootCtx *Context) error {
 }
 
 func (r *Runner) runRecursive(ctx context.Context, tgCtx *Context) error {
-	r.Log.Info(ctx, "step.evaluate", "id", tgCtx.ID, "description", tgCtx.Description)
+	r.Log.Debug(ctx, "step.evaluate", "id", tgCtx.ID, "description", tgCtx.Description)
 
 	var actionValue interface{}
 	var actionErr error
 	var skipped bool
 
-	// 1. Check Cryptographic/Historical Cache
 	if tgCtx.ID != "" && r.Completed[tgCtx.ID] {
-		r.Log.Info(ctx, "step.skipped.cached", "id", tgCtx.ID)
+		r.Log.Debug(ctx, "step.skipped.cached", "id", tgCtx.ID)
 		skipped = true
 	} else {
-		// 2. Real-world state Probe
 		var probeMatched bool
 		if tgCtx.Probe != nil {
 			r.Log.Debug(ctx, "step.probe.start", "id", tgCtx.ID)
@@ -151,16 +133,15 @@ func (r *Runner) runRecursive(ctx context.Context, tgCtx *Context) error {
 		}
 
 		if probeMatched {
-			r.Log.Info(ctx, "step.skipped.probed", "id", tgCtx.ID, "reason", "state already matches desired outcome")
+			r.Log.Debug(ctx, "step.skipped.probed", "id", tgCtx.ID, "reason", "state matches desired outcome")
 			skipped = true
 			if tgCtx.ID != "" {
 				r.Completed[tgCtx.ID] = true
 				_ = r.saveState()
 			}
 		} else {
-			// 3. State Reconciliation (Restore)
 			if tgCtx.Restore != nil {
-				r.Log.Info(ctx, "step.restore.start", "id", tgCtx.ID, "reason", "divergence detected, reconciling environment")
+				r.Log.Debug(ctx, "step.restore.start", "id", tgCtx.ID)
 				if err := tgCtx.Restore(ctx); err != nil {
 					r.runCleanup(ctx, tgCtx)
 					r.Log.WithError(err).Error(ctx, "step.restore.fail", "id", tgCtx.ID)
@@ -168,8 +149,7 @@ func (r *Runner) runRecursive(ctx context.Context, tgCtx *Context) error {
 				}
 			}
 
-			// 4. Execute Action
-			r.Log.Info(ctx, "step.action.start", "id", tgCtx.ID)
+			r.Log.Debug(ctx, "step.action.start", "id", tgCtx.ID)
 			if tgCtx.Action != nil {
 				actionValue, actionErr = tgCtx.Action(ctx)
 			}
@@ -184,7 +164,6 @@ func (r *Runner) runRecursive(ctx context.Context, tgCtx *Context) error {
 	result := &Result{Value: actionValue, Error: actionErr}
 	shouldInterpret := (actionErr == nil) || (tgCtx.InterpretOnError)
 
-	// 5. Interpret (Dynamic Generation of next Protosh capsules)
 	if tgCtx.Interpret != nil && shouldInterpret {
 		continuation, interpErr := tgCtx.Interpret(result)
 		if interpErr != nil {
@@ -205,14 +184,14 @@ func (r *Runner) runRecursive(ctx context.Context, tgCtx *Context) error {
 	}
 
 	if !skipped {
-		r.Log.Info(ctx, "step.ok", "id", tgCtx.ID, "description", tgCtx.Description)
+		r.Log.Debug(ctx, "step.ok", "id", tgCtx.ID, "description", tgCtx.Description)
 	}
 	return nil
 }
 
 func (r *Runner) runCleanup(ctx context.Context, tgCtx *Context) {
 	if !r.Debug && tgCtx.Cleanup != nil {
-		r.Log.Info(ctx, "step.cleanup", "id", tgCtx.ID, "description", tgCtx.Description)
+		r.Log.Debug(ctx, "step.cleanup", "id", tgCtx.ID, "description", tgCtx.Description)
 		tgCtx.Cleanup()
 	}
 }

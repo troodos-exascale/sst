@@ -1,6 +1,6 @@
 syntax = "proto3";
 package s2.hi.v1;
-option go_package = "github.com/swiss-software-tool/sst-templates/go/proto/v1;v1";
+option go_package = "github.com/troodos-exascale/sst-templates/go/proto/v1;v1";
 
 // SstHiCoreService defines the standard gRPC service that all HI plugins MUST implement.
 // It provides the core functionality required for the sst tool to orchestrate provisioning.

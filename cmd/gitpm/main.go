@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/swiss-software-tool/sst/internal/gitpm"
+	"github.com/troodos-exascale/sst/internal/gitpm"
 )
 
 func main() {

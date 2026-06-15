@@ -7,8 +7,8 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 
-	"github.com/swiss-software-tool/sst/cmd/hetzner-plugin/internal/server"
-	sst "github.com/swiss-software-tool/sst/internal/sst"
+	"github.com/troodos-exascale/sst/cmd/hetzner-plugin/internal/server"
+	sst "github.com/troodos-exascale/sst/internal/sst"
 )
 
 const port = ":50051"

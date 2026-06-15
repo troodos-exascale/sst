@@ -21,13 +21,13 @@ func TestCLIBuildManifestDEBAndRPM(t *testing.T) {
 	manifest := `
 schema: v1.3
 kind: package
-name: demo
-version: 9.9.9
-repo: local
+metadata:
+  name: demo
+  version: 9.9.9
 source:
   method: local
-build:
-  steps:
+phases:
+  build:
     - run: mkdir -p $BUILDROOT/usr/local/bin
     - run: printf '#!/bin/sh\necho hi\n' > $BUILDROOT/usr/local/bin/hi.sh
     - run: chmod 0755 $BUILDROOT/usr/local/bin/hi.sh
@@ -41,6 +41,14 @@ build:
 	args := []string{binPath, "build", "-f", mf}
 	cmd := exec.Command("bash", "-c", strings.Join(args, " "))
 	cmd.Dir = tmp
+	
+	// SANDBOX FIX: Override the global ~/.config/gitpm/config.yaml 
+	// so the test doesn't try to write to /package-build
+	cmd.Env = append(os.Environ(), 
+		"SST_PACKAGE_BUILD_DIR="+filepath.Join(tmp, "buildroot"),
+		"SST_PACKAGE_DIST_DIR="+filepath.Join(tmp, "dist"),
+	)
+	
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("build via manifest failed: %v\n%s", err, out)
@@ -48,8 +56,8 @@ build:
 
 	// Expect both deb and rpm outputs named by arch inferred from runtime
 	arch := detectArch()
-	wantDeb := filepath.Join(tmp, "dist", "demo_9.9.9_"+arch+".deb") // <-- NOTE: output goes to dist/
-	wantRpm := filepath.Join(tmp, "dist", "demo_9.9.9_"+arch+".rpm") // <-- NOTE: output goes to dist/
+	wantDeb := filepath.Join(tmp, "dist", "demo_9.9.9_"+arch+".deb")
+	wantRpm := filepath.Join(tmp, "dist", "demo_9.9.9_"+arch+".rpm")
 	if _, err := os.Stat(wantDeb); err != nil {
 		t.Fatalf("missing output deb: %s", wantDeb)
 	}
@@ -59,7 +67,5 @@ build:
 }
 
 func detectArch() string {
-	// mirror pkg/gitpm/options.go default arch logic if needed in tests
-	// Keep it simple for now:
 	return "arm64"
 }

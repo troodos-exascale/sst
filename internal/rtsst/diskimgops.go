@@ -12,8 +12,8 @@ import (
 	"strconv"
 	"strings"
 
-	sst "github.com/swiss-software-tool/sst/internal/sst"
-	mkimagepb "github.com/swiss-software-tool/sst/proto/yaml/mkimage/v1"
+	sst "github.com/troodos-exascale/sst/internal/sst"
+	mkimagepb "github.com/troodos-exascale/sst/proto/yaml/mkimage/v1"
 )
 
 // findPartitionByTag securely scopes a UUID/PARTUUID search to the children of a specific loop device,

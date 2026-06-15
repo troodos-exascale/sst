@@ -245,4 +245,71 @@ func formatPretty(sub string, level Level, msg string, f map[string]interface{})
 
 	// 4. Message
 	switch msg {
-	case "
+	case "image.convert":
+		sb.WriteString(fmt.Sprintf("converting image → raw\r\n  %v → %v", f["from"], f["to"]))
+		delete(f, "from")
+		delete(f, "to")
+	case "exec.start":
+		cmdline := fmt.Sprintf("%v", f["cmdline"])
+		if strings.HasPrefix(cmdline, "bash -c ") {
+			cmdline = strings.TrimPrefix(cmdline, "bash -c ")
+		}
+		cmdline = strings.Trim(cmdline, `"'`)
+		sb.WriteString(fmt.Sprintf("\033[32m$ %v\033[0m", cmdline))
+		delete(f, "cmdline")
+		delete(f, "args")
+		delete(f, "cmd")
+		delete(f, "mode")
+	case "exec.ok":
+		if d, ok := f["duration_us"]; ok {
+			sb.WriteString(fmt.Sprintf("✓ done (%v µs)", d))
+			delete(f, "duration_us")
+		} else {
+			sb.WriteString("✓ done")
+		}
+		delete(f, "cmdline")
+		delete(f, "cmd")
+		delete(f, "args")
+	default:
+		if level == LevelError {
+			sb.WriteString(colorRed + "✗ " + msg + colorReset)
+		} else {
+			sb.WriteString(msg)
+		}
+	}
+
+	// 5. Append context
+	if len(f) > 0 {
+		var keys []string
+		for k := range f {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		sb.WriteString(colorGray + " |")
+		for _, k := range keys {
+			sb.WriteString(fmt.Sprintf(" %s=%v", k, f[k]))
+		}
+		sb.WriteString(colorReset)
+	}
+
+	// 6. Append stderr
+	if stderrStr != "" {
+		sb.WriteString("\r\n" + colorRed + indent(stderrStr) + colorReset)
+	}
+
+	return sb.String()
+}
+
+func indent(s string) string {
+	lines := strings.Split(s, "\n")
+	for i := range lines {
+		lines[i] = "  " + strings.TrimRight(lines[i], "\r")
+	}
+	return strings.Join(lines, "\r\n")
+}
+
+func ResetFromEnv() {}
+
+func StartSpan(ctx context.Context, name string) (context.Context, func(error)) {
+	return ctx, func(error) {}
+}

@@ -33,9 +33,6 @@ func TestEndToEnd_Observability(t *testing.T) {
 			log.Info(ctx.Ctx, "preparing to compile", "depth", 3, "module", "core")
 
 			// 2. Shell Boundary Demonstration
-			// This is a single script, but we expect the interpreter to break it down.
-			// `echo` is a shell builtin (bypasses ExecHandler).
-			// `mkdir` and `rm` are external binaries (triggers ExecHandler).
 			script := `
 				set -e
 				echo "Starting compilation phase..."
@@ -93,16 +90,16 @@ func TestEndToEnd_Observability(t *testing.T) {
 			if msg == "sh.cmd.ok" {
 				if cmd, ok := entry["cmd"].(string); ok && cmd == "mkdir" {
 					foundMkdirOk = true
-					if _, ok := entry["duration_ms"].(float64); !ok {
-						t.Errorf("Profile missing: Expected 'duration_ms' metric on sh.cmd.ok")
+					if _, ok := entry["duration_us"]; !ok {
+						t.Errorf("Profile missing: Expected 'duration_us' metric on sh.cmd.ok")
 					}
 				}
 			}
 			
 			// Macro execution profile
 			if msg == "exec.ok" {
-				if _, ok := entry["duration_ms"].(float64); !ok {
-					t.Errorf("Profile missing: Expected 'duration_ms' metric on exec.ok")
+				if _, ok := entry["duration_us"]; !ok {
+					t.Errorf("Profile missing: Expected 'duration_us' metric on exec.ok")
 				}
 			}
 		}

@@ -6,7 +6,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	sst "github.com/swiss-software-tool/sst/internal/sst"
+	sst "github.com/troodos-exascale/sst/internal/sst"
 )
 
 // AttachDebugFlags wires persistent top-level flags onto the root command,

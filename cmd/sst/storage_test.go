@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	sst "github.com/swiss-software-tool/sst/internal/sst"
-	storagepb "github.com/swiss-software-tool/sst/proto/yaml/storage/v1"
+	sst "github.com/troodos-exascale/sst/internal/sst"
+	storagepb "github.com/troodos-exascale/sst/proto/yaml/storage/v1"
 )
 
 func TestComposeStoragePlan(t *testing.T) {

@@ -9,10 +9,10 @@ import (
 	"google.golang.org/grpc/status"
 	"gopkg.in/yaml.v3"
 
-	sst "github.com/swiss-software-tool/sst/internal/sst"
-	pb "github.com/swiss-software-tool/sst/proto/external/v1"
+	sst "github.com/troodos-exascale/sst/internal/sst"
+	pb "github.com/troodos-exascale/sst/proto/external/v1"
 
-	"github.com/swiss-software-tool/sst/cmd/hetzner-plugin/internal/probe"
+	"github.com/troodos-exascale/sst/cmd/hetzner-plugin/internal/probe"
 )
 
 // Server implements the gRPC service.

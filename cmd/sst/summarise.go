@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/swiss-software-tool/sst/internal/sst"
+	"github.com/troodos-exascale/sst/internal/sst"
 )
 
 //

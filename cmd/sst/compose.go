@@ -9,9 +9,9 @@ import (
 
 	"github.com/spf13/cobra"
 
-	sst "github.com/swiss-software-tool/sst/internal/sst"
+	sst "github.com/troodos-exascale/sst/internal/sst"
 
-	composepb "github.com/swiss-software-tool/sst/proto/yaml/compose/v1"
+	composepb "github.com/troodos-exascale/sst/proto/yaml/compose/v1"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 

@@ -1,4 +1,4 @@
-module github.com/swiss-software-tool/sst
+module github.com/troodos-exascale/sst
 
 go 1.25.6
 

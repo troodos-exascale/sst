@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+package gitpm.v1;
+
+option go_package = "github.com/troodos-exascale/sst/proto/yaml/gitpm/v1;gitpmpb";
+
+message Manifest {
+  string schema = 1;
+  string kind = 2;
+  
+  Metadata metadata = 3;
+  Source source = 4;
+  Dependencies dependencies = 5;
+  Phases phases = 6;
+  Outputs outputs = 7;
+}
+
+message Metadata {
+  string name = 1;
+  string version = 2;
+  string description = 3;
+  int32 epoch = 4;
+}
+
+message Source {
+  string method = 1;         
+  string expected_hash = 2;  
+  string upstream_repo = 3;  
+  string ref = 4;            
+  string url = 5;            
+}
+
+message Dependencies {
+  repeated string build = 1;   
+  repeated string install = 2; 
+}
+
+message Phases {
+  repeated Step fetch = 1;
+  repeated Step build = 2;
+  repeated Step build_test = 3;
+  repeated Step install = 4;
+  repeated Step install_test = 5;
+}
+
+message Step {
+  string run = 1;
+  string dir = 2;
+}
+
+message Outputs {
+  string prefix = 1;
+}

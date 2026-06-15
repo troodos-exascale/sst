@@ -7,7 +7,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-	"github.com/swiss-software-tool/sst/internal/sst"
+	"github.com/troodos-exascale/sst/internal/sst"
 )
 
 func TestDockerfileParser(t *testing.T) {

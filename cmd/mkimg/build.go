@@ -10,8 +10,8 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/swiss-software-tool/sst/internal/rtsst"
-	"github.com/swiss-software-tool/sst/internal/sst"
+	"github.com/troodos-exascale/sst/internal/rtsst"
+	"github.com/troodos-exascale/sst/internal/sst"
 )
 
 var (

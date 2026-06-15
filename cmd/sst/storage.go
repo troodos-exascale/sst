@@ -7,10 +7,10 @@ import (
 
 	"github.com/spf13/cobra"
 
-	sst "github.com/swiss-software-tool/sst/internal/sst"
+	sst "github.com/troodos-exascale/sst/internal/sst"
 
-	hardwarepb "github.com/swiss-software-tool/sst/proto/yaml/hardware/v1"
-	storagepb "github.com/swiss-software-tool/sst/proto/yaml/storage/v1"
+	hardwarepb "github.com/troodos-exascale/sst/proto/yaml/hardware/v1"
+	storagepb "github.com/troodos-exascale/sst/proto/yaml/storage/v1"
 )
 
 //

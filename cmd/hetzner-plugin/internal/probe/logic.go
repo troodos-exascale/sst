@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/swiss-software-tool/sst/internal/sst"
+	"github.com/troodos-exascale/sst/internal/sst"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 	"golang.org/x/crypto/ssh"

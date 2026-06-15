@@ -17,9 +17,9 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
-	rtsst "github.com/swiss-software-tool/sst/internal/rtsst"
-	sst "github.com/swiss-software-tool/sst/internal/sst"
-	runctlpb "github.com/swiss-software-tool/sst/proto/yaml/runctl/v1"
+	rtsst "github.com/troodos-exascale/sst/internal/rtsst"
+	sst "github.com/troodos-exascale/sst/internal/sst"
+	runctlpb "github.com/troodos-exascale/sst/proto/yaml/runctl/v1"
 )
 
 var (

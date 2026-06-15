@@ -53,6 +53,7 @@ Time-Travel REPL (ZFS-backed):
   gitpm build -f pkg.yaml --revert 03   # Rollback to the state just before step 03
   gitpm build -f pkg.yaml --cont        # Continue execution, using cached snapshots
   gitpm build -f pkg.yaml --clean       # Destroy all cached ZFS snapshots for this package
+  gitpm build -f my-project/            # Build via local clone using .gitpm/manifest.yaml
 `,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts := &BuildSessionOptions{
@@ -65,6 +66,13 @@ Time-Travel REPL (ZFS-backed):
 
 			// Manifest mode takes precedence if -f/--file was given
 			if manifestGlob != "" {
+				// 1. Check if it's a local directory (triggers ZFS clone behavior)
+				stat, err := os.Stat(manifestGlob)
+				if err == nil && stat.IsDir() {
+					return BuildTarget(cmd.Context(), manifestGlob, opts)
+				}
+
+				// 2. Otherwise, treat it as a file or glob of files
 				files, err := filepath.Glob(manifestGlob)
 				if err != nil {
 					return err
@@ -72,7 +80,13 @@ Time-Travel REPL (ZFS-backed):
 				if len(files) == 0 {
 					return fmt.Errorf("no manifest files matched %q", manifestGlob)
 				}
-				return BuildFromManifest(cmd.Context(), files, opts)
+
+				for _, f := range files {
+					if err := BuildTarget(cmd.Context(), f, opts); err != nil {
+						return err
+					}
+				}
+				return nil
 			}
 
 			// Legacy flag-based behavior (does not support Time-Travel DAG)
@@ -124,7 +138,7 @@ Time-Travel REPL (ZFS-backed):
 	cmd.Flags().StringVarP(&buildDir, "chdir", "C", ".", "directory to package")
 	cmd.Flags().StringVarP(&description, "desc", "d", "", "package description")
 
-	cmd.Flags().StringVarP(&manifestGlob, "file", "f", "", "YAML manifest file (glob allowed)")
+	cmd.Flags().StringVarP(&manifestGlob, "file", "f", "", "YAML manifest file or directory")
 
 	cmd.Flags().BoolVar(&flagList, "list", false, "List the parsed AST steps and their completion status")
 	cmd.Flags().BoolVar(&flagCont, "cont", false, "Continue a failed build from the last successful snapshot")

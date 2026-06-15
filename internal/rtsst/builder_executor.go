@@ -9,9 +9,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/swiss-software-tool/sst/internal/sst"
-	mkimagepb "github.com/swiss-software-tool/sst/proto/yaml/mkimage/v1"
-	runctlpb "github.com/swiss-software-tool/sst/proto/yaml/runctl/v1"
+	"github.com/troodos-exascale/sst/internal/sst"
+	mkimagepb "github.com/troodos-exascale/sst/proto/yaml/mkimage/v1"
+	runctlpb "github.com/troodos-exascale/sst/proto/yaml/runctl/v1"
 )
 
 func wrapWithTee(logFile string, cmd string, args ...string) (string, []string, []string) {

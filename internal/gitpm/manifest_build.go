@@ -13,14 +13,11 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/swiss-software-tool/sst/internal/sst"
+	"github.com/troodos-exascale/sst/internal/sst"
+	gitpmpb "github.com/troodos-exascale/sst/proto/yaml/gitpm/v1"
 	"mvdan.cc/sh/v3/syntax"
+	"sigs.k8s.io/yaml"
 )
-
-type BuildStep struct {
-	Run string `yaml:"run"`
-	Dir string `yaml:"dir,omitempty"`
-}
 
 type BuildSessionOptions struct {
 	List   bool
@@ -38,18 +35,84 @@ type ASTNode struct {
 	Hash    string
 }
 
-func BuildFromManifest(ctx context.Context, paths []string, opts *BuildSessionOptions) error {
+func LoadManifest(path string) (*gitpmpb.Manifest, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var m gitpmpb.Manifest
+	if err := yaml.UnmarshalStrict(data, &m); err != nil {
+		return nil, fmt.Errorf("failed to parse manifest %s: %w", path, err)
+	}
+	// Sanity checks
+	if m.Metadata == nil {
+		m.Metadata = &gitpmpb.Metadata{Name: "unknown", Version: "0.0.0"}
+	}
+	if m.Outputs == nil {
+		m.Outputs = &gitpmpb.Outputs{Prefix: "/"}
+	}
+	return &m, nil
+}
+
+// BuildTarget replaces BuildFromManifest. It handles both single files AND local Git directories.
+func BuildTarget(ctx context.Context, target string, opts *BuildSessionOptions) error {
+	cfg, err := LoadConfig()
+	if err != nil {
+		return err
+	}
+
 	log := sst.LogxRoot().Subsystem("gitpm.dag")
-	for _, p := range paths {
-		m, err := LoadManifest(p)
+	stat, err := os.Stat(target)
+	if err != nil {
+		return fmt.Errorf("target not found: %s", target)
+	}
+
+	var manifestPath string
+	var workDir string
+
+	if stat.IsDir() {
+		// --- LOCAL REPO MODE ---
+		manifestPath = filepath.Join(target, ".gitpm", "manifest.yaml")
+		if _, err := os.Stat(manifestPath); os.IsNotExist(err) {
+			return fmt.Errorf("no .gitpm/manifest.yaml found in %s", target)
+		}
+
+		m, err := LoadManifest(manifestPath)
 		if err != nil {
 			return err
 		}
-		if err := buildOneManifest(ctx, log, m, opts); err != nil {
-			return fmt.Errorf("%s: %w", filepath.Base(p), err)
+
+		workDir = filepath.Join(cfg.BuildDir, m.Metadata.Name)
+
+		if !opts.Cont && !opts.Clean && opts.Revert == "" && !opts.List {
+			_ = os.RemoveAll(workDir)
+			_ = os.MkdirAll(filepath.Dir(workDir), 0755)
+
+			fmt.Printf("📦 Cloning local repository into ZFS workspace: %s\n", workDir)
+			// Using --local hardlinks the Git objects, making this near-instant while preserving ZFS boundaries
+			cloneCmd := exec.Command("git", "clone", "--local", target, workDir)
+			if out, err := cloneCmd.CombinedOutput(); err != nil {
+				return fmt.Errorf("failed to clone into buildroot: %s\n%s", err, out)
+			}
 		}
+
+		manifestPath = filepath.Join(workDir, ".gitpm", "manifest.yaml")
+	} else {
+		// --- STANDARD FILE MODE ---
+		manifestPath = target
 	}
-	return nil
+
+	m, err := LoadManifest(manifestPath)
+	if err != nil {
+		return err
+	}
+
+	if workDir == "" {
+		workDir = filepath.Join(cfg.BuildDir, m.Metadata.Name)
+		_ = os.MkdirAll(workDir, 0755)
+	}
+
+	return buildOneManifest(ctx, log, m, workDir, cfg, opts)
 }
 
 // --- Universal Checkpointing Logic ---
@@ -124,36 +187,21 @@ func checkSnapshotExists(workDir, hash string) bool {
 
 // --- Main Engine ---
 
-func buildOneManifest(ctx context.Context, log *sst.Logx, m *Manifest, opts *BuildSessionOptions) error {
+func buildOneManifest(ctx context.Context, log *sst.Logx, m *gitpmpb.Manifest, workDir string, cfg *Config, opts *BuildSessionOptions) error {
 	if m.Kind != "" && m.Kind != "package" {
 		return fmt.Errorf("kind %q not implemented", m.Kind)
 	}
 
-	buildBase := os.Getenv("SST_PACKAGE_BUILD_DIR")
-	if buildBase == "" {
-		if info, err := os.Stat("/package-build"); err == nil && info.IsDir() {
-			buildBase = "/package-build"
-		} else {
-			buildBase = "buildroot" 
-		}
-	}
-
-	workDir := filepath.Join(buildBase, m.Name)
-	_ = os.MkdirAll(workDir, 0o755)
-
 	nodes := generateASTNodes(m, workDir)
-
-	statePath := filepath.Join(buildBase, fmt.Sprintf(".%s-state.json", m.Name))
+	statePath := filepath.Join(cfg.BuildDir, fmt.Sprintf(".%s-state.json", m.Metadata.Name))
 
 	if opts.Clean {
-		fmt.Printf("🧹 Cleaning all checkpoints for %s...\n", m.Name)
 		var hashes []string
 		for _, n := range nodes {
 			hashes = append(hashes, n.Hash)
 		}
 		cleanSnapshots(workDir, hashes)
 		_ = os.Remove(statePath)
-		fmt.Println("✅ Clean complete.")
 		return nil
 	}
 
@@ -177,14 +225,13 @@ func buildOneManifest(ctx context.Context, log *sst.Logx, m *Manifest, opts *Bui
 	}
 
 	if !opts.Cont {
-		_ = os.RemoveAll(workDir)
-		_ = os.MkdirAll(workDir, 0o755)
 		runner.Completed = make(map[string]bool)
 	}
 
 	var root *sst.Context
 	var prev *sst.Context
 	var parentHash string
+	var hasRestored bool
 
 	for _, n := range nodes {
 		currNode := n
@@ -199,11 +246,12 @@ func buildOneManifest(ctx context.Context, log *sst.Logx, m *Manifest, opts *Bui
 			},
 
 			Restore: func(c context.Context) error {
-				if pHash != "" {
-					fmt.Printf("⏪ Divergence detected. Rolling back environment to @%s...\n", pHash)
+				if opts.Cont && !hasRestored && pHash != "" {
+					fmt.Printf("\n\033[33m⏪ RESUMING: Restoring environment to state @%s...\033[0m\n\n", pHash[:8])
 					if err := rollbackSnapshot(workDir, pHash); err != nil {
 						return err
 					}
+					hasRestored = true
 				}
 				return nil
 			},
@@ -219,13 +267,11 @@ func buildOneManifest(ctx context.Context, log *sst.Logx, m *Manifest, opts *Bui
 
 		if prev != nil {
 			nextCtx := stepCtx
-			prevHashForSnapshot := pHash 
+			prevHashForSnapshot := pHash
 			prev.Interpret = func(res *sst.Result) ([]*sst.Context, error) {
 				if res.Error != nil {
 					return nil, res.Error
 				}
-				// CRITICAL FIX: Only snapshot if it doesn't already exist.
-				// This prevents skipping steps from overwriting the clean historical state!
 				if !checkSnapshotExists(workDir, prevHashForSnapshot) {
 					_ = takeSnapshot(workDir, prevHashForSnapshot)
 				}
@@ -238,7 +284,7 @@ func buildOneManifest(ctx context.Context, log *sst.Logx, m *Manifest, opts *Bui
 	}
 
 	if prev != nil {
-		prevHashForSnapshot := parentHash 
+		prevHashForSnapshot := parentHash
 		prev.Interpret = func(res *sst.Result) ([]*sst.Context, error) {
 			if res.Error != nil {
 				return nil, res.Error
@@ -246,11 +292,10 @@ func buildOneManifest(ctx context.Context, log *sst.Logx, m *Manifest, opts *Bui
 			if !checkSnapshotExists(workDir, prevHashForSnapshot) {
 				_ = takeSnapshot(workDir, prevHashForSnapshot)
 			}
-			return nil, packageArtifacts(m, workDir)
+			return nil, packageArtifacts(m, workDir, cfg)
 		}
 	}
 
-	fmt.Printf("▶️  Executing %s %s\n", m.Name, m.Version)
 	return runner.Run(ctx, root)
 }
 
@@ -278,50 +323,55 @@ func printASTList(nodes []ASTNode, completed map[string]bool) {
 
 func executeRevert(nodes []ASTNode, completed map[string]bool, workDir, statePath, revertTarget string) error {
 	var targetHash string
+	var parentHash string
 	for _, n := range nodes {
 		if fmt.Sprintf("%02d", n.Index) == revertTarget {
 			targetHash = n.Hash
 			break
 		}
+		parentHash = n.Hash
 	}
 
 	if targetHash == "" {
 		return fmt.Errorf("step index '%s' not found", revertTarget)
 	}
 
-	if !completed[targetHash] {
-		return fmt.Errorf("cannot revert to step %s: it has not been completed", revertTarget)
+	if !completed[targetHash] && !completed[parentHash] {
+		return fmt.Errorf("cannot revert step %s: neither it nor its parent has been completed", revertTarget)
 	}
 
-	fmt.Printf("⏪ Rolling back dataset to state AFTER step %s...\n", revertTarget)
-	if err := rollbackSnapshot(workDir, targetHash); err != nil {
-		return err
+	if parentHash == "" {
+		_ = os.RemoveAll(workDir)
+		_ = os.MkdirAll(workDir, 0o755)
+	} else {
+		if err := rollbackSnapshot(workDir, parentHash); err != nil {
+			return err
+		}
 	}
 
 	found := false
 	for _, n := range nodes {
-		if found {
-			delete(completed, n.Hash)
-		}
 		if n.Hash == targetHash {
 			found = true
+		}
+		if found {
+			delete(completed, n.Hash)
 		}
 	}
 
 	_ = os.Remove(statePath)
-	fmt.Println("✅ Revert complete. Run with --cont to resume.")
 	return nil
 }
 
-func generateASTNodes(m *Manifest, workDir string) []ASTNode {
+func generateASTNodes(m *gitpmpb.Manifest, workDir string) []ASTNode {
 	var nodes []ASTNode
 	idx := 1
 
 	h := sha256.New()
-	h.Write([]byte(m.Name + m.Version))
+	h.Write([]byte(m.Metadata.Name + m.Metadata.Version))
 	prevHash := hex.EncodeToString(h.Sum(nil))
 
-	appendPhase := func(phase string, steps []BuildStep) {
+	appendPhase := func(phase string, steps []*gitpmpb.Step) {
 		parser := syntax.NewParser(syntax.Variant(syntax.LangBash))
 		printer := syntax.NewPrinter()
 
@@ -368,20 +418,24 @@ func generateASTNodes(m *Manifest, workDir string) []ASTNode {
 		}
 	}
 
-	if m.Source.Fetch != "" {
-		appendPhase("fetch", []BuildStep{{Run: m.Source.Fetch}})
-	} else if m.Source.URL != "" {
-		appendPhase("fetch", []BuildStep{
-			{Run: fmt.Sprintf("curl -fSL '%s' -o source.tar.gz", m.Source.URL)},
-			{Run: "tar -xf source.tar.gz"},
-		})
-	} else if m.Source.Method == "git" {
-		appendPhase("fetch", []BuildStep{
-			{Run: fmt.Sprintf("git clone --depth 1 --branch %s %s .", m.Source.Tag, m.Repo)},
-		})
+	if m.Source != nil {
+		if m.Source.Method == "git" {
+			appendPhase("fetch", []*gitpmpb.Step{{Run: fmt.Sprintf("git clone --depth 1 --branch %s %s .", m.Source.Ref, m.Source.Url)}})
+		} else if m.Source.Method == "tar" {
+			appendPhase("fetch", []*gitpmpb.Step{
+				{Run: fmt.Sprintf("curl -fSL '%s' -o source.tar.gz", m.Source.Url)},
+				{Run: "tar -xf source.tar.gz"},
+			})
+		}
 	}
 
-	appendPhase("build", toBuildSteps(m.Build.Steps))
+	if m.Phases != nil {
+		appendPhase("fetch", m.Phases.Fetch)
+		appendPhase("build", m.Phases.Build)
+		appendPhase("build_test", m.Phases.BuildTest)
+		appendPhase("install", m.Phases.Install)
+		appendPhase("install_test", m.Phases.InstallTest)
+	}
 
 	return nodes
 }
@@ -420,18 +474,18 @@ func executeASTNode(ctx context.Context, log *sst.Logx, node ASTNode, workDir st
 	return err
 }
 
-func packageArtifacts(m *Manifest, buildRoot string) error {
-	outDir := "dist"
+func packageArtifacts(m *gitpmpb.Manifest, buildRoot string, cfg *Config) error {
+	outDir := cfg.DistDir
 	_ = os.MkdirAll(outDir, 0o755)
 	arch := runtime.GOARCH
 
 	opts := Options{
 		InputType:   "dir",
-		Name:        m.Name,
-		Version:     m.Version,
+		Name:        m.Metadata.Name,
+		Version:     m.Metadata.Version,
 		Chdir:       buildRoot,
-		Prefix:      m.Install.Prefix,
-		Description: "",
+		Prefix:      m.Outputs.Prefix,
+		Description: m.Metadata.Description,
 	}
 	if opts.Prefix == "" {
 		opts.Prefix = "/"
@@ -453,41 +507,15 @@ func packageArtifacts(m *Manifest, buildRoot string) error {
 			return err
 		}
 
-		target := filepath.Join(outDir, fmt.Sprintf("%s_%s_%s.%s", m.Name, m.Version, arch, t))
+		target := filepath.Join(outDir, fmt.Sprintf("%s_%s_%s.%s", m.Metadata.Name, m.Metadata.Version, arch, t))
 		if err := os.Rename(outFile, target); err != nil {
 			if copyErr := copyFile(outFile, target); copyErr != nil {
 				return fmt.Errorf("cannot move %s -> %s: %v / %v", outFile, target, err, copyErr)
 			}
 		}
-		fmt.Printf("📦 Artifact packaged: %s\n", target)
+		fmt.Printf("📦 Artifact packaged securely to DistDir: %s\n", target)
 	}
 	return nil
-}
-
-func toBuildSteps(raw interface{}) []BuildStep {
-	switch v := raw.(type) {
-	case []struct {
-		Run string `yaml:"run"`
-	}:
-		out := make([]BuildStep, len(v))
-		for i, s := range v {
-			out[i] = BuildStep{Run: s.Run}
-		}
-		return out
-
-	case []struct {
-		Run string `yaml:"run"`
-		Dir string `yaml:"dir,omitempty"`
-	}:
-		out := make([]BuildStep, len(v))
-		for i, s := range v {
-			out[i] = BuildStep{Run: s.Run, Dir: s.Dir}
-		}
-		return out
-
-	default:
-		return nil
-	}
 }
 
 func copyFile(src, dst string) error {

@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package sst.yaml.compose.v1;
 
-option go_package = "github.com/swiss-software-tool/sst/proto/yaml/compose/v1;composepb";
+option go_package = "github.com/troodos-exascale/sst/proto/yaml/compose/v1;composepb";
 
 import "google/protobuf/struct.proto";
 

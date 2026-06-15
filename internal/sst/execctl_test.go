@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/swiss-software-tool/sst/internal/sst"
+	"github.com/troodos-exascale/sst/internal/sst"
 )
 
 // Helper to assert that a specific sequence of messages exists in the logs

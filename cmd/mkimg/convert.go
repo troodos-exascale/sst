@@ -8,9 +8,9 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/swiss-software-tool/sst/internal/rtsst"
-	"github.com/swiss-software-tool/sst/internal/sst"
-	mkimagepb "github.com/swiss-software-tool/sst/proto/yaml/mkimage/v1"
+	"github.com/troodos-exascale/sst/internal/rtsst"
+	"github.com/troodos-exascale/sst/internal/sst"
+	mkimagepb "github.com/troodos-exascale/sst/proto/yaml/mkimage/v1"
 )
 
 var convertCmd = &cobra.Command{

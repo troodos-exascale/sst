@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/swiss-software-tool/sst/internal/sst"
-	mkimagepb "github.com/swiss-software-tool/sst/proto/yaml/mkimage/v1"
-	runctlpb "github.com/swiss-software-tool/sst/proto/yaml/runctl/v1"
+	"github.com/troodos-exascale/sst/internal/sst"
+	mkimagepb "github.com/troodos-exascale/sst/proto/yaml/mkimage/v1"
+	runctlpb "github.com/troodos-exascale/sst/proto/yaml/runctl/v1"
 )
 
 // UpdateCatalog safely links a target directory into ~/.runtimes/<kind>/<name>.

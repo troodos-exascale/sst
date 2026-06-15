@@ -9,8 +9,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	sst "github.com/swiss-software-tool/sst/internal/sst"
-	hardwarepb "github.com/swiss-software-tool/sst/proto/yaml/hardware/v1"
+	sst "github.com/troodos-exascale/sst/internal/sst"
+	hardwarepb "github.com/troodos-exascale/sst/proto/yaml/hardware/v1"
 )
 
 var probeCmd = &cobra.Command{

@@ -99,7 +99,6 @@ func Exec(ctx context.Context, log *Logx, req ExecRequest) (*ExecResult, error) 
 	var exitCode int
 	var waitErr error
 
-	// Detect if this is a shell invocation (e.g., bash -c '...', sh -c '...')
 	isShell := false
 	var script string
 	var scriptName string
@@ -109,7 +108,6 @@ func Exec(ctx context.Context, log *Logx, req ExecRequest) (*ExecResult, error) 
 		isShell = true
 		script = req.Args[1]
 
-		// Map arguments according to bash '$0' semantics
 		if len(req.Args) > 2 {
 			scriptName = req.Args[2]
 		} else {
@@ -134,6 +132,7 @@ func Exec(ctx context.Context, log *Logx, req ExecRequest) (*ExecResult, error) 
 	}
 
 	dur := time.Since(start)
+	durUS := dur.Microseconds()
 
 	res := &ExecResult{
 		ExitCode: exitCode,
@@ -156,7 +155,7 @@ func Exec(ctx context.Context, log *Logx, req ExecRequest) (*ExecResult, error) 
 
 		log.Diagnose(ctx, "EXEC_FAILED", "command execution failed",
 			"cmd", req.Cmd, "args", req.Args, "cmdline", cmdline,
-			"exit_code", exitCode, "stderr", errMsg, "duration_ms", dur.Milliseconds(),
+			"exit_code", exitCode, "stderr", errMsg, "duration_us", durUS,
 		)
 
 		if errMsg != "" && req.Mode != ExecForeground {
@@ -171,7 +170,7 @@ func Exec(ctx context.Context, log *Logx, req ExecRequest) (*ExecResult, error) 
 		}
 	}
 
-	log.Info(ctx, "exec.ok", "cmd", req.Cmd, "cmdline", cmdline, "duration_ms", dur.Milliseconds())
+	log.Info(ctx, "exec.ok", "cmd", req.Cmd, "cmdline", cmdline, "duration_us", durUS)
 	return res, nil
 }
 
@@ -187,7 +186,6 @@ func executeShell(ctx context.Context, log *Logx, script, scriptName string, scr
 		return fmt.Errorf("failed to parse shell script: %w", err)
 	}
 
-	// Merge os.Environ and request environment
 	envMap := make(map[string]string)
 	for _, e := range os.Environ() {
 		parts := strings.SplitN(e, "=", 2)
@@ -206,22 +204,20 @@ func executeShell(ctx context.Context, log *Logx, script, scriptName string, scr
 		envList = append(envList, k+"="+v)
 	}
 
-	// The custom execution handler that wraps the default one to provide granular logging
 	execHandler := func(ictx context.Context, args []string) error {
 		start := time.Now()
 		if len(args) > 0 {
 			log.Debug(ctx, "sh.cmd.start", "cmd", args[0], "args", args[1:])
 		}
 
-		// Delegate to the actual system execution (0 timeout means no timeout)
 		err := interp.DefaultExecHandler(0)(ictx, args)
 
 		dur := time.Since(start)
 		if len(args) > 0 {
 			if err != nil {
-				log.Error(ctx, "sh.cmd.fail", "cmd", args[0], "error", err.Error(), "duration_ms", dur.Milliseconds())
+				log.Error(ctx, "sh.cmd.fail", "cmd", args[0], "error", err.Error(), "duration_us", dur.Microseconds())
 			} else {
-				log.Debug(ctx, "sh.cmd.ok", "cmd", args[0], "duration_ms", dur.Milliseconds())
+				log.Debug(ctx, "sh.cmd.ok", "cmd", args[0], "duration_us", dur.Microseconds())
 			}
 		}
 		return err

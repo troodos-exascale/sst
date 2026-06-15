@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package sst.yaml.mkimage.v1;
 
-option go_package = "github.com/swiss-software-tool/sst/proto/yaml/mkimage/v1;mkimagepb";
+option go_package = "github.com/troodos-exascale/sst/proto/yaml/mkimage/v1;mkimagepb";
 
 // ============================================================================
 // Top-level image document

@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package sst.yaml.runctl.v1;
 
-option go_package = "github.com/swiss-software-tool/sst/proto/yaml/runctl/v1;runctlpb";
+option go_package = "github.com/troodos-exascale/sst/proto/yaml/runctl/v1;runctlpb";
 
 message Instance {
   string api_version = 1; // "sst.io/v1"
