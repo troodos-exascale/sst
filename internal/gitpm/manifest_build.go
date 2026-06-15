@@ -1,6 +1,10 @@
 package gitpm
 
 import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -8,61 +12,415 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/swiss-software-tool/sst/internal/sst"
+	"mvdan.cc/sh/v3/syntax"
 )
 
-// BuildStep is the shared struct used for YAML decoding and execution.
-// Backward compatible: existing manifests with only `run:` still work.
-// New: optional `dir:` lets you run a step in a subdirectory of the source tree.
 type BuildStep struct {
 	Run string `yaml:"run"`
 	Dir string `yaml:"dir,omitempty"`
 }
 
-// BuildFromManifest builds all packages described by YAML manifest(s).
-func BuildFromManifest(paths []string) error {
+type BuildSessionOptions struct {
+	List   bool
+	Cont   bool
+	Clean  bool
+	Revert string
+	Debug  bool
+}
+
+type ASTNode struct {
+	Phase   string
+	Index   int
+	Command string
+	Dir     string
+	Hash    string
+}
+
+func BuildFromManifest(ctx context.Context, paths []string, opts *BuildSessionOptions) error {
+	log := sst.LogxRoot().Subsystem("gitpm.dag")
 	for _, p := range paths {
 		m, err := LoadManifest(p)
 		if err != nil {
 			return err
 		}
-		if err := buildOneManifest(m); err != nil {
+		if err := buildOneManifest(ctx, log, m, opts); err != nil {
 			return fmt.Errorf("%s: %w", filepath.Base(p), err)
 		}
 	}
 	return nil
 }
 
-func buildOneManifest(m *Manifest) error {
-	switch m.Kind {
-	case "", "package":
-		return buildPackageManifest(m)
-	default:
-		return fmt.Errorf("kind %q not implemented", m.Kind)
+// --- Universal Checkpointing Logic ---
+
+func isZfsDataset(dir string) bool {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	out, err := exec.Command("zfs", "list", "-H", "-o", "mountpoint", abs).Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == abs
+}
+
+func takeSnapshot(workDir, hash string) error {
+	if isZfsDataset(workDir) {
+		ds, _ := exec.Command("zfs", "list", "-H", "-o", "name", workDir).Output()
+		dataset := strings.TrimSpace(string(ds))
+		return exec.Command("zfs", "snapshot", fmt.Sprintf("%s@%s", dataset, hash)).Run()
+	}
+
+	checkpointDir := filepath.Join(".checkpoints", filepath.Base(workDir), hash)
+	_ = os.MkdirAll(filepath.Dir(checkpointDir), 0755)
+	_ = os.RemoveAll(checkpointDir)
+	return exec.Command("cp", "-a", workDir, checkpointDir).Run()
+}
+
+func rollbackSnapshot(workDir, hash string) error {
+	if isZfsDataset(workDir) {
+		ds, _ := exec.Command("zfs", "list", "-H", "-o", "name", workDir).Output()
+		dataset := strings.TrimSpace(string(ds))
+		out, err := exec.Command("zfs", "rollback", "-r", "-f", fmt.Sprintf("%s@%s", dataset, hash)).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("zfs rollback failed: %s", string(out))
+		}
+		return nil
+	}
+
+	checkpointDir := filepath.Join(".checkpoints", filepath.Base(workDir), hash)
+	if _, err := os.Stat(checkpointDir); os.IsNotExist(err) {
+		return fmt.Errorf("checkpoint %s not found", checkpointDir)
+	}
+
+	_ = os.RemoveAll(workDir)
+	return exec.Command("cp", "-a", checkpointDir, workDir).Run()
+}
+
+func cleanSnapshots(workDir string, hashes []string) {
+	if isZfsDataset(workDir) {
+		ds, _ := exec.Command("zfs", "list", "-H", "-o", "name", workDir).Output()
+		dataset := strings.TrimSpace(string(ds))
+		for _, h := range hashes {
+			_ = exec.Command("zfs", "destroy", fmt.Sprintf("%s@%s", dataset, h)).Run()
+		}
+	} else {
+		_ = os.RemoveAll(filepath.Join(".checkpoints", filepath.Base(workDir)))
 	}
 }
 
-func buildPackageManifest(m *Manifest) error {
-	fmt.Printf("▶️  %s %s\n", m.Name, m.Version)
+func checkSnapshotExists(workDir, hash string) bool {
+	if isZfsDataset(workDir) {
+		ds, _ := exec.Command("zfs", "list", "-H", "-o", "name", workDir).Output()
+		dataset := strings.TrimSpace(string(ds))
+		return exec.Command("zfs", "list", "-t", "snapshot", fmt.Sprintf("%s@%s", dataset, hash)).Run() == nil
+	}
+	checkpointDir := filepath.Join(".checkpoints", filepath.Base(workDir), hash)
+	_, err := os.Stat(checkpointDir)
+	return err == nil
+}
 
-	// 1) Resolve source dir (git/archive/local/exec) with sane autodetection.
-	srcDir, err := manifestFetchSource(m)
-	if err != nil {
-		return fmt.Errorf("fetch: %w", err)
+// --- Main Engine ---
+
+func buildOneManifest(ctx context.Context, log *sst.Logx, m *Manifest, opts *BuildSessionOptions) error {
+	if m.Kind != "" && m.Kind != "package" {
+		return fmt.Errorf("kind %q not implemented", m.Kind)
 	}
 
-	// 2) Fresh buildroot for this package
-	buildRoot := filepath.Join("buildroot", m.Name)
-	_ = os.RemoveAll(buildRoot)
-	if err := os.MkdirAll(buildRoot, 0o755); err != nil {
+	buildBase := os.Getenv("SST_PACKAGE_BUILD_DIR")
+	if buildBase == "" {
+		if info, err := os.Stat("/package-build"); err == nil && info.IsDir() {
+			buildBase = "/package-build"
+		} else {
+			buildBase = "buildroot" 
+		}
+	}
+
+	workDir := filepath.Join(buildBase, m.Name)
+	_ = os.MkdirAll(workDir, 0o755)
+
+	nodes := generateASTNodes(m, workDir)
+
+	statePath := filepath.Join(buildBase, fmt.Sprintf(".%s-state.json", m.Name))
+
+	if opts.Clean {
+		fmt.Printf("🧹 Cleaning all checkpoints for %s...\n", m.Name)
+		var hashes []string
+		for _, n := range nodes {
+			hashes = append(hashes, n.Hash)
+		}
+		cleanSnapshots(workDir, hashes)
+		_ = os.Remove(statePath)
+		fmt.Println("✅ Clean complete.")
+		return nil
+	}
+
+	runner := &sst.Runner{
+		Log:       log,
+		StatePath: statePath,
+		State:     make(map[string]interface{}),
+		Completed: make(map[string]bool),
+		Debug:     opts.Debug,
+	}
+
+	_ = runner.Run(ctx, &sst.Context{Action: func(c context.Context) (interface{}, error) { return nil, nil }})
+
+	if opts.List {
+		printASTList(nodes, runner.Completed)
+		return nil
+	}
+
+	if opts.Revert != "" {
+		return executeRevert(nodes, runner.Completed, workDir, statePath, opts.Revert)
+	}
+
+	if !opts.Cont {
+		_ = os.RemoveAll(workDir)
+		_ = os.MkdirAll(workDir, 0o755)
+		runner.Completed = make(map[string]bool)
+	}
+
+	var root *sst.Context
+	var prev *sst.Context
+	var parentHash string
+
+	for _, n := range nodes {
+		currNode := n
+		pHash := parentHash
+
+		stepCtx := &sst.Context{
+			ID:          currNode.Hash,
+			Description: fmt.Sprintf("[%s %02d] %s", currNode.Phase, currNode.Index, currNode.Command),
+
+			Probe: func(c context.Context) (bool, error) {
+				return checkSnapshotExists(workDir, currNode.Hash), nil
+			},
+
+			Restore: func(c context.Context) error {
+				if pHash != "" {
+					fmt.Printf("⏪ Divergence detected. Rolling back environment to @%s...\n", pHash)
+					if err := rollbackSnapshot(workDir, pHash); err != nil {
+						return err
+					}
+				}
+				return nil
+			},
+
+			Action: func(c context.Context) (interface{}, error) {
+				return nil, executeASTNode(c, log, currNode, workDir)
+			},
+		}
+
+		if root == nil {
+			root = stepCtx
+		}
+
+		if prev != nil {
+			nextCtx := stepCtx
+			prevHashForSnapshot := pHash 
+			prev.Interpret = func(res *sst.Result) ([]*sst.Context, error) {
+				if res.Error != nil {
+					return nil, res.Error
+				}
+				// CRITICAL FIX: Only snapshot if it doesn't already exist.
+				// This prevents skipping steps from overwriting the clean historical state!
+				if !checkSnapshotExists(workDir, prevHashForSnapshot) {
+					_ = takeSnapshot(workDir, prevHashForSnapshot)
+				}
+				return []*sst.Context{nextCtx}, nil
+			}
+		}
+
+		prev = stepCtx
+		parentHash = currNode.Hash
+	}
+
+	if prev != nil {
+		prevHashForSnapshot := parentHash 
+		prev.Interpret = func(res *sst.Result) ([]*sst.Context, error) {
+			if res.Error != nil {
+				return nil, res.Error
+			}
+			if !checkSnapshotExists(workDir, prevHashForSnapshot) {
+				_ = takeSnapshot(workDir, prevHashForSnapshot)
+			}
+			return nil, packageArtifacts(m, workDir)
+		}
+	}
+
+	fmt.Printf("▶️  Executing %s %s\n", m.Name, m.Version)
+	return runner.Run(ctx, root)
+}
+
+func printASTList(nodes []ASTNode, completed map[string]bool) {
+	fmt.Printf("--- Build Execution Graph ---\n")
+	currentPhase := ""
+	for _, n := range nodes {
+		if n.Phase != currentPhase {
+			fmt.Printf("\nStage: [%s]\n", strings.ToUpper(n.Phase))
+			currentPhase = n.Phase
+		}
+		status := "PENDING"
+		if completed[n.Hash] {
+			status = "OK     "
+		}
+
+		cmdPreview := n.Command
+		if len(cmdPreview) > 60 {
+			cmdPreview = cmdPreview[:57] + "..."
+		}
+
+		fmt.Printf("  [%02d] %s | %s\n", n.Index, status, cmdPreview)
+	}
+}
+
+func executeRevert(nodes []ASTNode, completed map[string]bool, workDir, statePath, revertTarget string) error {
+	var targetHash string
+	for _, n := range nodes {
+		if fmt.Sprintf("%02d", n.Index) == revertTarget {
+			targetHash = n.Hash
+			break
+		}
+	}
+
+	if targetHash == "" {
+		return fmt.Errorf("step index '%s' not found", revertTarget)
+	}
+
+	if !completed[targetHash] {
+		return fmt.Errorf("cannot revert to step %s: it has not been completed", revertTarget)
+	}
+
+	fmt.Printf("⏪ Rolling back dataset to state AFTER step %s...\n", revertTarget)
+	if err := rollbackSnapshot(workDir, targetHash); err != nil {
 		return err
 	}
 
-	// 3) Execute steps with BUILDROOT exported
-	if err := manifestExecuteSteps(srcDir, buildRoot, toBuildSteps(m.Build.Steps)); err != nil {
-		return fmt.Errorf("steps: %w", err)
+	found := false
+	for _, n := range nodes {
+		if found {
+			delete(completed, n.Hash)
+		}
+		if n.Hash == targetHash {
+			found = true
+		}
 	}
 
-	// 4) Package into dist/ with <name>_<version>_<arch>.<deb|rpm>
+	_ = os.Remove(statePath)
+	fmt.Println("✅ Revert complete. Run with --cont to resume.")
+	return nil
+}
+
+func generateASTNodes(m *Manifest, workDir string) []ASTNode {
+	var nodes []ASTNode
+	idx := 1
+
+	h := sha256.New()
+	h.Write([]byte(m.Name + m.Version))
+	prevHash := hex.EncodeToString(h.Sum(nil))
+
+	appendPhase := func(phase string, steps []BuildStep) {
+		parser := syntax.NewParser(syntax.Variant(syntax.LangBash))
+		printer := syntax.NewPrinter()
+
+		for _, step := range steps {
+			prog, err := parser.Parse(strings.NewReader(step.Run), "")
+			if err != nil {
+				h := sha256.New()
+				h.Write([]byte(prevHash + phase + step.Run + step.Dir))
+				prevHash = hex.EncodeToString(h.Sum(nil))[:12]
+
+				nodes = append(nodes, ASTNode{
+					Phase:   phase,
+					Index:   idx,
+					Command: step.Run,
+					Dir:     step.Dir,
+					Hash:    prevHash,
+				})
+				idx++
+				continue
+			}
+
+			for _, stmt := range prog.Stmts {
+				var buf bytes.Buffer
+				_ = printer.Print(&buf, stmt)
+				cmdStr := strings.TrimSpace(buf.String())
+
+				if cmdStr == "" {
+					continue
+				}
+
+				h := sha256.New()
+				h.Write([]byte(prevHash + phase + cmdStr + step.Dir))
+				prevHash = hex.EncodeToString(h.Sum(nil))[:12]
+
+				nodes = append(nodes, ASTNode{
+					Phase:   phase,
+					Index:   idx,
+					Command: cmdStr,
+					Dir:     step.Dir,
+					Hash:    prevHash,
+				})
+				idx++
+			}
+		}
+	}
+
+	if m.Source.Fetch != "" {
+		appendPhase("fetch", []BuildStep{{Run: m.Source.Fetch}})
+	} else if m.Source.URL != "" {
+		appendPhase("fetch", []BuildStep{
+			{Run: fmt.Sprintf("curl -fSL '%s' -o source.tar.gz", m.Source.URL)},
+			{Run: "tar -xf source.tar.gz"},
+		})
+	} else if m.Source.Method == "git" {
+		appendPhase("fetch", []BuildStep{
+			{Run: fmt.Sprintf("git clone --depth 1 --branch %s %s .", m.Source.Tag, m.Repo)},
+		})
+	}
+
+	appendPhase("build", toBuildSteps(m.Build.Steps))
+
+	return nodes
+}
+
+func executeASTNode(ctx context.Context, log *sst.Logx, node ASTNode, workDir string) error {
+	absBuildRoot, _ := filepath.Abs(workDir)
+	runDir := absBuildRoot
+	if node.Dir != "" {
+		runDir = filepath.Join(absBuildRoot, node.Dir)
+	}
+
+	_ = os.MkdirAll(runDir, 0755)
+
+	defaultEnv := []string{
+		"SOURCE_DATE_EPOCH=0",
+		"TZ=UTC",
+		"LANG=C",
+		"LC_ALL=C",
+		"KBUILD_BUILD_TIMESTAMP=0",
+		"KBUILD_BUILD_USER=nobody",
+		"KBUILD_BUILD_HOST=sst",
+		"LDFLAGS=-Wl,--build-id=none",
+	}
+	env := append(os.Environ(), defaultEnv...)
+	env = append(env, "BUILDROOT="+absBuildRoot)
+
+	req := sst.ExecRequest{
+		Cmd:  "bash",
+		Args: []string{"-c", node.Command},
+		Dir:  runDir,
+		Env:  env,
+		Mode: sst.ExecForeground,
+	}
+
+	_, err := sst.Exec(ctx, log, req)
+	return err
+}
+
+func packageArtifacts(m *Manifest, buildRoot string) error {
 	outDir := "dist"
 	_ = os.MkdirAll(outDir, 0o755)
 	arch := runtime.GOARCH
@@ -72,8 +430,11 @@ func buildPackageManifest(m *Manifest) error {
 		Name:        m.Name,
 		Version:     m.Version,
 		Chdir:       buildRoot,
-		Prefix:      "/",
-		Description: "", // keep empty until provenance/annex flow
+		Prefix:      m.Install.Prefix,
+		Description: "",
+	}
+	if opts.Prefix == "" {
+		opts.Prefix = "/"
 	}
 
 	for _, t := range []string{"deb", "rpm"} {
@@ -94,82 +455,13 @@ func buildPackageManifest(m *Manifest) error {
 
 		target := filepath.Join(outDir, fmt.Sprintf("%s_%s_%s.%s", m.Name, m.Version, arch, t))
 		if err := os.Rename(outFile, target); err != nil {
-			// If writer placed it elsewhere/with different name, copy
 			if copyErr := copyFile(outFile, target); copyErr != nil {
 				return fmt.Errorf("cannot move %s -> %s: %v / %v", outFile, target, err, copyErr)
 			}
 		}
-		fmt.Printf("✅ built %s\n", target)
+		fmt.Printf("📦 Artifact packaged: %s\n", target)
 	}
 	return nil
-}
-
-// manifestFetchSource returns the directory where build steps should run.
-// It also tries to select the *actual* project root for wrapper repos.
-func manifestFetchSource(m *Manifest) (string, error) {
-	base := filepath.Join("checkouts", m.Name+"-"+m.Version)
-	_ = os.RemoveAll(base)
-	_ = os.MkdirAll("checkouts", 0o755)
-
-	// Mutually exclusive URL vs Fetch
-	if m.Source.URL != "" && m.Source.Fetch != "" {
-		return "", fmt.Errorf("manifest invalid: both url and fetch present")
-	}
-
-	// Archive URL (tar.*, zip, etc.) – naive fetch+extract
-	if m.Source.URL != "" {
-		fmt.Printf("🌐 fetching: %s\n", m.Source.URL)
-		out := filepath.Join("checkouts", "source.tar.gz")
-		if err := runLogged(".", "curl", "-fSL", m.Source.URL, "-o", out); err != nil {
-			return "", err
-		}
-		if err := runLogged("checkouts", "tar", "-xf", "source.tar.gz"); err != nil {
-			return "", err
-		}
-		root := firstDir("checkouts")
-		return root, nil
-	}
-
-	// Custom fetch command (user-provided)
-	if m.Source.Fetch != "" {
-		fmt.Printf("⚙️  custom fetch\n")
-		if err := runShell(".", m.Source.Fetch); err != nil {
-			return "", err
-		}
-		return firstDir("checkouts"), nil
-	}
-
-	// Git checkout by tag (+ optional signature verification)
-	if m.Source.Method == "git" {
-		if m.Repo == "" || m.Source.Tag == "" {
-			return "", fmt.Errorf("git fetch requires repo and tag")
-		}
-		fmt.Printf("📥 cloning %s @ %s\n", m.Repo, m.Source.Tag)
-		if err := gitCloneTagAndVerify(m.Repo, m.Source.Tag, base, m.Source.Signed); err != nil {
-			return "", err
-		}
-		// Heuristics:
-		// 1) If base has a Makefile, use it.
-		// 2) Else, if there is exactly one subdir AND it has a Makefile, descend.
-		if fileExists(filepath.Join(base, "Makefile")) {
-			return base, nil
-		}
-		if sub, ok := singleSubdir(base); ok && fileExists(filepath.Join(sub, "Makefile")) {
-			return sub, nil
-		}
-		// Fallback to base
-		return base, nil
-	}
-
-	// Local source: treat repo "", ".", or "local" as current directory
-	if m.Source.Method == "local" {
-		if m.Repo == "" || m.Repo == "." || m.Repo == "local" {
-			return ".", nil
-		}
-		return m.Repo, nil
-	}
-
-	return "", fmt.Errorf("no valid source")
 }
 
 func toBuildSteps(raw interface{}) []BuildStep {
@@ -196,112 +488,6 @@ func toBuildSteps(raw interface{}) []BuildStep {
 	default:
 		return nil
 	}
-}
-
-func manifestExecuteSteps(srcDir, buildRoot string, steps []BuildStep) error {
-	// Ensure BUILDROOT exists and is absolute for clarity in logs
-	if err := os.MkdirAll(buildRoot, 0o755); err != nil {
-		return err
-	}
-	absBuildRoot, _ := filepath.Abs(buildRoot)
-	// Default reproducible build environment
-	defaultEnv := []string{
-		"SOURCE_DATE_EPOCH=0",
-		"TZ=UTC",
-		"LANG=C",
-		"LC_ALL=C",
-		"KBUILD_BUILD_TIMESTAMP=0",
-		"KBUILD_BUILD_USER=nobody",
-		"KBUILD_BUILD_HOST=sst",
-		"LDFLAGS=-Wl,--build-id=none",
-	}
-	env := append(os.Environ(), defaultEnv...)
-	env = append(env, "BUILDROOT="+buildRoot)
-
-	for i, s := range steps {
-		// Resolve working directory for this step
-		runDir := srcDir
-		if strings.TrimSpace(s.Dir) != "" {
-			runDir = filepath.Join(srcDir, s.Dir)
-		}
-		absRunDir, _ := filepath.Abs(runDir)
-
-		// Expand the visible command (so logs show where $BUILDROOT ended up)
-		runCmd := strings.ReplaceAll(s.Run, "$BUILDROOT", absBuildRoot)
-
-		fmt.Printf("🔧 step %d: %s\n", i+1, s.Run)
-		fmt.Printf("📂 running in %s with BUILDROOT=%s\n", absRunDir, absBuildRoot)
-		fmt.Printf("🧾 expanded command: %s\n", runCmd)
-
-		cmd := exec.Command("bash", "-c", runCmd)
-		cmd.Dir = absRunDir
-		cmd.Env = env
-		cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("step %d failed: %w", i+1, err)
-		}
-	}
-	return nil
-}
-
-// --- helpers ---
-
-func runLogged(dir string, cmd string, args ...string) error {
-	c := exec.Command(cmd, args...)
-	c.Dir = dir
-	c.Stdout, c.Stderr = os.Stdout, os.Stderr
-	return c.Run()
-}
-
-func runShell(dir, script string) error {
-	return runShellEnv(dir, script, os.Environ())
-}
-
-func runShellEnv(dir, script string, env []string) error {
-	c := exec.Command("bash", "-c", script)
-	c.Dir = dir
-	c.Env = env
-	c.Stdout, c.Stderr = os.Stdout, os.Stderr
-	return c.Run()
-}
-
-func firstDir(base string) string {
-	ents, _ := os.ReadDir(base)
-	for _, e := range ents {
-		if e.IsDir() {
-			return filepath.Join(base, e.Name())
-		}
-	}
-	return base
-}
-
-func singleSubdir(base string) (string, bool) {
-	ents, err := os.ReadDir(base)
-	if err != nil {
-		return "", false
-	}
-	var sub string
-	for _, e := range ents {
-		if e.IsDir() {
-			if sub != "" {
-				return "", false // more than one
-			}
-			sub = filepath.Join(base, e.Name())
-		} else {
-			// there are files at top-level; not a pure wrapper
-			return "", false
-		}
-	}
-	if sub == "" {
-		return "", false
-	}
-	return sub, true
-}
-
-func fileExists(p string) bool {
-	st, err := os.Stat(p)
-	return err == nil && !st.IsDir()
 }
 
 func copyFile(src, dst string) error {

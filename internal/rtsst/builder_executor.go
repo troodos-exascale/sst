@@ -3,7 +3,6 @@ package rtsst
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,62 +13,6 @@ import (
 	mkimagepb "github.com/swiss-software-tool/sst/proto/yaml/mkimage/v1"
 	runctlpb "github.com/swiss-software-tool/sst/proto/yaml/runctl/v1"
 )
-
-type BuildStepState struct {
-	Hash    string `json:"hash"`
-	Status  string `json:"status"`
-	LogPath string `json:"log_path,omitempty"`
-}
-
-type BuildState struct {
-	LastSuccessfulStep int                    `json:"last_successful_step"`
-	Status             string                 `json:"status"`
-	FailedAtStep       int                    `json:"failed_at_step,omitempty"`
-	Steps              map[int]BuildStepState `json:"steps"`
-}
-
-func (b *BuildApp) LoadState() (*BuildState, error) {
-	if b.DatasetMgr == nil {
-		return &BuildState{LastSuccessfulStep: -1, Status: "new", Steps: make(map[int]BuildStepState)}, nil
-	}
-	path := filepath.Join(b.DatasetMgr.MountPath(""), "state.json")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return &BuildState{LastSuccessfulStep: -1, Status: "new", Steps: make(map[int]BuildStepState)}, nil
-	}
-	var s BuildState
-	if err := json.Unmarshal(data, &s); err != nil {
-		return &BuildState{LastSuccessfulStep: -1, Status: "new", Steps: make(map[int]BuildStepState)}, nil
-	}
-	if s.Steps == nil {
-		s.Steps = make(map[int]BuildStepState)
-	}
-	return &s, nil
-}
-
-func (b *BuildApp) SaveState(s *BuildState) error {
-	if b.DatasetMgr == nil {
-		return nil 
-	}
-	path := filepath.Join(b.DatasetMgr.MountPath(""), "state.json")
-	data, err := json.MarshalIndent(s, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0644)
-}
-
-func (b *BuildApp) SnapshotActiveDatasets(ctx context.Context, tag string) {
-	if b.DatasetMgr == nil {
-		return
-	}
-	for stage := range b.StageMounts {
-		err := b.DatasetMgr.SnapshotDataset("as-roots/"+stage, tag)
-		if err != nil {
-			b.Log.Warn(ctx, "failed to snapshot dataset", "stage", stage, "tag", tag, "error", err)
-		}
-	}
-}
 
 func wrapWithTee(logFile string, cmd string, args ...string) (string, []string, []string) {
 	if logFile == "" {
@@ -113,7 +56,6 @@ func (b *BuildApp) InitEnvironment(ctx context.Context) error {
 		b.Log.Info(ctx, "force flag provided, annihilating existing build environment", "build_id", b.BuildID)
 		_ = b.DatasetMgr.Destroy()
 		
-		// If building an image, aggressively wipe the output directory before any steps run
 		if b.Name != "" && !strings.HasSuffix(b.Dockerfile, "instance.dockerfile") {
 			outDir := filepath.Join(b.RuntimeDir, "images", b.Name)
 			b.Log.Info(ctx, "force flag provided, wiping output directory", "dir", outDir)
@@ -157,170 +99,11 @@ func (b *BuildApp) execProvisionDataset(ctx context.Context, args string) error 
 		return err
 	}
 
-	b.StageMounts[target] = mntPath
 	b.Log.Info(ctx, "provisioned AS dataset", "stage", target, "mount", mntPath)
 	return nil
 }
 
-func (b *BuildApp) ExecuteSingleInstruction(ctx context.Context, inst Instruction) error {
-	var bState *BuildState
-	var logsDir, logFile, metaFile string
-
-	if b.DatasetMgr != nil {
-		bState, _ = b.LoadState()
-		logsDir = filepath.Join(b.DatasetMgr.MountPath(""), "logs")
-		os.MkdirAll(logsDir, 0755)
-
-		hashStub := ""
-		if len(inst.Hash) >= 8 {
-			hashStub = inst.Hash[:8]
-		}
-		
-		logFile = filepath.Join(logsDir, fmt.Sprintf("%02d_%s_%s.log", inst.Index, hashStub, strings.ToLower(inst.Type)))
-		metaFile = filepath.Join(logsDir, fmt.Sprintf("%02d_%s_meta.json", inst.Index, hashStub))
-	}
-
-	var args string
-	if inst.Type == "RUN" {
-		args = inst.Args
-	} else {
-		args = b.Substitute(inst.Args)
-	}
-
-	cleanArgs := args
-	if inst.Type != "RUN" {
-		cleanArgs = strings.SplitN(args, " #", 2)[0]
-		cleanArgs = strings.TrimSpace(cleanArgs)
-	}
-
-	var execErr error
-
-	switch inst.Type {
-	case "ARG":
-		parts := strings.SplitN(cleanArgs, "=", 2)
-		if len(parts) == 2 {
-			b.Args[parts[0]] = parts[1]
-		} else if val, ok := b.BuildArgs[parts[0]]; ok {
-			b.Args[parts[0]] = val
-		}
-	case "ENV":
-		parts := strings.SplitN(cleanArgs, "=", 2)
-		if len(parts) == 2 {
-			b.Env[parts[0]] = parts[1]
-		} else {
-			parts = strings.SplitN(cleanArgs, " ", 2)
-			if len(parts) == 2 {
-				b.Env[parts[0]] = parts[1]
-			}
-		}
-	case "WORKDIR":
-		b.Workdir = b.Substitute(cleanArgs)
-	case "USER":
-		b.User = b.Substitute(cleanArgs)
-	case "CMD":
-		b.Cmd = b.Substitute(cleanArgs)
-	case "ENTRYPOINT":
-		b.EntryPoint = b.Substitute(cleanArgs)
-	case "LABEL":
-		parts := strings.SplitN(cleanArgs, "=", 2)
-		if len(parts) == 2 {
-			b.Labels[strings.Trim(parts[0], `"`)] = strings.Trim(parts[1], `"`)
-		}
-	case "EXPOSE":
-		for _, port := range strings.Fields(cleanArgs) {
-			if !strings.Contains(port, "/") {
-				port += "/tcp"
-			}
-			b.ExposedPorts[port] = struct{}{}
-		}
-	case "VOLUME":
-		clean := strings.TrimPrefix(strings.TrimSuffix(cleanArgs, "]"), "[")
-		for _, vol := range strings.Split(clean, ",") {
-			b.Volumes[strings.Trim(strings.TrimSpace(vol), `"`)] = struct{}{}
-		}
-	case "FROM", "NAME", "VMOUT", "EMIT", "COPY", "ADD":
-		// Handled structurally during PreProcess
-	case "RUN":
-		if !b.shouldExecute(inst.Conditions) {
-			b.Log.Info(ctx, "skipping instruction (condition mismatch)", "conditions", inst.Conditions, "emits", b.Emits)
-		} else {
-			if strings.HasPrefix(inst.Args, "sys.provision_dataset") {
-				execErr = b.execProvisionDataset(ctx, inst.Args)
-			} else {
-				resolvedLoc := b.Substitute(inst.Location)
-				targetDir := b.RootDir
-				activeRootfs := b.RootDir
-
-				if resolvedLoc == "base" {
-					targetDir = filepath.Dir(b.RootDir)
-				} else if resolvedLoc == "boot" {
-					targetDir = filepath.Join(filepath.Dir(b.RootDir), "boot")
-				} else if stagePath, ok := b.StageMounts[resolvedLoc]; ok {
-					targetDir = stagePath
-					activeRootfs = stagePath
-				} else if resolvedLoc != "root" && resolvedLoc != "host" && resolvedLoc != "chroot" && resolvedLoc != "" {
-					if b.DatasetMgr != nil {
-						targetDir = filepath.Join(b.DatasetMgr.MountPath(""), resolvedLoc)
-					}
-					os.MkdirAll(targetDir, 0755)
-				}
-
-				b.Log.Info(ctx, "evaluating RUN directive", "context", inst.Context, "dir", targetDir)
-
-				if inst.Context == "host" {
-					execErr = b.execHostRun(ctx, args, targetDir, activeRootfs, logFile)
-				} else {
-					execErr = b.execChrootRun(ctx, args, targetDir, activeRootfs, logFile)
-				}
-			}
-		}
-	default:
-		execErr = fmt.Errorf("unknown instruction type: %s", inst.Type)
-	}
-
-	if b.DatasetMgr != nil && bState != nil {
-		status := "OK"
-		if execErr != nil {
-			status = "FAIL"
-		}
-
-		bState.Steps[inst.Index] = BuildStepState{
-			Hash:    inst.Hash,
-			Status:  status,
-			LogPath: logFile,
-		}
-
-		if execErr == nil {
-			bState.LastSuccessfulStep = inst.Index
-			bState.Status = "building"
-		} else {
-			bState.Status = "failed"
-			bState.FailedAtStep = inst.Index
-		}
-
-		_ = b.SaveState(bState)
-
-		metaData := map[string]interface{}{
-			"index":  inst.Index,
-			"type":   inst.Type,
-			"args":   inst.Args,
-			"hash":   inst.Hash,
-			"status": status,
-		}
-		if metaBytes, err := json.MarshalIndent(metaData, "", "  "); err == nil {
-			_ = os.WriteFile(metaFile, metaBytes, 0644)
-		}
-
-		if execErr == nil {
-			snapshotTag := fmt.Sprintf("step_%02d_hash_%s", inst.Index, inst.Hash[:8])
-			b.SnapshotActiveDatasets(ctx, snapshotTag)
-		}
-	}
-
-	return execErr
-}
-
-func (b *BuildApp) buildEnvironmentMap(activeRootfs string) []string {
+func (b *BuildApp) buildEnvironmentMap(inst Instruction, activeRootfs string) []string {
 	envMap := make(map[string]string)
 
 	if activeRootfs == "" {
@@ -342,14 +125,11 @@ func (b *BuildApp) buildEnvironmentMap(activeRootfs string) []string {
 		envMap["SST_CACHE_FROM"] = b.DatasetMgr.CacheDir("from")
 	}
 
-	for k, v := range b.Env {
-		envMap[k] = v
-	}
-	for k, v := range b.Args {
+	for k, v := range inst.Env {
 		envMap[k] = v
 	}
 	for k, v := range b.BuildArgs {
-		envMap[k] = v
+		envMap[k] = v // Global build args still overlay
 	}
 
 	var envs []string
@@ -359,14 +139,126 @@ func (b *BuildApp) buildEnvironmentMap(activeRootfs string) []string {
 	return envs
 }
 
-func (b *BuildApp) execHostRun(ctx context.Context, cmdStr string, targetDir string, activeRootfs string, logFile string) error {
+// CreateStepContext builds a pure, self-contained Protosh capsule for a Dockerfile instruction.
+func (b *BuildApp) CreateStepContext(inst Instruction, parentHash string) *sst.Context {
+	hashStub := inst.Hash
+	if len(hashStub) >= 8 {
+		hashStub = hashStub[:8]
+	}
+	_ = fmt.Sprintf("step_%02d_hash_%s", inst.Index, hashStub)
+
+	var pTag string
+	if parentHash != "" {
+		pStub := parentHash
+		if len(pStub) >= 8 {
+			pStub = pStub[:8]
+		}
+		pTag = fmt.Sprintf("step_%02d_hash_%s", inst.Index-1, pStub)
+	}
+
+	return &sst.Context{
+		ID:          inst.Hash,
+		Description: fmt.Sprintf("Step %02d: %s", inst.Index, inst.Type),
+		
+		Probe: func(c context.Context) (bool, error) {
+			if b.DatasetMgr != nil {
+				// We check if all primary target stages exist at this hash tag
+				// A more robust implementation would loop over inst.StageMounts,
+				// but relying on the TG engine's Completed map (backed by state.json) 
+				// is generally enough unless manual tampering occurred.
+				// We return false to allow tg.go to rely purely on state.json for now.
+				return false, nil 
+			}
+			return false, nil
+		},
+		
+		Restore: func(c context.Context) error {
+			if b.DatasetMgr != nil && pTag != "" {
+				b.Log.Info(c, "divergence detected, rolling back ZFS to parent state", "tag", pTag)
+				for stageTarget := range inst.StageMounts {
+					_ = b.DatasetMgr.RollbackDataset(stageTarget, pTag)
+				}
+			}
+			return nil
+		},
+
+		Action: func(c context.Context) (interface{}, error) {
+			return nil, b.executeAction(c, inst, hashStub)
+		},
+	}
+}
+
+func (b *BuildApp) executeAction(ctx context.Context, inst Instruction, hashStub string) error {
+	var logFile string
+
+	if b.DatasetMgr != nil {
+		logsDir := filepath.Join(b.DatasetMgr.MountPath(""), "logs")
+		os.MkdirAll(logsDir, 0755)
+		logFile = filepath.Join(logsDir, fmt.Sprintf("%02d_%s_%s.log", inst.Index, hashStub, strings.ToLower(inst.Type)))
+	}
+
+	var args string
+	if inst.Type == "RUN" {
+		args = inst.Args
+	} else {
+		// Variable expansion using the frozen env for this step
+		args = os.Expand(inst.Args, func(k string) string {
+			if v, ok := inst.Env[k]; ok { return v }
+			return ""
+		})
+	}
+
+	var execErr error
+
+	if inst.Type == "RUN" {
+		if !b.shouldExecute(inst.Conditions) {
+			b.Log.Info(ctx, "skipping instruction (condition mismatch)", "conditions", inst.Conditions, "emits", b.Emits)
+		} else {
+			if strings.HasPrefix(inst.Args, "sys.provision_dataset") {
+				execErr = b.execProvisionDataset(ctx, inst.Args)
+			} else {
+				resolvedLoc := os.Expand(inst.Location, func(k string) string { return inst.Env[k] })
+				targetDir := b.RootDir
+				activeRootfs := b.RootDir
+
+				if resolvedLoc == "base" {
+					targetDir = filepath.Dir(b.RootDir)
+				} else if resolvedLoc == "boot" {
+					targetDir = filepath.Join(filepath.Dir(b.RootDir), "boot")
+				} else if stagePath, ok := inst.StageMounts[resolvedLoc]; ok {
+					if b.DatasetMgr != nil {
+						targetDir = b.DatasetMgr.MountPath(stagePath)
+					}
+					activeRootfs = targetDir
+				} else if resolvedLoc != "root" && resolvedLoc != "host" && resolvedLoc != "chroot" && resolvedLoc != "" {
+					if b.DatasetMgr != nil {
+						targetDir = filepath.Join(b.DatasetMgr.MountPath(""), resolvedLoc)
+					}
+					os.MkdirAll(targetDir, 0755)
+				}
+
+				b.Log.Info(ctx, "evaluating RUN directive", "context", inst.Context, "dir", targetDir)
+
+				if inst.Context == "host" {
+					execErr = b.execHostRun(ctx, args, targetDir, activeRootfs, inst, logFile)
+				} else {
+					execErr = b.execChrootRun(ctx, args, targetDir, activeRootfs, inst, logFile)
+				}
+			}
+		}
+	}
+	
+	return execErr
+}
+
+func (b *BuildApp) execHostRun(ctx context.Context, cmdStr string, targetDir string, activeRootfs string, inst Instruction, logFile string) error {
 	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		return err
 	}
 
 	cmdToRun, argsToRun, extraEnv := wrapWithTee(logFile, "/bin/sh", "-c", cmdStr)
 	
-	env := b.buildEnvironmentMap(activeRootfs)
+	env := b.buildEnvironmentMap(inst, activeRootfs)
 	env = append(env, extraEnv...)
 
 	req := sst.ExecRequest{
@@ -383,7 +275,7 @@ func (b *BuildApp) execHostRun(ctx context.Context, cmdStr string, targetDir str
 	return nil
 }
 
-func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir string, activeRootfs string, logFile string) error {
+func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir string, activeRootfs string, inst Instruction, logFile string) error {
 	mounts := []string{"/dev", "/dev/pts", "/proc", "/sys"}
 	for _, m := range mounts {
 		target := filepath.Join(targetDir, m)
@@ -423,11 +315,11 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 
 	sst.ExecShell(ctx, b.Log, "cp", "-L", "/etc/resolv.conf", filepath.Join(targetDir, "etc/resolv.conf"))
 
-	workdir := b.Workdir
+	workdir := inst.Workdir
 	if workdir == "" {
 		workdir = "/"
 	}
-	user := b.User
+	user := inst.User
 	if user == "" {
 		user = "root"
 	}
@@ -453,7 +345,7 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 
 	cmdToRun, argsToRun, extraEnv := wrapWithTee(logFile, "chroot", targetDir, "/bin/sh", "-c", chrootCmd)
 
-	env := b.buildEnvironmentMap(activeRootfs)
+	env := b.buildEnvironmentMap(inst, activeRootfs)
 	env = append(env,
 		"APK_CACHE_DIR=/var/cache/apk",
 		"APT_CACHE_DIR=/var/cache/apt/archives",
@@ -502,7 +394,7 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 			Provenance: &mkimagepb.Provenance{
 				Name:            b.Name,
 				BuildId:         buildID,
-				UpstreamOs:      semanticName, // Recorded for tracking, but not used for paths!
+				UpstreamOs:      semanticName, 
 				UpstreamBuildId: upstreamBuildID,
 			},
 			Storage: &mkimagepb.StoragePlan{
@@ -515,10 +407,8 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 
 	rawDiskPath := filepath.Join(b.ImageOutput, b.Name+".raw")
 	if _, err := os.Stat(rawDiskPath); err == nil {
-		// It's a Hardware VM (Layer 3/4)
-		b.Log.Info(ctx, "populating manifest declaratively from build state (skipping block analysis)")
+		b.Log.Info(ctx, "populating manifest declaratively from build state")
 
-		// 1. Declarative Partition Layout
 		hasEFI := false
 		for relPath := range b.IncludedFiles {
 			if strings.Contains(relPath, "boot-efi") || strings.Contains(relPath, "efiboot") {
@@ -526,7 +416,6 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 				break
 			}
 		}
-		// Fallback check against the physical ZFS boot directory
 		if _, err := os.Stat(filepath.Join(b.RootDir, "boot", "efi")); err == nil {
 			hasEFI = true
 		}
@@ -543,7 +432,6 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 			sb.YamlObject.Boot.BootfsType = "ext4"
 		}
 
-		// 2. Extract Kernel/Initrd natively from ZFS workspace (if not already extracted by EMIT)
 		kernelExists := false
 		if _, err := os.Stat(filepath.Join(b.ImageOutput, "kernel")); err == nil {
 			sb.YamlObject.Boot.Kernel = "kernel"
@@ -580,7 +468,6 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 
 		QueuePurification(b.RuntimeDir, []string{rawDiskPath})
 	} else {
-		// It's a Container! (Layer 1/2). Promote the underlying ZFS dataset physically.
 		b.Log.Info(ctx, "resolving artifact as OCI container dataset")
 		sb.YamlObject.Storage.RawImage = "" 
 
@@ -641,25 +528,16 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		}
 	}
 
-	// Print the helpful workflow hint directly to the user
 	b.Log.Info(ctx, "✅ Build complete!", "next_step", fmt.Sprintf("mkimg instance %s <your-instance-name>", b.Name))
-
 	return nil
 }
 
 func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
-	instName := b.BuildArgs["INST_NAME"]
-	if instName == "" {
-		instName = b.Args["INST_NAME"]
-	}
+	instName := b.Args["INST_NAME"]
 	if instName == "" {
 		instName = b.Name
 	}
-
-	baseImage := b.BuildArgs["BASE_IMAGE"]
-	if baseImage == "" {
-		baseImage = b.Args["BASE_IMAGE"]
-	}
+	baseImage := b.Args["BASE_IMAGE"]
 	if baseImage == "" {
 		baseImage = b.BaseImage
 	}

@@ -5,6 +5,8 @@ FROM ubuntu:24.04 AS kernel-builder
 
 RUN [$TARGET_STAGE]: |
   set -e
+  export DEBIAN_FRONTEND=noninteractive
+  export TZ=Etc/UTC
   
   # SURGICAL FIX 1: Ubuntu's minimal OCI image ships with a broken statoverride for messagebus.
   if [ -f /var/lib/dpkg/statoverride ]; then
@@ -15,11 +17,12 @@ RUN [$TARGET_STAGE]: |
   rm -f /etc/apt/apt.conf.d/docker-clean
   echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/01keep-cache
 
-  apt-get update && apt-get install -y build-essential bc flex bison libelf-dev \
+  apt-get update && apt-get install -y tzdata build-essential bc flex bison libelf-dev \
     libssl-dev curl tar autoconf automake libtool gawk alien fakeroot dkms \
     libblkid-dev uuid-dev libudev-dev libattr1-dev zlib1g-dev libselinux-dev
 
-  mkdir -p /tmp/src && cd /tmp/src
+  # Moved from /tmp/src to /build/src to prevent volatile filesystem pruning
+  mkdir -p /build/src && cd /build/src
   
   echo "--> Fetching Kernel and ZFS sources..."
   curl -fsSL https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.8.12.tar.xz | tar -xJ
@@ -27,7 +30,7 @@ RUN [$TARGET_STAGE]: |
 
   # A. Build the Micro-Kernel
   echo "--> Compiling Micro-Kernel..."
-  cd /tmp/src/linux-6.8.12
+  cd /build/src/linux-6.8.12
   make tinyconfig
   cat << 'EOF' > microvm.config
   CONFIG_64BIT=y
@@ -57,8 +60,8 @@ RUN [$TARGET_STAGE]: |
 
   # B. Build the out-of-tree ZFS Kernel Modules against our Micro-Kernel
   echo "--> Compiling ZFS Modules..."
-  cd /tmp/src/zfs-2.2.3
-  ./configure --with-linux=/tmp/src/linux-6.8.12 --with-linux-obj=/tmp/src/linux-6.8.12
+  cd /build/src/zfs-2.2.3
+  ./configure --with-linux=/build/src/linux-6.8.12 --with-linux-obj=/build/src/linux-6.8.12
   make -j$(nproc) modules
 
 
@@ -69,11 +72,13 @@ FROM golang:1.25 AS uroot-builder
 
 RUN [$TARGET_STAGE]: |
   set -e
-  apt-get update && apt-get install -y cpio git
+  export DEBIAN_FRONTEND=noninteractive
+  export TZ=Etc/UTC
+  apt-get update && apt-get install -y tzdata cpio git
   
   export GOPATH=/go
   export PATH=/usr/local/go/bin:$GOPATH/bin:$PATH
-  mkdir -p /go/bin /go/src
+  mkdir -p /go/bin /go/src /build
   
   echo "--> Preparing u-root source..."
   if [ -d "/go/src/github.com/u-root/u-root/.git" ]; then
@@ -91,8 +96,8 @@ RUN [$TARGET_STAGE]: |
   go install .
   
   echo "--> Building Go userland (bb format)..."
-  # Running inside the repo guarantees Go module resolution works flawlessly
-  /go/bin/u-root -build=bb -o /tmp/initramfs.cpio core
+  # Using /build instead of /tmp
+  /go/bin/u-root -build=bb -o /build/initramfs.cpio core
   
 
 # ==========================================
@@ -102,6 +107,8 @@ FROM ubuntu:24.04 AS ubuntu-massive
 
 RUN [$TARGET_STAGE]: |
   set -e
+  export DEBIAN_FRONTEND=noninteractive
+  export TZ=Etc/UTC
   
   if [ -f /var/lib/dpkg/statoverride ]; then
       sed -i '/messagebus/d' /var/lib/dpkg/statoverride || true
@@ -110,7 +117,7 @@ RUN [$TARGET_STAGE]: |
   rm -f /etc/apt/apt.conf.d/docker-clean
   echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/01keep-cache
 
-  apt-get update && apt-get install -y qemu-utils zfsutils-linux e2fsprogs iproute2
+  apt-get update && apt-get install -y tzdata qemu-utils zfsutils-linux e2fsprogs iproute2
 
 
 # ==========================================
@@ -119,7 +126,6 @@ RUN [$TARGET_STAGE]: |
 FROM scratch
 NAME: ultra-lean-runtime
 
-# Using RUN [host] to surgically orchestrate the assembly without relying on COPY variable expansion
 RUN [host]: |
   set -e
   echo "--> Assembling ultra-lean runtime..."
@@ -127,19 +133,14 @@ RUN [host]: |
   # Setup basic filesystem hierarchy
   mkdir -p "${ROOTFS}/bin" "${ROOTFS}/lib/modules" "${ROOTFS}/dev" "${ROOTFS}/proc" "${ROOTFS}/sys" "${ROOTFS}/tmp"
   
-  # 1. Extract the custom Micro-Kernel - We don't need this because we're using the custom kernel built in the kernel-builder stage
-  # cp -a "${BASEDIR}/as-roots/kernel-builder/tmp/src/linux-6.8.12/vmlinux" "${ROOTFS}/kernel"
-  
   # 2. Extract the compiled ZFS kernel modules
-  find "${BASEDIR}/as-roots/kernel-builder/tmp/src/zfs-2.2.3/module" -name "*.ko" -exec cp -a {} "${ROOTFS}/lib/modules/" \;
+  find "${BASEDIR}/as-roots/kernel-builder/build/src/zfs-2.2.3/module" -name "*.ko" -exec cp -a {} "${ROOTFS}/lib/modules/" \;
   
   # 3. Extract the u-root userland from its cpio archive
   cd "${ROOTFS}"
-  cat "${BASEDIR}/as-roots/uroot-builder/tmp/initramfs.cpio" | cpio -idm --quiet
+  cat "${BASEDIR}/as-roots/uroot-builder/build/initramfs.cpio" | cpio -idm --quiet
   
   # 4. Extract specific C binaries from ubuntu-massive
-  # (Note: Standard C binaries require their linked .so libraries to function. Since u-root gives 
-  # us a working native Go shell, we'll just drop these binaries in as placeholders for the demo).
   cp -a "${BASEDIR}/as-roots/ubuntu-massive/usr/bin/qemu-nbd" "${ROOTFS}/bin/" || true
   cp -a "${BASEDIR}/as-roots/ubuntu-massive/sbin/mkfs.ext4" "${ROOTFS}/bin/" || true
   cp -a "${BASEDIR}/as-roots/ubuntu-massive/sbin/zfs" "${ROOTFS}/bin/" || true
@@ -166,8 +167,6 @@ RUN [host]: |
   chmod +x "${ROOTFS}/init"
 
 # 5. Emit the final artifacts
-# Instead of building a raw disk, we pack the ROOTFS directly into an initramfs 
-# so you can boot it instantly with `crosvm run --initrd ...`
 RUN [host]: |
   set -e
   mkdir -p "${OUTDIR}"
@@ -177,6 +176,14 @@ RUN [host]: |
   find . | LC_ALL=C sort | cpio --reproducible --owner=0:0 -H newc -o | gzip -9 > "${OUTDIR}/initrd"
   
   echo "--> Promoting Kernel directly to output..."
-  cp -a "${BASEDIR}/as-roots/kernel-builder/tmp/src/linux-6.8.12/vmlinux" "${OUTDIR}/kernel"
+  KERNEL_SRC="${BASEDIR}/as-roots/kernel-builder/build/src/linux-6.8.12/vmlinux"
+  
+  # Fallback search if ARM64 placed it inside arch/arm64/boot/
+  if [ ! -f "$KERNEL_SRC" ]; then
+      echo "    vmlinux not at tree root, searching..."
+      KERNEL_SRC=$(find "${BASEDIR}/as-roots/kernel-builder/build/src/linux-6.8.12" -name vmlinux | head -n 1)
+  fi
+  
+  cp -a "$KERNEL_SRC" "${OUTDIR}/kernel"
    
   echo "✅ Bootable MicroVM ready: ${OUTDIR}/kernel and ${OUTDIR}/initrd"

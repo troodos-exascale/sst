@@ -40,8 +40,6 @@ NAME: base-boot-debian`
 
 	foundRun := false
 	for _, inst := range builder.Instructions {
-		// FIX: We just check if ANY run instruction has our target string,
-		// because from-oci.dockerfile injects its own RUN instructions now.
 		if inst.Type == "RUN" && strings.Contains(inst.Args, "apt-get update") {
 			foundRun = true
 			break
@@ -79,35 +77,33 @@ ADD https://example.com/binary /usr/local/bin/
 	err = builder.Parse(context.Background())
 	assert.NoError(t, err)
 
+	// In the two-pass architecture, state mutations happen in PreProcess.
+	// We no longer manually "execute" these metadata instructions.
 	err = builder.PreProcess(context.Background())
 	assert.NoError(t, err)
 
+	var lastInst Instruction
+	foundAdd := false
 	for _, inst := range builder.Instructions {
-		if inst.Type == "RUN" {
-			continue
+		if inst.Type == "RUN" && strings.Contains(inst.Args, "curl -sSL 'https://example.com/binary'") {
+			lastInst = inst
+			foundAdd = true
+			break
 		}
-		err := builder.ExecuteSingleInstruction(context.Background(), inst)
-		assert.NoError(t, err)
 	}
 
-	assert.Equal(t, "/opt/app", builder.Workdir)
-	assert.Equal(t, "appuser:appgroup", builder.User)
+	assert.True(t, foundAdd, "ADD instruction should be desugared into a RUN curl command")
+	
+	// Verify that the pre-computed snapshot attached to the final instruction is correct
+	assert.Equal(t, "/opt/app", lastInst.Workdir)
+	assert.Equal(t, "appuser:appgroup", lastInst.User)
+
+	// Verify global builder properties
 	assert.Equal(t, `["/bin/server", "--port", "8080"]`, builder.Cmd)
 	assert.Equal(t, `["/tini", "--"]`, builder.EntryPoint)
-
 	assert.Equal(t, "1.0", builder.Labels["version"])
 	assert.Contains(t, builder.ExposedPorts, "8080/tcp")
 	assert.Contains(t, builder.ExposedPorts, "9090/udp")
 	assert.Contains(t, builder.Volumes, "/data")
 	assert.Contains(t, builder.Volumes, "/config")
-
-	foundAdd := false
-	for _, inst := range builder.Instructions {
-		// FIX: Updated assertion to match the actual -sSL flag emitted by desugarAdd
-		if inst.Type == "RUN" && strings.Contains(inst.Args, "curl -sSL 'https://example.com/binary'") {
-			foundAdd = true
-			break
-		}
-	}
-	assert.True(t, foundAdd, "ADD instruction should be desugared into a RUN curl command")
 }

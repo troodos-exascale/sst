@@ -115,7 +115,6 @@ func writeDataTar(path, dir string) error {
 		}
 		name, _ := filepath.Rel(dir, p)
 
-		// NEW: Read the symlink target if it's a symlink
 		var link string
 		if info.Mode()&os.ModeSymlink != 0 {
 			link, err = os.Readlink(p)
@@ -124,13 +123,16 @@ func writeDataTar(path, dir string) error {
 			}
 		}
 
-		// Pass the link target to the tar header
 		hdr, err := tar.FileInfoHeader(info, link)
 		if err != nil {
 			return err
 		}
 		hdr.Name = name
+		
+		// STRICT METADATA CLAMPING FOR DETERMINISM
 		hdr.ModTime = time.Unix(0, 0)
+		hdr.AccessTime = time.Unix(0, 0)
+		hdr.ChangeTime = time.Unix(0, 0)
 		hdr.Uid, hdr.Gid = 0, 0
 		hdr.Uname, hdr.Gname = "root", "root"
 
@@ -153,15 +155,17 @@ func writeDataTar(path, dir string) error {
 
 func addTarFile(tw *tar.Writer, name string, data []byte) {
 	h := &tar.Header{
-		Name:     name,
-		Mode:     0o644,
-		Size:     int64(len(data)),
-		ModTime:  time.Unix(0, 0),
-		Typeflag: tar.TypeReg,
-		Uid:      0,
-		Gid:      0,
-		Uname:    "root",
-		Gname:    "root",
+		Name:       name,
+		Mode:       0o644,
+		Size:       int64(len(data)),
+		ModTime:    time.Unix(0, 0),
+		AccessTime: time.Unix(0, 0),
+		ChangeTime: time.Unix(0, 0),
+		Typeflag:   tar.TypeReg,
+		Uid:        0,
+		Gid:        0,
+		Uname:      "root",
+		Gname:      "root",
 	}
 	tw.WriteHeader(h)
 	tw.Write(data)

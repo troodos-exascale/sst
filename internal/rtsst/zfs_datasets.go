@@ -170,3 +170,13 @@ func (d *DatasetManager) RollbackDataset(subPath, tag string) error {
 	}
 	return nil
 }
+
+// CheckSnapshot probes the underlying storage to ensure the requested tag actually exists.
+func (d *DatasetManager) CheckSnapshot(subPath, tag string) bool {
+	if d.Zpool == "" {
+		return true // If not using ZFS, we assume the host filesystem state matches the TG JSON state
+	}
+	dsPath := d.datasetPath(subPath)
+	cmd := exec.Command("zfs", "list", "-t", "snapshot", fmt.Sprintf("%s@%s", dsPath, tag))
+	return cmd.Run() == nil
+}

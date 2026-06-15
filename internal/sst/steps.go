@@ -2,51 +2,10 @@ package sst
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
-	"time"
 )
-
-//
-// =========================
-// Exported Steps API (verbs)
-// =========================
-//
-// These are the ONLY exported entry points of the steps framework.
-// Anyone reading this file should immediately know what is available
-// and where to find it.
-//
-
-// StepsInit initializes a new linear steps execution context.
-func StepsInit(name string) *StepsRunState {
-	return &StepsRunState{
-		Name:  name,
-		State: make(StepState),
-		logf:  func(string, ...any) {},
-	}
-}
-
-// StepsRun executes all registered steps in order.
-func StepsRun(r *StepsRunState) error {
-	return r.runAll()
-}
-
-// StepsResume resumes execution from persisted state.
-func StepsResume(r *StepsRunState) error {
-	r.persist = true
-	return r.runAll()
-}
-
-// StepsFinish finalizes a steps run (currently a no-op, reserved).
-func StepsFinish(r *StepsRunState) error { return nil }
-
-//
-// =========================
-// Nouns: state & structure
-// =========================
 
 // StepState is application-owned, serializable state shared between steps.
 type StepState map[string]interface{}
@@ -64,32 +23,34 @@ type StepFunc func(ctx *StepsContext, state StepState) error
 type StepsContext struct {
 	StepName string
 	StepIdx  int
-
-	// Ctx is a context for structured logging/tracing.
-	// Callers may ignore it; existing code remains valid.
-	Ctx context.Context
+	Ctx      context.Context
 }
 
-// StepsRunState is the superblock / inode of a steps execution.
+// StepsRunState represents a linear sequence of operations, backed by the TG Runner.
 type StepsRunState struct {
 	Name       string
 	Steps      []Step
 	State      StepState
-	StartIndex int // Instructs the runner to fast-forward to this index (0-based)
-	persist    bool
+	StartIndex int // Instructs the runner to manually skip to this index (0-based)
+	
+	runner     *Runner
 	statePath  string
-
-	// Legacy logger callback (kept for compatibility).
-	// New structured logging uses LogxRoot() internally.
-	logf func(format string, args ...any)
+	persist    bool
 }
 
-//
-// =========================
-// Public methods on state
-// =========================
+// StepsInit initializes a new linear steps execution context.
+func StepsInit(name string) *StepsRunState {
+	return &StepsRunState{
+		Name:  name,
+		State: make(StepState),
+		runner: &Runner{
+			Log:       LogxRoot(),
+			State:     make(map[string]interface{}),
+			Completed: make(map[string]bool),
+		},
+	}
+}
 
-// StepsAdd registers a new step.
 func (r *StepsRunState) StepsAdd(name string, fn StepFunc) {
 	r.Steps = append(r.Steps, Step{
 		Name: name,
@@ -97,39 +58,40 @@ func (r *StepsRunState) StepsAdd(name string, fn StepFunc) {
 	})
 }
 
-// StepsWithLogger attaches a legacy formatter logger to the run.
-// Kept for compatibility: structured logging is handled via LogxRoot().
-func (r *StepsRunState) StepsWithLogger(logf func(format string, args ...any)) {
-	if logf == nil {
-		r.logf = func(string, ...any) {}
-		return
-	}
-	r.logf = logf
-}
+// StepsWithLogger is retained purely as a no-op to prevent compilation errors
+// across dozens of callers. Logging is automatically managed by sst.Logx.
+func (r *StepsRunState) StepsWithLogger(logf func(format string, args ...any)) {}
 
-// StepsWithPersistence enables persistence to the given path.
 func (r *StepsRunState) StepsWithPersistence(path string) {
 	r.persist = true
 	r.statePath = path
+	r.runner.StatePath = path
 }
 
-//
-// =========================
-// Private execution logic
-// =========================
+func StepsRun(r *StepsRunState) error {
+	return r.execute()
+}
 
-func (r *StepsRunState) runAll() error {
-	if r.persist {
-		_ = r.loadState()
+func StepsResume(r *StepsRunState) error {
+	r.persist = true
+	return r.execute()
+}
+
+func StepsFinish(r *StepsRunState) error {
+	// Could be used to clean up the persistence file if desired.
+	return nil
+}
+
+func (r *StepsRunState) execute() error {
+	if len(r.Steps) == 0 {
+		return nil
 	}
 
-	// Base logging context for this run.
+	// Establish the baseline logging subsystem context.
 	runCtx := context.Background()
 	runSub := "steps." + sanitizeForNamespace(r.Name)
-	runLog := LogxRoot().Subsystem(runSub).With("run", r.Name)
+	r.runner.Log = r.runner.Log.Subsystem(runSub).With("run", r.Name)
 
-	// Establish a base call path for downstream processes.
-	// We do not assume logx consumes env yet; we only emit it.
 	baseCallPath := currentCallPath()
 	if baseCallPath == "" {
 		baseCallPath = runSub
@@ -137,78 +99,65 @@ func (r *StepsRunState) runAll() error {
 		baseCallPath = baseCallPath + "." + runSub
 	}
 
-	for i, step := range r.Steps {
-		stepName := step.Name
-		stepIdx := i + 1
+	// Link application state explicitly into the TG runner's map
+	r.runner.State = r.State
 
-		stepSub := runSub + "." + sanitizeForNamespace(stepName)
-		stepLog := LogxRoot().Subsystem(stepSub).With("run", r.Name, "step", stepName, "step_idx", stepIdx)
-
-		// Fast-forward mechanic for resumable builds
-		if i < r.StartIndex {
-			r.logf("SKIP %02d %s (Cached)", stepIdx, stepName)
-			stepLog.Info(runCtx, "step.skipped.cached")
-			continue
-		}
-
-		// Set SST_CALL_PATH for the duration of this step.
-		prevCallPath, hadPrev := os.LookupEnv("SST_CALL_PATH")
-		_ = os.Setenv("SST_CALL_PATH", baseCallPath+"."+sanitizeForNamespace(stepName))
-
-		ctx := &StepsContext{
-			StepName: stepName,
-			StepIdx:  stepIdx,
-			Ctx:      runCtx,
-		}
-
-		// Step start (legacy + structured)
-		r.logf("STEP %02d %s", stepIdx, stepName)
-		stepLog.Info(runCtx, "step.start")
-
-		err := step.Run(ctx, r.State)
-
-		if err != nil {
-			// Failure marking is handled by structured logging.
-			stepLog.WithError(err).Error(runCtx, "step.fail")
-			r.logf("FAIL %02d %s: %v", stepIdx, stepName, err)
-
-			// Restore prior call path before returning.
-			if hadPrev {
-				_ = os.Setenv("SST_CALL_PATH", prevCallPath)
-			} else {
-				_ = os.Unsetenv("SST_CALL_PATH")
-			}
-			return err
-		}
-
-		if r.persist {
-			if err := r.saveState(); err != nil {
-				stepLog.WithError(err).Error(runCtx, "steps.persist.fail")
-				r.logf("FAIL %02d %s: %v", stepIdx, stepName, err)
-
-				// Restore prior call path before returning.
-				if hadPrev {
-					_ = os.Setenv("SST_CALL_PATH", prevCallPath)
-				} else {
-					_ = os.Unsetenv("SST_CALL_PATH")
-				}
-				return err
-			}
-		}
-
-		stepLog.Info(runCtx, "step.ok")
-		r.logf("OK   %02d %s", stepIdx, stepName)
-
-		// Restore prior call path after successful step.
-		if hadPrev {
-			_ = os.Setenv("SST_CALL_PATH", prevCallPath)
-		} else {
-			_ = os.Unsetenv("SST_CALL_PATH")
-		}
+	// Pre-fill the completed map if StartIndex is utilized (legacy fast-forward)
+	for i := 0; i < r.StartIndex && i < len(r.Steps); i++ {
+		r.runner.Completed[r.Steps[i].Name] = true
 	}
 
-	runLog.Info(runCtx, "steps.run.ok")
-	return nil
+	// Construct the linked list of Context nodes for the TG runner
+	var root *Context
+	var prev *Context
+
+	for i, step := range r.Steps {
+		stepIdx := i + 1
+		stepName := step.Name
+		
+		curr := &Context{
+			ID:          stepName,
+			Description: fmt.Sprintf("Step %02d: %s", stepIdx, stepName),
+			Action: func(ctx context.Context) (interface{}, error) {
+				prevCallPath, hadPrev := os.LookupEnv("SST_CALL_PATH")
+				_ = os.Setenv("SST_CALL_PATH", baseCallPath+"."+sanitizeForNamespace(stepName))
+				defer func() {
+					if hadPrev {
+						_ = os.Setenv("SST_CALL_PATH", prevCallPath)
+					} else {
+						_ = os.Unsetenv("SST_CALL_PATH")
+					}
+				}()
+
+				sCtx := &StepsContext{
+					StepName: stepName,
+					StepIdx:  stepIdx,
+					Ctx:      ctx,
+				}
+				
+				return nil, step.Run(sCtx, r.State)
+			},
+		}
+
+		if root == nil {
+			root = curr
+		}
+		
+		if prev != nil {
+			// Bind the previous step to dynamically return this step
+			nextCtx := curr 
+			prev.Interpret = func(res *Result) ([]*Context, error) {
+				return []*Context{nextCtx}, nil
+			}
+		}
+		prev = curr
+	}
+
+	err := r.runner.Run(runCtx, root)
+	if err == nil {
+		r.runner.Log.Info(runCtx, "steps.run.ok")
+	}
+	return err
 }
 
 func currentCallPath() string {
@@ -224,7 +173,6 @@ func sanitizeForNamespace(s string) string {
 		return "step"
 	}
 
-	// Keep [a-z0-9._-], replace others with '_'.
 	var b strings.Builder
 	b.Grow(len(s))
 	for _, r := range s {
@@ -241,51 +189,9 @@ func sanitizeForNamespace(s string) string {
 	}
 	out := b.String()
 
-	// Avoid empty/degenerate segments.
 	out = strings.Trim(out, "._-")
 	if out == "" {
 		return "step"
 	}
 	return out
-}
-
-//
-// =========================
-// Persistence (private)
-// =========================
-
-type persistedStepsState struct {
-	Updated time.Time
-	State   StepState
-}
-
-func (r *StepsRunState) loadState() error {
-	data, err := os.ReadFile(r.statePath)
-	if err != nil {
-		return nil
-	}
-
-	var p persistedStepsState
-	if err := json.Unmarshal(data, &p); err != nil {
-		return fmt.Errorf("load steps state: %w", err)
-	}
-	r.State = p.State
-	return nil
-}
-
-func (r *StepsRunState) saveState() error {
-	p := persistedStepsState{
-		Updated: time.Now().UTC(),
-		State:   r.State,
-	}
-
-	data, err := json.MarshalIndent(p, "", "  ")
-	if err != nil {
-		return err
-	}
-
-	if err := os.MkdirAll(filepath.Dir(r.statePath), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(r.statePath, data, 0o644)
 }

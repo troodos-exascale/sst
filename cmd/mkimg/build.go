@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -23,7 +24,6 @@ var (
 	flagSource  string
 )
 
-// RunBuildEngine is the universal entrypoint for parsing and executing VAXLang DAGs.
 func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runtimeDir string, flagForce bool, bArgs map[string]string) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("mkimg requires root privileges to provision datasets and execute isolated environments. Please run with sudo")
@@ -85,113 +85,83 @@ func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runti
 		return err
 	}
 
-	bState, _ := builder.LoadState()
+	// 1. Initialize the generic Task Graph Engine
+	runner := &sst.Runner{
+		Log:       log,
+		StatePath: filepath.Join(builder.DatasetMgr.MountPath(""), "state.json"),
+		State:     make(map[string]interface{}),
+		Completed: make(map[string]bool),
+	}
 
+	// 2. Overview Mode (--show)
 	if flagShow {
+		// Load state silently to peek at completions
+		_ = runner.Run(ctx, &sst.Context{Action: func(c context.Context) (interface{}, error) { return nil, nil }})
+		
 		fmt.Printf("--- Build Summary: %s ---\n", builder.Name)
 		for _, inst := range builder.Instructions {
-			step, ok := bState.Steps[inst.Index]
-			if ok {
-				fmt.Printf("[Step %02d] %-8s | Log: %s\n", inst.Index, step.Status, step.LogPath)
-			} else {
-				fmt.Printf("[Step %02d] PENDING  | %s\n", inst.Index, inst.Type)
+			status := "PENDING"
+			if runner.Completed[inst.Hash] {
+				status = "OK"
 			}
+			
+			hashStub := inst.Hash
+			if len(hashStub) >= 8 { hashStub = hashStub[:8] }
+			logPath := filepath.Join(builder.DatasetMgr.MountPath(""), "logs", fmt.Sprintf("%02d_%s_%s.log", inst.Index, hashStub, strings.ToLower(inst.Type)))
+			
+			if _, err := os.Stat(logPath); err != nil {
+				logPath = "-"
+			}
+
+			fmt.Printf("[Step %02d] %-8s | Log: %s\n", inst.Index, status, logPath)
 		}
 		return nil
 	}
 
-	startIndex := 0
+	// 3. Construct the Protosh DAG
+	var root *sst.Context
+	var prev *sst.Context
 
-	if flagForce {
-		startIndex = 0
-		_ = builder.SaveState(&rtsst.BuildState{Status: "new", Steps: make(map[int]rtsst.BuildStepState)})
-	} else if flagRestart >= 0 {
-		startIndex = flagRestart
-		log.Info(ctx, "manual restart requested", "step", startIndex)
-	} else {
-		divergence := -1
-		for i, inst := range builder.Instructions {
-			savedStep, ok := bState.Steps[i]
-			if !ok || savedStep.Hash != inst.Hash || savedStep.Status != "OK" {
-				divergence = i
-				break
-			}
-		}
-		if divergence == -1 {
-			if bState.Status == "building" || bState.Status == "OK" {
-				// We fast-forward past the IR steps, but critically, we DO NOT exit.
-				// This ensures FINALIZE MANIFEST executes to safely emit outputs.
-				fmt.Println("✅ Build IR is up to date. Re-evaluating manifest outputs...")
-				startIndex = len(builder.Instructions)
-			} else {
-				startIndex = len(builder.Instructions)
-			}
-		} else {
-			startIndex = divergence
-			log.Info(ctx, "detected hash divergence or failure", "step", startIndex)
-		}
-	}
+	parentHash := ""
 
-	for i := 0; i < startIndex; i++ {
-		inst := builder.Instructions[i]
-
-		cleanArgs := inst.Args
-		if inst.Type != "RUN" {
-			cleanArgs = strings.SplitN(builder.Substitute(inst.Args), " #", 2)[0]
-			cleanArgs = strings.TrimSpace(cleanArgs)
+	for _, inst := range builder.Instructions {
+		stepCtx := builder.CreateStepContext(inst, parentHash)
+		
+		if root == nil {
+			root = stepCtx
 		}
 
-		switch inst.Type {
-		case "WORKDIR":
-			builder.Workdir = builder.Substitute(cleanArgs)
-		case "USER":
-			builder.User = builder.Substitute(cleanArgs)
-		case "RUN":
-			if strings.HasPrefix(inst.Args, "sys.provision_dataset") {
-				parts := strings.Fields(inst.Args)
-				for _, p := range parts {
-					if strings.HasPrefix(p, "--target=") {
-						target := strings.TrimPrefix(p, "--target=")
-						builder.StageMounts[target] = builder.DatasetMgr.MountPath("as-roots/" + target)
+		if prev != nil {
+			nextCtx := stepCtx
+			prev.Interpret = func(res *sst.Result) ([]*sst.Context, error) {
+				// Successfully completed action! Snapshot the ZFS dataset now that it's clean.
+				if builder.DatasetMgr != nil {
+					hashStub := nextCtx.ID
+					if len(hashStub) >= 8 { hashStub = hashStub[:8] }
+					tag := fmt.Sprintf("step_%02d_hash_%s", inst.Index-1, hashStub)
+					for stageTarget := range inst.StageMounts {
+						_ = builder.DatasetMgr.SnapshotDataset(stageTarget, tag)
 					}
 				}
+				return []*sst.Context{nextCtx}, nil
 			}
 		}
+
+		prev = stepCtx
+		parentHash = inst.Hash
 	}
 
-	if startIndex > 0 && startIndex <= len(builder.Instructions) && len(builder.StageMounts) > 0 {
-		prevInst := builder.Instructions[startIndex-1]
-		hashStub := ""
-		if len(prevInst.Hash) >= 8 {
-			hashStub = prevInst.Hash[:8]
-		}
-		tag := fmt.Sprintf("step_%02d_hash_%s", prevInst.Index, hashStub)
-		log.Info(ctx, "rolling back active datasets to previous valid state", "tag", tag)
-		for stage := range builder.StageMounts {
-			_ = builder.DatasetMgr.RollbackDataset("as-roots/"+stage, tag)
+	// Terminate the graph with the Finalization step
+	if prev != nil {
+		prev.Interpret = func(res *sst.Result) ([]*sst.Context, error) {
+			if strings.HasSuffix(builder.Dockerfile, "instance.dockerfile") {
+				return nil, builder.FinalizeInstance(ctx)
+			}
+			return nil, builder.FinalizeVM(ctx)
 		}
 	}
 
-	runner := sst.StepsInit("mkimage.build")
-	runner.StartIndex = startIndex
-
-	for i, inst := range builder.Instructions {
-		instruction := inst
-		stepName := fmt.Sprintf("%s %02d", instruction.Type, i)
-
-		runner.StepsAdd(stepName, func(c *sst.StepsContext, _ sst.StepState) error {
-			return builder.ExecuteSingleInstruction(ctx, instruction)
-		})
-	}
-
-	runner.StepsAdd("FINALIZE MANIFEST", func(c *sst.StepsContext, _ sst.StepState) error {
-		if strings.HasSuffix(builder.Dockerfile, "instance.dockerfile") {
-			return builder.FinalizeInstance(ctx)
-		}
-		return builder.FinalizeVM(ctx)
-	})
-
-	return sst.StepsRun(runner)
+	return runner.Run(ctx, root)
 }
 
 var buildCmd = &cobra.Command{

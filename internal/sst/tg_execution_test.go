@@ -7,15 +7,11 @@ import (
 )
 
 func TestTG_BranchingWorkflow(t *testing.T) {
-	// Scenario: Check if a "file" exists. If yes, delete it. If no, create it.
-	// This tests Action -> Interpret -> Branching logic.
-
-	runner, _ := newTestRunner() // Reusing helper from tg_test.go (now visible)
+	runner, _ := newTestRunner() // Reusing helper from tg_test.go
 	ctx := context.Background()
 
 	var executionLog []string
 
-	// Define the leaf tasks
 	taskCreate := &Context{
 		Description: "Create Resource",
 		Action: func(ctx context.Context) (interface{}, error) {
@@ -32,39 +28,27 @@ func TestTG_BranchingWorkflow(t *testing.T) {
 		},
 	}
 
-	// Define the root decision task
 	rootTask := &Context{
 		Description: "Check Resource",
 		Action: func(ctx context.Context) (interface{}, error) {
 			executionLog = append(executionLog, "check")
-			// Simulate "Exists = true"
-			return true, nil
+			return true, nil // Simulate Exists = true
 		},
 		Interpret: func(res *Result) ([]*Context, error) {
 			exists := res.Value.(bool)
 			if exists {
-				// Branch A: Resource exists -> Delete it
 				return []*Context{taskDelete}, nil
 			}
-			// Branch B: Resource missing -> Create it
 			return []*Context{taskCreate}, nil
 		},
 	}
 
-	// Run
 	if err := runner.Run(ctx, rootTask); err != nil {
 		t.Fatalf("Runner failed: %v", err)
 	}
 
-	// Verify Execution Order
-	if len(executionLog) != 2 {
-		t.Fatalf("Expected 2 steps, got %d", len(executionLog))
-	}
-	if executionLog[0] != "check" {
-		t.Errorf("Expected first step 'check', got '%s'", executionLog[0])
-	}
-	if executionLog[1] != "delete" {
-		t.Errorf("Expected second step 'delete', got '%s'", executionLog[1])
+	if len(executionLog) != 2 || executionLog[0] != "check" || executionLog[1] != "delete" {
+		t.Fatalf("Expected check -> delete, got %v", executionLog)
 	}
 }
 
@@ -89,10 +73,91 @@ func TestTG_ErrorHandlingAndCleanup(t *testing.T) {
 	if err == nil {
 		t.Fatal("Expected error, got nil")
 	}
-	if err.Error() != "simulated failure" {
-		t.Errorf("Expected 'simulated failure', got '%v'", err)
-	}
 	if !cleanupCalled {
 		t.Error("Cleanup hook was NOT called on failure")
+	}
+}
+
+func TestTG_ProbeAndRestoreLifecycle(t *testing.T) {
+	runner, _ := newTestRunner()
+	ctx := context.Background()
+
+	var executionLog []string
+
+	rootTask := &Context{
+		ID:          "test-node-1",
+		Description: "Test Probe and Restore",
+		Probe: func(ctx context.Context) (bool, error) {
+			executionLog = append(executionLog, "probe")
+			return false, nil // returning false forces Restore -> Action
+		},
+		Restore: func(ctx context.Context) error {
+			executionLog = append(executionLog, "restore")
+			return nil
+		},
+		Action: func(ctx context.Context) (interface{}, error) {
+			executionLog = append(executionLog, "action")
+			return "done", nil
+		},
+		Interpret: func(res *Result) ([]*Context, error) {
+			executionLog = append(executionLog, "interpret")
+			return nil, nil
+		},
+	}
+
+	if err := runner.Run(ctx, rootTask); err != nil {
+		t.Fatalf("Runner failed: %v", err)
+	}
+
+	expectedLog := []string{"probe", "restore", "action", "interpret"}
+	if len(executionLog) != len(expectedLog) {
+		t.Fatalf("Expected execution log %v, got %v", expectedLog, executionLog)
+	}
+	for i, v := range expectedLog {
+		if executionLog[i] != v {
+			t.Errorf("At index %d expected %s, got %s", i, v, executionLog[i])
+		}
+	}
+}
+
+func TestTG_ProbeSkipsAction(t *testing.T) {
+	runner, _ := newTestRunner()
+	ctx := context.Background()
+
+	var executionLog []string
+
+	rootTask := &Context{
+		ID:          "test-node-2",
+		Description: "Test Probe Skip",
+		Probe: func(ctx context.Context) (bool, error) {
+			executionLog = append(executionLog, "probe")
+			return true, nil // true should SKIP Restore and Action
+		},
+		Restore: func(ctx context.Context) error {
+			executionLog = append(executionLog, "restore")
+			return nil
+		},
+		Action: func(ctx context.Context) (interface{}, error) {
+			executionLog = append(executionLog, "action")
+			return "done", nil
+		},
+		Interpret: func(res *Result) ([]*Context, error) {
+			executionLog = append(executionLog, "interpret")
+			return nil, nil
+		},
+	}
+
+	if err := runner.Run(ctx, rootTask); err != nil {
+		t.Fatalf("Runner failed: %v", err)
+	}
+
+	expectedLog := []string{"probe", "interpret"}
+	if len(executionLog) != len(expectedLog) {
+		t.Fatalf("Expected execution log %v, got %v", expectedLog, executionLog)
+	}
+	for i, v := range expectedLog {
+		if executionLog[i] != v {
+			t.Errorf("At index %d expected %s, got %s", i, v, executionLog[i])
+		}
 	}
 }

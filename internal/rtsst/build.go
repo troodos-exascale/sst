@@ -16,13 +16,19 @@ import (
 )
 
 type Instruction struct {
-	Index      int    // Indicates sequential execution order
+	Index      int
 	Type       string
 	Args       string
 	Location   string
 	Context    string
 	Conditions []string
-	Hash       string // The cascading cryptographic signature of this step and its ancestors
+	Hash       string
+
+	// Frozen State (Populated during PreProcess for execution safety)
+	Env         map[string]string
+	Workdir     string
+	User        string
+	StageMounts map[string]string
 }
 
 type BuildApp struct {
@@ -34,7 +40,7 @@ type BuildApp struct {
 	Name         string
 	Emits        []string
 	Instructions []Instruction
-	IncludedFiles map[string]string // NEW: Tracks relative include path to resolved absolute path
+	IncludedFiles map[string]string
 
 	BuildArgs map[string]string
 	Args      map[string]string
@@ -55,7 +61,6 @@ type BuildApp struct {
 
 	DatasetMgr  *DatasetManager
 	BuildID     string
-	StageMounts map[string]string
 	Force       bool
 }
 
@@ -74,7 +79,6 @@ func NewBuilder(log *sst.Logx, files sst.Files, dockerfile, contextDir, buildDir
 		Labels:        make(map[string]string),
 		Volumes:       make(map[string]struct{}),
 		ExposedPorts:  make(map[string]struct{}),
-		StageMounts:   make(map[string]string),
 		Workdir:       "/",
 		User:          "root",
 	}
@@ -217,7 +221,6 @@ func (b *BuildApp) resolveIncludePath(currentFile, target string) (string, error
 		targetWithExt += ".dockerfile"
 	}
 
-	// 1. Check local context directory
 	localPathExact := filepath.Join(b.ContextDir, target)
 	localPathExt := filepath.Join(b.ContextDir, targetWithExt)
 
@@ -228,7 +231,6 @@ func (b *BuildApp) resolveIncludePath(currentFile, target string) (string, error
 		return localPathExt, nil
 	}
 
-	// 2. Check system templates directory
 	stdDir := "/usr/local/share/mkimg/templates"
 	stdPathExact := filepath.Join(stdDir, target)
 	stdPathExt := filepath.Join(stdDir, targetWithExt)
@@ -463,50 +465,101 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 	return scanner.Err()
 }
 
-func (b *BuildApp) PreProcess(ctx context.Context) error {
-	tmpArgs := make(map[string]string)
-	for k, v := range b.BuildArgs {
-		tmpArgs[k] = v
+func cloneMap(m map[string]string) map[string]string {
+	c := make(map[string]string, len(m))
+	for k, v := range m {
+		c[k] = v
 	}
-	tmpEnv := make(map[string]string)
+	return c
+}
 
-	for _, inst := range b.Instructions {
-		args := os.Expand(inst.Args, func(k string) string {
-			if v, ok := tmpEnv[k]; ok {
-				return v
-			}
-			if v, ok := tmpArgs[k]; ok {
-				return v
-			}
+// PreProcess executes Pass 1: State accumulation and Hash computation.
+func (b *BuildApp) PreProcess(ctx context.Context) error {
+	// Active running state
+	activeArgs := make(map[string]string)
+	for k, v := range b.BuildArgs {
+		activeArgs[k] = v
+	}
+	activeEnv := make(map[string]string)
+	activeWorkdir := "/"
+	activeUser := "root"
+	activeStageMounts := make(map[string]string)
+
+	substitute := func(val string) string {
+		return os.Expand(val, func(k string) string {
+			if v, ok := activeEnv[k]; ok { return v }
+			if v, ok := activeArgs[k]; ok { return v }
 			return ""
 		})
+	}
 
+	h := sha256.New()
+	
+	// Pre-seed the hash with build args to ensure different args yield different graphs
+	var keys []string
+	for k := range b.BuildArgs { keys = append(keys, k) }
+	sort.Strings(keys)
+	for _, k := range keys {
+		h.Write([]byte(k + "=" + b.BuildArgs[k]))
+	}
+
+	prevHash := hex.EncodeToString(h.Sum(nil))
+
+	for i := range b.Instructions {
+		inst := &b.Instructions[i]
+		inst.Index = i
+
+		args := substitute(inst.Args)
 		cleanArgs := strings.SplitN(args, " #", 2)[0]
 		cleanArgs = strings.TrimSpace(cleanArgs)
 
+		// State Accumulation
 		switch inst.Type {
 		case "ARG":
 			parts := strings.SplitN(cleanArgs, "=", 2)
 			if len(parts) == 2 {
-				tmpArgs[parts[0]] = parts[1]
+				activeArgs[parts[0]] = parts[1]
 			}
 		case "ENV":
 			parts := strings.SplitN(cleanArgs, "=", 2)
 			if len(parts) == 2 {
-				tmpEnv[parts[0]] = parts[1]
+				activeEnv[parts[0]] = parts[1]
 			} else {
 				parts = strings.SplitN(cleanArgs, " ", 2)
 				if len(parts) == 2 {
-					tmpEnv[parts[0]] = parts[1]
+					activeEnv[parts[0]] = parts[1]
 				}
 			}
 		case "FROM":
 			if b.BaseImage == "" {
 				b.BaseImage = cleanArgs
 			}
-			tmpArgs = make(map[string]string)
-			for k, v := range b.BuildArgs {
-				tmpArgs[k] = v
+			activeArgs = make(map[string]string)
+			for k, v := range b.BuildArgs { activeArgs[k] = v }
+		case "WORKDIR":
+			activeWorkdir = cleanArgs
+		case "USER":
+			activeUser = cleanArgs
+		case "CMD":
+			b.Cmd = substitute(cleanArgs)
+		case "ENTRYPOINT":
+			b.EntryPoint = substitute(cleanArgs)
+		case "LABEL":
+			parts := strings.SplitN(cleanArgs, "=", 2)
+			if len(parts) == 2 {
+				b.Labels[strings.Trim(parts[0], `"`)] = strings.Trim(parts[1], `"`)
+			}
+		case "EXPOSE":
+			for _, port := range strings.Fields(cleanArgs) {
+				if !strings.Contains(port, "/") {
+					port += "/tcp"
+				}
+				b.ExposedPorts[port] = struct{}{}
+			}
+		case "VOLUME":
+			clean := strings.TrimPrefix(strings.TrimSuffix(cleanArgs, "]"), "[")
+			for _, vol := range strings.Split(clean, ",") {
+				b.Volumes[strings.Trim(strings.TrimSpace(vol), `"`)] = struct{}{}
 			}
 		case "NAME", "VMOUT":
 			b.Name = cleanArgs
@@ -515,7 +568,39 @@ func (b *BuildApp) PreProcess(ctx context.Context) error {
 			for _, e := range emits {
 				b.Emits = append(b.Emits, strings.ToLower(strings.TrimSpace(e)))
 			}
+		case "RUN":
+			if strings.HasPrefix(inst.Args, "sys.provision_dataset") {
+				parts := strings.Fields(inst.Args)
+				for _, p := range parts {
+					if strings.HasPrefix(p, "--target=") {
+						target := strings.TrimPrefix(p, "--target=")
+						// We map the expected future directory path 
+						activeStageMounts[target] = fmt.Sprintf("as-roots/%s", target)
+					}
+				}
+			}
 		}
+
+		// Snapshot freezing
+		inst.Env = cloneMap(activeEnv)
+		for k, v := range activeArgs {
+			inst.Env[k] = v // Merge args into env snapshot for execution context
+		}
+		inst.Workdir = activeWorkdir
+		inst.User = activeUser
+		inst.StageMounts = cloneMap(activeStageMounts)
+
+		// Hashing
+		h := sha256.New()
+		h.Write([]byte(prevHash))
+		h.Write([]byte(inst.Type))
+		h.Write([]byte(inst.Args))
+		h.Write([]byte(inst.Context))
+		h.Write([]byte(inst.Location))
+		h.Write([]byte(strings.Join(inst.Conditions, ",")))
+
+		prevHash = hex.EncodeToString(h.Sum(nil))
+		inst.Hash = prevHash
 	}
 
 	if b.Name == "" {
@@ -530,50 +615,5 @@ func (b *BuildApp) PreProcess(ctx context.Context) error {
 		return fmt.Errorf("no FROM instruction found in Dockerfile")
 	}
 
-	b.ComputeHashes()
-
 	return nil
-}
-
-func (b *BuildApp) ComputeHashes() {
-	h := sha256.New()
-	h.Write([]byte(b.BaseImage))
-
-	var keys []string
-	for k := range b.BuildArgs {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		h.Write([]byte(k + "=" + b.BuildArgs[k]))
-	}
-
-	prevHash := hex.EncodeToString(h.Sum(nil))
-
-	for i := range b.Instructions {
-		b.Instructions[i].Index = i
-
-		h := sha256.New()
-		h.Write([]byte(prevHash))
-		h.Write([]byte(b.Instructions[i].Type))
-		h.Write([]byte(b.Instructions[i].Args))
-		h.Write([]byte(b.Instructions[i].Context))
-		h.Write([]byte(b.Instructions[i].Location))
-		h.Write([]byte(strings.Join(b.Instructions[i].Conditions, ",")))
-
-		prevHash = hex.EncodeToString(h.Sum(nil))
-		b.Instructions[i].Hash = prevHash
-	}
-}
-
-func (b *BuildApp) Substitute(val string) string {
-	return os.Expand(val, func(k string) string {
-		if v, ok := b.Env[k]; ok {
-			return v
-		}
-		if v, ok := b.Args[k]; ok {
-			return v
-		}
-		return ""
-	})
 }
