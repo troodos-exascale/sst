@@ -162,11 +162,6 @@ func (b *BuildApp) CreateStepContext(inst Instruction, parentHash string) *sst.C
 		
 		Probe: func(c context.Context) (bool, error) {
 			if b.DatasetMgr != nil {
-				// We check if all primary target stages exist at this hash tag
-				// A more robust implementation would loop over inst.StageMounts,
-				// but relying on the TG engine's Completed map (backed by state.json) 
-				// is generally enough unless manual tampering occurred.
-				// We return false to allow tg.go to rely purely on state.json for now.
 				return false, nil 
 			}
 			return false, nil
@@ -406,7 +401,21 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 	}
 
 	rawDiskPath := filepath.Join(b.ImageOutput, b.Name+".raw")
-	if _, err := os.Stat(rawDiskPath); err == nil {
+	kernelPath := filepath.Join(b.ImageOutput, "kernel")
+	initrdPath := filepath.Join(b.ImageOutput, "initrd")
+
+	_, rawErr := os.Stat(rawDiskPath)
+	_, kernErr := os.Stat(kernelPath)
+	_, initErr := os.Stat(initrdPath)
+
+	// Inject dummy disk for MicroVMs to satisfy template branching
+	if rawErr != nil && (kernErr == nil || initErr == nil) {
+		b.Log.Info(ctx, "microvm detected without raw disk; generating dummy block device to satisfy vm constraints")
+		_ = CreateSparse(rawDiskPath, 1024*1024) // 1 MiB dummy disk
+		rawErr = nil
+	}
+
+	if rawErr == nil || kernErr == nil || initErr == nil {
 		b.Log.Info(ctx, "populating manifest declaratively from build state")
 
 		hasEFI := false
@@ -433,28 +442,28 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 		}
 
 		kernelExists := false
-		if _, err := os.Stat(filepath.Join(b.ImageOutput, "kernel")); err == nil {
+		if kernErr == nil {
 			sb.YamlObject.Boot.Kernel = "kernel"
 			kernelExists = true
 		}
 		initrdExists := false
-		if _, err := os.Stat(filepath.Join(b.ImageOutput, "initrd")); err == nil {
+		if initErr == nil {
 			sb.YamlObject.Boot.Initrd = "initrd"
 			initrdExists = true
 		}
 
-		if !kernelExists || !initrdExists {
+		if (!kernelExists || !initrdExists) && rawErr == nil {
 			b.Log.Info(ctx, "locating kernel binaries natively in ZFS dataset")
 			bootDir := filepath.Join(b.RootDir, "boot")
 			
-			kernelPath, initrdPath, ok := scanPartitionForArtifacts(bootDir)
+			kernelPathOut, initrdPathOut, ok := scanPartitionForArtifacts(bootDir)
 			if !ok {
-				kernelPath, initrdPath, ok = scanPartitionForArtifacts(b.RootDir)
+				kernelPathOut, initrdPathOut, ok = scanPartitionForArtifacts(b.RootDir)
 			}
 			
 			if ok {
-				b.Log.Info(ctx, "extracting kernel directly from workspace", "kernel", filepath.Base(kernelPath))
-				kName, iName, err := copyArtifacts(kernelPath, initrdPath, b.ImageOutput)
+				b.Log.Info(ctx, "extracting kernel directly from workspace", "kernel", filepath.Base(kernelPathOut))
+				kName, iName, err := copyArtifacts(kernelPathOut, initrdPathOut, b.ImageOutput)
 				if err != nil {
 					b.Log.Warn(ctx, "native artifact extraction failed", "error", err)
 				} else {
@@ -466,7 +475,9 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 			}
 		}
 
-		QueuePurification(b.RuntimeDir, []string{rawDiskPath})
+		if rawErr == nil {
+			QueuePurification(b.RuntimeDir, []string{rawDiskPath})
+		}
 	} else {
 		b.Log.Info(ctx, "resolving artifact as OCI container dataset")
 		sb.YamlObject.Storage.RawImage = "" 
@@ -533,11 +544,11 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 }
 
 func (b *BuildApp) FinalizeInstance(ctx context.Context) error {
-	instName := b.Args["INST_NAME"]
+	instName := b.BuildArgs["INST_NAME"]
 	if instName == "" {
 		instName = b.Name
 	}
-	baseImage := b.Args["BASE_IMAGE"]
+	baseImage := b.BuildArgs["BASE_IMAGE"]
 	if baseImage == "" {
 		baseImage = b.BaseImage
 	}

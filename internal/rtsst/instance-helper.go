@@ -5,8 +5,6 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	sst "github.com/troodos-exascale/sst/internal/sst"
-	runctlpb "github.com/troodos-exascale/sst/proto/yaml/runctl/v1"
 	"os"
 	"os/exec"
 	"os/user"
@@ -15,6 +13,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	sst "github.com/troodos-exascale/sst/internal/sst"
+	runctlpb "github.com/troodos-exascale/sst/proto/yaml/runctl/v1"
 )
 
 func Home() string {
@@ -92,7 +93,6 @@ func ReadLock(path string) (*LockInfo, error) {
 		if ln == "" {
 			continue
 		}
-		// Corrected: added the "=" separator back in
 		parts := strings.SplitN(ln, "=", 2)
 		if len(parts) != 2 {
 			continue
@@ -227,13 +227,42 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 		return fmt.Errorf("failed to get user's local public key: %w", err)
 	}
 
-	type mountInfo struct {
-		tag       string
-		guestPath string
-		options   string
-	}
-	var mounts []mountInfo
+	var sb strings.Builder
 
+	sb.WriteString("#cloud-config\n")
+	sb.WriteString("# syntax=yaml\n\n")
+
+	fmt.Fprintf(&sb, "hostname: %s\n", inst.Hostname)
+	sb.WriteString("lock_passwd: false\n")
+	sb.WriteString("ssh_pwauth: false\n")
+	sb.WriteString("disable_root: true\n\n")
+
+	// 1. Core GPT repair
+	sb.WriteString("bootcmd:\n")
+	sb.WriteString("  - [ cloud-init-per, once, move-gpt-header, sgdisk, -e, /dev/vda ]\n")
+	sb.WriteString("  - [ cloud-init-per, once, reread-pt, partprobe ]\n\n")
+
+	// 2. User injection
+	sb.WriteString("users:\n")
+	sb.WriteString("  - default\n")
+	fmt.Fprintf(&sb, "  - name: %s\n", username)
+	fmt.Fprintf(&sb, "    gecos: %s\n", username)
+	sb.WriteString("    sudo: ALL=(ALL) NOPASSWD:ALL\n")
+	sb.WriteString("    shell: /bin/bash\n")
+	if pubKey != "" {
+		sb.WriteString("    ssh_authorized_keys:\n")
+		fmt.Fprintf(&sb, "      - %s\n", pubKey)
+	}
+
+	sb.WriteString("\nchpasswd:\n")
+	sb.WriteString("  list: |\n")
+	fmt.Fprintf(&sb, "    %s:abcd1234\n", username)
+	sb.WriteString("  expire: False\n\n")
+
+	// 3. Mounts formulation
+	sb.WriteString("# Mount virtiofs shares\n")
+	sb.WriteString("mounts:\n")
+	var guestMountDirs []string
 	for _, shareStr := range inst.SharedDir {
 		parts := strings.Split(shareStr, ":")
 		if len(parts) == 0 || parts[0] == "" {
@@ -245,73 +274,53 @@ func WriteCIData(ctx context.Context, log *sst.Logx, instanceDir string, inst *r
 		if len(parts) > 1 && parts[1] != "" {
 			tag = parts[1]
 		}
+		guestPath := tag 
 
-		guestPath := tag
 		opts := "rw"
 		if len(parts) > 2 && parts[2] == "ro" {
 			opts = "ro"
 		}
-		mounts = append(mounts, mountInfo{tag: tag, guestPath: guestPath, options: opts})
+		
+		fmt.Fprintf(&sb, "  - [ %q, %q, \"virtiofs\", %q, \"0\", \"0\" ]\n", tag, guestPath, opts)
+		guestMountDirs = append(guestMountDirs, guestPath)
 	}
 
-	var sb strings.Builder
-
-	sb.WriteString("#cloud-config\n")
-	sb.WriteString("# syntax=yaml\n\n")
-
-	fmt.Fprintf(&sb, "hostname: %s\n", inst.Hostname)
-	fmt.Fprintf(&sb, "local-hostname: %s\n", inst.Hostname)
-	sb.WriteString("lock_passwd: false\n")
-	sb.WriteString("ssh_pwauth: false\n")
-	sb.WriteString("disable_root: true\n\n")
-
-	sb.WriteString("\nusers:\n")
-	sb.WriteString("  - default\n")
-	fmt.Fprintf(&sb, "  - name: %s\n", username)
-	sb.WriteString("    shell: /bin/bash\n")
-	sb.WriteString("    sudo: ALL=(ALL) NOPASSWD:ALL\n")
-	if pubKey != "" {
-		sb.WriteString("    ssh_authorized_keys:\n")
-		sb.WriteString("      - " + pubKey + "\n")
-	}
-
-	// NEW: bootcmd runs on EVERY boot, ensuring tmpfs directories survive reboots
-	sb.WriteString("\nbootcmd:\n")
-	sb.WriteString("  - mkdir -p /run/sshd\n")
-	sb.WriteString("  - chmod 0755 /run/sshd\n")
-
+	// 4. Execution Logic (Alpine fallback, mount dirs, and ZFS pool creation)
 	sb.WriteString("\nruncmd:\n")
+	
 	sb.WriteString("  - |\n")
-
 	sb.WriteString(fmt.Sprintf(`    if [ -f /etc/alpine-release ]; then
       mkdir -p /etc/conf.d
       echo 'TTY="hvc0"' > /etc/conf.d/ttyAMA0
       sed -i 's/^ttyAMA0/#ttyAMA0/' /etc/inittab
-      
-      # Ensure shell is set using sed since bash/usermod are removed
-      sed -i -e "s#^\(%s:.*:\)[^:]*\$#\1/bin/sh#" /etc/passwd
-      
-      # Explicit passwordless doas configuration
-      mkdir -p /etc/doas.d
-      echo "permit nopass %s as root" > /etc/doas.d/%s.conf
-      
-      # Force Hostname
-      hostname %s
-      echo "%s" > /etc/hostname
-      
+      apk add --no-cache sudo bash shadow
+      usermod -s /bin/bash %s
       kill -HUP 1
     fi
+`, username))
 
-    # Proactively announce presence to populate the host's ARP table
-    GW=$(ip route | awk '/default/ {print $3}' | head -n 1)
-    if [ -n "$GW" ]; then ping -c 3 "$GW" >/dev/null 2>&1 || true; fi
-`, username, username, username, inst.Hostname, inst.Hostname))
-
-	for _, m := range mounts {
-		sb.WriteString("  - |\n")
-		fmt.Fprintf(&sb, "    mkdir -p %s\n", m.guestPath)
-		fmt.Fprintf(&sb, "    mount -t virtiofs %s %s -o %s\n", m.tag, m.guestPath, m.options)
+	for _, dir := range guestMountDirs {
+		fmt.Fprintf(&sb, "  - mkdir -p %q\n", dir)
 	}
+
+	// Inject ZFS Installation and Pool Provisioning
+	sb.WriteString("  - |\n")
+	sb.WriteString(`    # ZFS Provisioning
+    if command -v apt-get >/dev/null 2>&1 && ! command -v zpool >/dev/null 2>&1; then
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update && apt-get install -y zfsutils-linux
+    elif command -v apk >/dev/null 2>&1 && ! command -v zpool >/dev/null 2>&1; then
+      apk add --no-cache zfs
+      modprobe zfs || true
+    fi
+
+    # Assuming /dev/vdb is the 30GB secondary 'data.raw' disk
+    if blockdev --getsize64 /dev/vdb >/dev/null 2>&1; then
+      if ! zpool status sst-data >/dev/null 2>&1; then
+        zpool create -f -m /sst-data sst-data /dev/vdb
+      fi
+    fi
+`)
 
 	userData := sb.String()
 	metaData := fmt.Sprintf("instance-id: %s\nlocal-hostname: %s\n", inst.Hostname, inst.Hostname)
@@ -380,9 +389,10 @@ func EnsureCIDataISO(ctx context.Context, log *sst.Logx, instDir string) error {
 		return nil
 	}
 
-	instanceID := "iid-" + time.Now().UTC().Format("2006-01-02-15-04-05.000000000")
+	instanceID := filepath.Base(instDir)
 	hostname := filepath.Base(instDir)
 
+	// Keep the exact metadata format requested
 	metaData := fmt.Sprintf(
 		"instance-id: %s\nlocal-hostname: %s\n",
 		instanceID,
@@ -392,8 +402,6 @@ func EnsureCIDataISO(ctx context.Context, log *sst.Logx, instDir string) error {
 	if err := os.WriteFile(metaDataPath, []byte(metaData), 0644); err != nil {
 		return fmt.Errorf("write meta-data: %w", err)
 	}
-
-	log.Info(ctx, "Updated instance-id", "instance_id", instanceID)
 
 	_ = os.Remove(isoPath)
 	if err := UpdateCIDATAISO(instDir); err != nil {
