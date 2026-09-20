@@ -42,37 +42,19 @@ RUN [host]: |
       fi
   else
       echo "--> VM format detected. Copying block devices..."
+  if [ -f "${SRC_DIR}/${RAW_IMAGE}" ]; then
       if [ "$(uname)" = "Darwin" ]; then
         cp -c "${SRC_DIR}/${RAW_IMAGE}" "${INST_DIR}/${INST_NAME}.raw" || cp "${SRC_DIR}/${RAW_IMAGE}" "${INST_DIR}/${INST_NAME}.raw"
       else
         cp --sparse=always "${SRC_DIR}/${RAW_IMAGE}" "${INST_DIR}/${INST_NAME}.raw"
       fi
+  else
+    echo "    (MicroVM detected: No physical raw image found, skipping block device copy)"
+  fi
       
       if [ -f "${SRC_DIR}/kernel" ]; then cp -L "${SRC_DIR}/kernel" "${INST_DIR}/kernel"; fi
       if [ -f "${SRC_DIR}/initrd" ]; then cp -L "${SRC_DIR}/initrd" "${INST_DIR}/initrd"; fi
       
-      echo "--> Generating cloud-init (cidata)..."
-      mkdir -p "${INST_DIR}/cidata"
-      
-      (
-        echo "#cloud-config"
-        echo "hostname: ${INST_NAME}"
-        echo "local-hostname: ${INST_NAME}"
-      ) > "${INST_DIR}/cidata/user-data"
-      
-      (
-        echo "instance-id: iid-${INST_NAME}"
-        echo "local-hostname: ${INST_NAME}"
-      ) > "${INST_DIR}/cidata/meta-data"
-      
-      if command -v hdiutil >/dev/null 2>&1; then
-        hdiutil makehybrid -o "${INST_DIR}/cidata.iso" "${INST_DIR}/cidata" -joliet -iso -default-volume-name cidata >/dev/null
-      else
-        genisoimage -output "${INST_DIR}/cidata.iso" -volid cidata -joliet -rock "${INST_DIR}/cidata" >/dev/null 2>&1
-        SIZE=$(stat -c%s "${INST_DIR}/cidata.iso")
-        REM=$((SIZE % 4096))
-        if [ $REM -ne 0 ]; then
-          truncate -s +$((4096 - REM)) "${INST_DIR}/cidata.iso"
-        fi
-      fi
+      echo "--> Provisioning 30GB sparse data disk for ZFS..."
+      truncate -s 30G "${INST_DIR}/data.raw"
   fi
