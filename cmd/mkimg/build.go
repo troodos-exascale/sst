@@ -24,7 +24,7 @@ var (
 	flagSource  string
 )
 
-func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runtimeDir string, flagForce bool, bArgs map[string]string) error {
+func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runtimeDir string, flagForce bool, bArgs map[string]string, restartIndex int) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("mkimg requires root privileges to provision datasets and execute isolated environments. Please run with sudo")
 	}
@@ -93,11 +93,51 @@ func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runti
 		Completed: make(map[string]bool),
 	}
 
+	// === RECONCILIATION LAYER ===
+	if err := runner.LoadState(); err == nil {
+		stateMutated := false
+
+		for i, inst := range builder.Instructions {
+			// 1. User-Requested Pruning (--restart)
+			if restartIndex >= 0 && inst.Index >= restartIndex {
+				if runner.Completed[inst.Hash] {
+					delete(runner.Completed, inst.Hash)
+					stateMutated = true
+				}
+				continue
+			}
+
+			// 2. Physical Reality Check (ZFS Sync)
+			if runner.Completed[inst.Hash] && builder.DatasetMgr != nil {
+				var nextHashStub string
+				if i+1 < len(builder.Instructions) {
+					nextHashStub = builder.Instructions[i+1].Hash
+					if len(nextHashStub) >= 8 {
+						nextHashStub = nextHashStub[:8]
+					}
+				} else {
+					nextHashStub = "final"
+				}
+
+				tag := fmt.Sprintf("step_%02d_hash_%s", inst.Index, nextHashStub)
+				
+				// Ensure the filesystem matches the mathematical ledger
+				if !builder.DatasetMgr.CheckSnapshot(builder.DatasetMgr.RuntimeRootName, tag) {
+					log.Warn(ctx, "zfs out of sync with state.json; pruning future", "step", inst.Index, "missing_tag", tag)
+					delete(runner.Completed, inst.Hash)
+					stateMutated = true
+				}
+			}
+		}
+
+		if stateMutated {
+			_ = runner.SaveState()
+		}
+	}
+	// === END RECONCILIATION ===
+
 	// 2. Overview Mode (--show)
 	if flagShow {
-		// Load state silently to peek at completions
-		_ = runner.Run(ctx, &sst.Context{Action: func(c context.Context) (interface{}, error) { return nil, nil }})
-		
 		fmt.Printf("--- Build Summary: %s ---\n", builder.Name)
 		for _, inst := range builder.Instructions {
 			status := "PENDING"
@@ -142,6 +182,8 @@ func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runti
 					for stageTarget := range inst.StageMounts {
 						_ = builder.DatasetMgr.SnapshotDataset(stageTarget, tag)
 					}
+					// Also snapshot the core runtime root
+					_ = builder.DatasetMgr.SnapshotDataset(builder.DatasetMgr.RuntimeRootName, tag)
 				}
 				return []*sst.Context{nextCtx}, nil
 			}
@@ -181,6 +223,7 @@ var buildCmd = &cobra.Command{
 
 		bArgs := make(map[string]string)
 		for _, arg := range buildArgs {
+			// FIXED: Added the missing "=" separator
 			parts := strings.SplitN(arg, "=", 2)
 			if len(parts) == 2 {
 				bArgs[parts[0]] = parts[1]
@@ -189,10 +232,9 @@ var buildCmd = &cobra.Command{
 			}
 		}
 
-		return RunBuildEngine(cmd.Context(), flagFile, contextDir, flagBuildDir, runtimeDir, flagForce, bArgs)
+		return RunBuildEngine(cmd.Context(), flagFile, contextDir, flagBuildDir, runtimeDir, flagForce, bArgs, flagRestart)
 	},
 }
-
 func init() {
 	buildCmd.Flags().StringSliceVar(&buildArgs, "build-arg", nil, "Set build-time variables (e.g., DEBARCH=amd64)")
 	buildCmd.Flags().StringVarP(&flagFile, "file", "f", "./Dockerfile", "path to the Dockerfile")

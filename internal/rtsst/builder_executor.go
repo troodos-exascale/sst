@@ -162,7 +162,10 @@ func (b *BuildApp) CreateStepContext(inst Instruction, parentHash string) *sst.C
 		
 		Probe: func(c context.Context) (bool, error) {
 			if b.DatasetMgr != nil {
-				return false, nil 
+				// We enforce absolute ZFS integrity. If the snapshot representing the successful completion 
+				// of this step exists, we guarantee the state is clean.
+				exists := b.DatasetMgr.CheckSnapshot(b.DatasetMgr.RuntimeRootName, fmt.Sprintf("step_%02d_hash_%s", inst.Index, hashStub))
+				return exists, nil
 			}
 			return false, nil
 		},
@@ -173,6 +176,7 @@ func (b *BuildApp) CreateStepContext(inst Instruction, parentHash string) *sst.C
 				for stageTarget := range inst.StageMounts {
 					_ = b.DatasetMgr.RollbackDataset(stageTarget, pTag)
 				}
+				_ = b.DatasetMgr.RollbackDataset(b.DatasetMgr.RuntimeRootName, pTag)
 			}
 			return nil
 		},

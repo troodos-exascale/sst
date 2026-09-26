@@ -48,7 +48,7 @@ type persistedGraphState struct {
 	Completed map[string]bool
 }
 
-func (r *Runner) loadState() error {
+func (r *Runner) LoadState() error {
 	if r.StatePath == "" {
 		return nil
 	}
@@ -69,7 +69,7 @@ func (r *Runner) loadState() error {
 	return nil
 }
 
-func (r *Runner) saveState() error {
+func (r *Runner) SaveState() error {
 	if r.StatePath == "" {
 		return nil
 	}
@@ -96,7 +96,7 @@ func (r *Runner) Run(ctx context.Context, rootCtx *Context) error {
 		r.Completed = make(map[string]bool)
 	}
 	if r.StatePath != "" {
-		if err := r.loadState(); err != nil {
+		if err := r.LoadState(); err != nil {
 			r.Log.WithError(err).Warn(ctx, "tg.runner.state_load_failed", "path", r.StatePath)
 		}
 	}
@@ -137,7 +137,7 @@ func (r *Runner) runRecursive(ctx context.Context, tgCtx *Context) error {
 			skipped = true
 			if tgCtx.ID != "" {
 				r.Completed[tgCtx.ID] = true
-				_ = r.saveState()
+				_ = r.SaveState()
 			}
 		} else {
 			if tgCtx.Restore != nil {
@@ -156,7 +156,7 @@ func (r *Runner) runRecursive(ctx context.Context, tgCtx *Context) error {
 			
 			if actionErr == nil && tgCtx.ID != "" {
 				r.Completed[tgCtx.ID] = true
-				_ = r.saveState()
+				_ = r.SaveState()
 			}
 		}
 	}
@@ -173,29 +173,28 @@ func (r *Runner) runRecursive(ctx context.Context, tgCtx *Context) error {
 
 		for _, nextCtx := range continuation {
 			if err := r.runRecursive(ctx, nextCtx); err != nil {
-				r.runCleanup(ctx, tgCtx)
 				return err
 			}
 		}
-	} else if actionErr != nil {
-		r.runCleanup(ctx, tgCtx)
-		r.Log.WithError(actionErr).Error(ctx, "step.action.fail", "id", tgCtx.ID, "description", tgCtx.Description)
-		return actionErr
 	}
 
-	if !skipped {
-		r.Log.Debug(ctx, "step.ok", "id", tgCtx.ID, "description", tgCtx.Description)
+	r.runCleanup(ctx, tgCtx)
+
+	if !skipped && actionErr == nil {
+		r.Log.Debug(ctx, "step.action.ok", "id", tgCtx.ID)
 	}
-	return nil
+
+	return actionErr
 }
 
 func (r *Runner) runCleanup(ctx context.Context, tgCtx *Context) {
-	if !r.Debug && tgCtx.Cleanup != nil {
-		r.Log.Debug(ctx, "step.cleanup", "id", tgCtx.ID, "description", tgCtx.Description)
+	if tgCtx.Cleanup != nil {
+		r.Log.Debug(ctx, "step.cleanup.start", "id", tgCtx.ID)
 		tgCtx.Cleanup()
+		r.Log.Debug(ctx, "step.cleanup.ok", "id", tgCtx.ID)
 	}
 }
 
 func (r *Runner) handleError(ctx context.Context, err error, tgCtx *Context) {
-	r.Log.WithError(err).Error(ctx, "tg.runner.fatal", "step", tgCtx.Description)
+	r.Log.WithError(err).Error(ctx, "step.action.fail", "id", tgCtx.ID)
 }

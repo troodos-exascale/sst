@@ -211,7 +211,7 @@ func pullvmCmd() *cobra.Command {
 				"URL":       source,
 				"PULL_NAME": name,
 			}
-			return RunBuildEngine(cmd.Context(), "pullpullvm.dockerfile", ".", flagBuildDir, runtimeDir, flagForce, bArgs)
+			return RunBuildEngine(cmd.Context(), "pullpullvm.dockerfile", ".", flagBuildDir, runtimeDir, flagForce, bArgs, -1)
 		},
 	}
 }
@@ -312,7 +312,7 @@ func instanceCmd() *cobra.Command {
 				"BASE_IMAGE": baseImage,
 				"INST_NAME":  args[1],
 			}
-			return RunBuildEngine(cmd.Context(), "instance.dockerfile", ".", flagBuildDir, runtimeDir, flagForce, bArgs)
+			return RunBuildEngine(cmd.Context(), "instance.dockerfile", ".", flagBuildDir, runtimeDir, flagForce, bArgs, -1)
 		},
 	}
 	cmd.Flags().StringVarP(&flagBuildDir, "builddir", "b", "/runtimes", "Base directory for ZFS extraction")
