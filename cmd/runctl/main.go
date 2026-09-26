@@ -242,7 +242,6 @@ func (r *Runctl) startContainer(inst *runctlpb.Instance, instDir string) error {
 	} else {
 		args = append(args, "--as-pid2", "/.sst/init", "/bin/sh")
 	}
-	
 
 	if len(inst.Network) > 0 {
 		mac := strings.Split(inst.Network[0], "@")[0]
@@ -516,27 +515,27 @@ func (r *Runctl) listCmd() *cobra.Command {
 
 func (r *Runctl) sshCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:               "ssh <name>",
+		Use:               "ssh <[user@]name>",
 		Short:             "SSH into a running instance",
 		Args:              cobra.MinimumNArgs(1),
 		ValidArgsFunction: r.instanceCompletion,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			r.syncWorkspace()
 
-			instName := args[0]
+			target := args[0]
+			instName := target
+			sshUser := ""
+
+			// Support user@instance syntax
+			if strings.Contains(target, "@") {
+				parts := strings.SplitN(target, "@", 2)
+				sshUser = parts[0]
+				instName = parts[1]
+			}
+
 			inst, err := r.loadInstance(instName)
 			if err != nil {
 				return fmt.Errorf("failed to load instance: %w", err)
-			}
-			if len(inst.Network) == 0 {
-				return fmt.Errorf("instance has no network configured")
-			}
-
-			mac := strings.Split(inst.Network[0], "@")[0]
-
-			ip, err := r.resolveIP(mac)
-			if err != nil {
-				return fmt.Errorf("could not resolve IP for instance %s (MAC: %s): %w\nWait a few seconds after boot or ensure it acquired a DHCP lease", instName, mac, err)
 			}
 
 			u, err := user.Current()
@@ -544,12 +543,14 @@ func (r *Runctl) sshCmd() *cobra.Command {
 				return err
 			}
 
+			if sshUser == "" {
+				sshUser = u.Username
+			}
+
 			sshBin, err := exec.LookPath("ssh")
 			if err != nil {
 				return fmt.Errorf("ssh binary not found in PATH")
 			}
-
-			fmt.Printf("Connecting to %s@%s...\n", u.Username, ip)
 
 			sshArgs := []string{
 				"ssh",
@@ -559,11 +560,32 @@ func (r *Runctl) sshCmd() *cobra.Command {
 				"-o", "LogLevel=ERROR",
 			}
 
-			if term.IsTerminal(int(os.Stdin.Fd())) {
-				sshArgs = append(sshArgs, "-t")
+			sockPath := filepath.Join(r.instanceDir(instName), "var", "ssh.sock")
+			if _, err := os.Stat(sockPath); err == nil {
+				// VSOCK routing: bypass macOS networking entirely
+				fmt.Printf("Connecting to %s via VSOCK tunnel...\n", sshUser)
+				sshArgs = append(sshArgs, "-o", fmt.Sprintf("ProxyCommand=nc -U %s", sockPath))
+				if term.IsTerminal(int(os.Stdin.Fd())) {
+					sshArgs = append(sshArgs, "-t")
+				}
+				// socat forwards to localhost inside the guest
+				sshArgs = append(sshArgs, fmt.Sprintf("%s@127.0.0.1", sshUser))
+			} else {
+				// Legacy IP Resolution fallback
+				if len(inst.Network) == 0 {
+					return fmt.Errorf("instance has no network configured and no vsock found")
+				}
+				mac := strings.Split(inst.Network[0], "@")[0]
+				ip, err := r.resolveIP(mac)
+				if err != nil {
+					return fmt.Errorf("could not resolve IP for instance %s (MAC: %s): %w\nWait a few seconds after boot or ensure it acquired a DHCP lease", instName, mac, err)
+				}
+				fmt.Printf("Connecting to %s@%s...\n", sshUser, ip)
+				if term.IsTerminal(int(os.Stdin.Fd())) {
+					sshArgs = append(sshArgs, "-t")
+				}
+				sshArgs = append(sshArgs, fmt.Sprintf("%s@%s", sshUser, ip))
 			}
-
-			sshArgs = append(sshArgs, fmt.Sprintf("%s@%s", u.Username, ip))
 
 			if len(args) > 1 {
 				sshArgs = append(sshArgs, args[1:]...)

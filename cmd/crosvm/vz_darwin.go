@@ -15,8 +15,10 @@ import "C"
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -100,7 +102,7 @@ func NewVMWrapper(app *CrosvmApp) (*VMWrapper, error) {
 	}
 	config.SetStorageDevicesVirtualMachineConfiguration(storageDevices)
 
-	// 4. Network (Strict Ordering Enforced)
+	// 4. Network
 	if len(app.Networks) == 0 {
 		app.Networks = []string{"nat"}
 	}
@@ -126,7 +128,7 @@ func NewVMWrapper(app *CrosvmApp) (*VMWrapper, error) {
 	}
 	config.SetDirectorySharingDevicesVirtualMachineConfiguration(directoryShares)
 
-	// 6. Devices (Balloon & Entropy)
+	// 6. Devices (Balloon, Entropy, VSOCK)
 	entropy, _ := vz.NewVirtioEntropyDeviceConfiguration()
 	config.SetEntropyDevicesVirtualMachineConfiguration([]*vz.VirtioEntropyDeviceConfiguration{entropy})
 
@@ -134,6 +136,13 @@ func NewVMWrapper(app *CrosvmApp) (*VMWrapper, error) {
 		bal, _ := vz.NewVirtioTraditionalMemoryBalloonDeviceConfiguration()
 		config.SetMemoryBalloonDevicesVirtualMachineConfiguration([]vz.MemoryBalloonDeviceConfiguration{bal})
 	}
+
+	// 6.5 VSOCK Configuration for Host-to-Guest SSH
+	socketDev, err := vz.NewVirtioSocketDeviceConfiguration()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create vsock config: %w", err)
+	}
+	config.SetSocketDevicesVirtualMachineConfiguration([]vz.SocketDeviceConfiguration{socketDev})
 
 	// 7. Validation
 	validated, err := config.Validate()
@@ -161,9 +170,49 @@ func (v *VMWrapper) Start(ctx context.Context) error {
 		return err
 	}
 
-	// NEW: Monitor VM state in the background.
-	// This ensures that when the guest OS halts (via ACPI or internal shutdown),
-	// we instantly close the done channel so the wrapper can cleanly exit.
+	// Setup Host Unix Socket for VSOCK SSH Tunnel
+	sockDir := "var"
+	os.MkdirAll(sockDir, 0755)
+	sockPath := filepath.Join(sockDir, "ssh.sock")
+	os.Remove(sockPath)
+
+	ln, err := net.Listen("unix", sockPath)
+	if err == nil {
+		go func() {
+			defer ln.Close()
+			for {
+				hostConn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go func(hc net.Conn) {
+					defer hc.Close()
+					socketDevices := v.machine.SocketDevices()
+					if len(socketDevices) == 0 {
+						return
+					}
+					// Connect to guest vsock port 2222
+					guestConn, err := socketDevices[0].Connect(2222)
+					if err != nil {
+						return
+					}
+					defer guestConn.Close()
+
+					errc := make(chan error, 2)
+					go func() {
+						_, err := io.Copy(hc, guestConn)
+						errc <- err
+					}()
+					go func() {
+						_, err := io.Copy(guestConn, hc)
+						errc <- err
+					}()
+					<-errc
+				}(hostConn)
+			}
+		}()
+	}
+
 	go func() {
 		for {
 			state := v.machine.State()
@@ -182,6 +231,7 @@ func (v *VMWrapper) Start(ctx context.Context) error {
 	return nil
 }
 
+// ... (keep RequestStop, Stop, Pause, Resume, Done, Err, and all Helpers exactly as they are) ...
 func (v *VMWrapper) RequestStop() error {
 	if v.machine.CanRequestStop() {
 		_, err := v.machine.RequestStop()
@@ -190,22 +240,10 @@ func (v *VMWrapper) RequestStop() error {
 	return v.machine.Stop()
 }
 
-func (v *VMWrapper) Stop() error {
-	return v.machine.Stop()
-}
-
-func (v *VMWrapper) Pause() error {
-	return v.machine.Pause()
-}
-
-func (v *VMWrapper) Resume() error {
-	return v.machine.Resume()
-}
-
-func (v *VMWrapper) Done() <-chan struct{} {
-	return v.doneCh
-}
-
+func (v *VMWrapper) Stop() error { return v.machine.Stop() }
+func (v *VMWrapper) Pause() error { return v.machine.Pause() }
+func (v *VMWrapper) Resume() error { return v.machine.Resume() }
+func (v *VMWrapper) Done() <-chan struct{} { return v.doneCh }
 func (v *VMWrapper) Err() error {
 	select {
 	case err := <-v.errCh:
@@ -215,37 +253,19 @@ func (v *VMWrapper) Err() error {
 	}
 }
 
-// --- Helpers ---
-
 func createBootloader(app *CrosvmApp) (vz.BootLoader, error) {
 	if app.Bootloader == "linux" {
-		return vz.NewLinuxBootLoader(
-			app.Kernel,
-			vz.WithCommandLine(app.Params),
-			vz.WithInitrd(app.Initrd),
-		)
+		return vz.NewLinuxBootLoader(app.Kernel, vz.WithCommandLine(app.Params), vz.WithInitrd(app.Initrd))
 	}
-
-	store, err := vz.NewEFIVariableStore(
-		app.EfiVars,
-		vz.WithCreatingEFIVariableStore(),
-	)
+	store, err := vz.NewEFIVariableStore(app.EfiVars, vz.WithCreatingEFIVariableStore())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create EFI store: %w", err)
 	}
-
-	return vz.NewEFIBootLoader(
-		vz.WithEFIVariableStore(store),
-	)
+	return vz.NewEFIBootLoader(vz.WithEFIVariableStore(store))
 }
 
 func createDiskConfig(path string, ro bool) (vz.StorageDeviceConfiguration, error) {
-	att, err := vz.NewDiskImageStorageDeviceAttachmentWithCacheAndSync(
-		path,
-		ro,
-		vz.DiskImageCachingModeCached,
-		vz.DiskImageSynchronizationModeFsync,
-	)
+	att, err := vz.NewDiskImageStorageDeviceAttachmentWithCacheAndSync(path, ro, vz.DiskImageCachingModeCached, vz.DiskImageSynchronizationModeFsync)
 	if err != nil {
 		return nil, err
 	}
@@ -262,8 +282,6 @@ func createUSBCDROMConfig(path string) (vz.StorageDeviceConfiguration, error) {
 
 func createNetworkConfig(netStr string) (*vz.VirtioNetworkDeviceConfiguration, error) {
 	macStr := ""
-
-	// Parse standard crosvm format (e.g. "mac=52:54:00:11:22:33,tap-name=sst_tap")
 	parts := strings.Split(netStr, ",")
 	for _, p := range parts {
 		kv := strings.SplitN(p, "=", 2)
