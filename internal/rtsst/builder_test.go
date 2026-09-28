@@ -85,14 +85,15 @@ ADD https://example.com/binary /usr/local/bin/
 	var lastInst Instruction
 	foundAdd := false
 	for _, inst := range builder.Instructions {
-		if inst.Type == "RUN" && strings.Contains(inst.Args, "curl -sSL 'https://example.com/binary'") {
+		// Look for the new dynamic bash script that desugarAdd() generates
+		if inst.Type == "RUN" && strings.Contains(inst.Args, "curl -sSL \"$SRC\" -o \"$DST\"") {
 			lastInst = inst
 			foundAdd = true
 			break
 		}
 	}
 
-	assert.True(t, foundAdd, "ADD instruction should be desugared into a RUN curl command")
+	assert.True(t, foundAdd, "ADD instruction should be desugared into a dynamic script containing a curl command")
 	
 	// Verify that the pre-computed snapshot attached to the final instruction is correct
 	assert.Equal(t, "/opt/app", lastInst.Workdir)

@@ -14,15 +14,6 @@ import (
 	runctlpb "github.com/troodos-exascale/sst/proto/yaml/runctl/v1"
 )
 
-func wrapWithTee(logFile string, cmd string, args ...string) (string, []string, []string) {
-	if logFile == "" {
-		return cmd, args, nil
-	}
-	bashArgs := []string{"-c", `set -o pipefail; "$@" 2>&1 | tee -a "$LOGFILE"`, "_", cmd}
-	bashArgs = append(bashArgs, args...)
-	return "bash", bashArgs, []string{"LOGFILE=" + logFile}
-}
-
 func (b *BuildApp) InitEnvironment(ctx context.Context) error {
 	absContext, err := filepath.Abs(b.ContextDir)
 	if err != nil {
@@ -41,7 +32,11 @@ func (b *BuildApp) InitEnvironment(ctx context.Context) error {
 
 	dockerfileName := filepath.Base(b.Dockerfile)
 
-	b.BuildID = fmt.Sprintf("%s-%s", contextHash, dockerfileName)
+	if b.Name != "" {
+		b.BuildID = fmt.Sprintf("%s-%s-%s", contextHash, b.Name, dockerfileName)
+	} else {
+		b.BuildID = fmt.Sprintf("%s-%s", contextHash, dockerfileName)
+	}
 	runtimeRootName := fmt.Sprintf("runtime-root-%s", dockerfileName)
 
 	b.Log.Info(ctx, "initialized workspace",
@@ -129,7 +124,7 @@ func (b *BuildApp) buildEnvironmentMap(inst Instruction, activeRootfs string) []
 		envMap[k] = v
 	}
 	for k, v := range b.BuildArgs {
-		envMap[k] = v // Global build args still overlay
+		envMap[k] = v
 	}
 
 	var envs []string
@@ -139,13 +134,11 @@ func (b *BuildApp) buildEnvironmentMap(inst Instruction, activeRootfs string) []
 	return envs
 }
 
-// CreateStepContext builds a pure, self-contained Protosh capsule for a Dockerfile instruction.
 func (b *BuildApp) CreateStepContext(inst Instruction, parentHash string) *sst.Context {
 	hashStub := inst.Hash
 	if len(hashStub) >= 8 {
 		hashStub = hashStub[:8]
 	}
-	_ = fmt.Sprintf("step_%02d_hash_%s", inst.Index, hashStub)
 
 	var pTag string
 	if parentHash != "" {
@@ -162,9 +155,14 @@ func (b *BuildApp) CreateStepContext(inst Instruction, parentHash string) *sst.C
 		
 		Probe: func(c context.Context) (bool, error) {
 			if b.DatasetMgr != nil {
-				// We enforce absolute ZFS integrity. If the snapshot representing the successful completion 
-				// of this step exists, we guarantee the state is clean.
-				exists := b.DatasetMgr.CheckSnapshot(b.DatasetMgr.RuntimeRootName, fmt.Sprintf("step_%02d_hash_%s", inst.Index, hashStub))
+				var nextHashStub string
+				if inst.Index+1 < len(b.Instructions) {
+					nextHashStub = b.Instructions[inst.Index+1].Hash[:8]
+				} else {
+					nextHashStub = "final"
+				}
+				tag := fmt.Sprintf("step_%02d_hash_%s", inst.Index, nextHashStub)
+				exists := b.DatasetMgr.CheckSnapshot(b.DatasetMgr.RuntimeRootName, tag)
 				return exists, nil
 			}
 			return false, nil
@@ -188,8 +186,9 @@ func (b *BuildApp) CreateStepContext(inst Instruction, parentHash string) *sst.C
 }
 
 func (b *BuildApp) executeAction(ctx context.Context, inst Instruction, hashStub string) error {
-	var logFile string
+	b.RegisterHandlers()
 
+	var logFile string
 	if b.DatasetMgr != nil {
 		logsDir := filepath.Join(b.DatasetMgr.MountPath(""), "logs")
 		os.MkdirAll(logsDir, 0755)
@@ -200,7 +199,6 @@ func (b *BuildApp) executeAction(ctx context.Context, inst Instruction, hashStub
 	if inst.Type == "RUN" {
 		args = inst.Args
 	} else {
-		// Variable expansion using the frozen env for this step
 		args = os.Expand(inst.Args, func(k string) string {
 			if v, ok := inst.Env[k]; ok { return v }
 			return ""
@@ -213,8 +211,31 @@ func (b *BuildApp) executeAction(ctx context.Context, inst Instruction, hashStub
 		if !b.shouldExecute(inst.Conditions) {
 			b.Log.Info(ctx, "skipping instruction (condition mismatch)", "conditions", inst.Conditions, "emits", b.Emits)
 		} else {
-			if strings.HasPrefix(inst.Args, "sys.provision_dataset") {
-				execErr = b.execProvisionDataset(ctx, inst.Args)
+			// Universal Interception via sst.Exec
+			if strings.HasPrefix(inst.Args, "sys.") {
+				// Convert list of environments to a map for dynamic Go expansion
+				envMap := make(map[string]string)
+				for _, kv := range b.buildEnvironmentMap(inst, b.RootDir) {
+					parts := strings.SplitN(kv, "=", 2)
+					if len(parts) == 2 {
+						envMap[parts[0]] = parts[1]
+					}
+				}
+				// Expand environment variables since this skips Bash
+				expandedCmd := os.Expand(inst.Args, func(k string) string { return envMap[k] })
+				parts := strings.Fields(expandedCmd)
+				
+				req := sst.ExecRequest{
+					Cmd:   parts[0],
+					Args:  parts[1:],
+					Env:   b.buildEnvironmentMap(inst, b.RootDir),
+					Mode:  sst.ExecCaptured,
+				}
+				res, err := sst.Exec(ctx, b.Log, req)
+				if logFile != "" && res != nil {
+					_ = os.WriteFile(logFile, []byte(res.Stdout+"\n"+res.Stderr), 0644)
+				}
+				execErr = err
 			} else {
 				resolvedLoc := os.Expand(inst.Location, func(k string) string { return inst.Env[k] })
 				targetDir := b.RootDir
@@ -255,19 +276,21 @@ func (b *BuildApp) execHostRun(ctx context.Context, cmdStr string, targetDir str
 		return err
 	}
 
-	cmdToRun, argsToRun, extraEnv := wrapWithTee(logFile, "/bin/sh", "-c", cmdStr)
-	
 	env := b.buildEnvironmentMap(inst, activeRootfs)
-	env = append(env, extraEnv...)
 
 	req := sst.ExecRequest{
-		Cmd:  cmdToRun,
-		Args: argsToRun,
-		Dir:  filepath.Dir(b.Dockerfile),
-		Env:  env,
-		Mode: sst.ExecForeground,
+		Cmd:   "bash",
+		Args:  []string{"-c", cmdStr},
+		Dir:   filepath.Dir(b.Dockerfile),
+		Env:   env,
+		Mode:  sst.ExecForeground,
 	}
-	_, err := sst.Exec(ctx, b.Log, req)
+	res, err := sst.Exec(ctx, b.Log, req)
+	
+	if logFile != "" && res != nil {
+		_ = os.WriteFile(logFile, []byte(res.Stdout+"\n"+res.Stderr), 0644)
+	}
+	
 	if err != nil {
 		return fmt.Errorf("host run command failed: %w", err)
 	}
@@ -342,8 +365,6 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 		chrootCmd = fmt.Sprintf("/%s", scriptName)
 	}
 
-	cmdToRun, argsToRun, extraEnv := wrapWithTee(logFile, "chroot", targetDir, "/bin/sh", "-c", chrootCmd)
-
 	env := b.buildEnvironmentMap(inst, activeRootfs)
 	env = append(env,
 		"APK_CACHE_DIR=/var/cache/apk",
@@ -351,15 +372,20 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 		"DNF_CACHE_DIR=/var/cache/dnf",
 		"YUM_CACHE_DIR=/var/cache/dnf",
 	)
-	env = append(env, extraEnv...)
 
 	req := sst.ExecRequest{
-		Cmd:  cmdToRun,
-		Args: argsToRun,
-		Env:  env,
-		Mode: sst.ExecForeground,
+		Cmd:         "chroot",
+		Args:        []string{targetDir, "/bin/sh", "-c", chrootCmd},
+		Env:         env,
+		Mode:        sst.ExecForeground,
 	}
-	if _, err := sst.Exec(ctx, b.Log, req); err != nil {
+	res, err := sst.Exec(ctx, b.Log, req)
+	
+	if logFile != "" && res != nil {
+		_ = os.WriteFile(logFile, []byte(res.Stdout+"\n"+res.Stderr), 0644)
+	}
+	
+	if err != nil {
 		return fmt.Errorf("chroot command failed: %w", err)
 	}
 	return nil
@@ -412,10 +438,9 @@ func (b *BuildApp) FinalizeVM(ctx context.Context) error {
 	_, kernErr := os.Stat(kernelPath)
 	_, initErr := os.Stat(initrdPath)
 
-	// Inject dummy disk for MicroVMs to satisfy template branching
 	if rawErr != nil && (kernErr == nil || initErr == nil) {
 		b.Log.Info(ctx, "microvm detected without raw disk; generating dummy block device to satisfy vm constraints")
-		_ = CreateSparse(rawDiskPath, 1024*1024) // 1 MiB dummy disk
+		_ = CreateSparse(rawDiskPath, 1024*1024)
 		rawErr = nil
 	}
 

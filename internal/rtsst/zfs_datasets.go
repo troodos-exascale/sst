@@ -8,15 +8,13 @@ import (
 	"strings"
 )
 
-// DatasetManager enforces the strict ZFS topology for a single build instance.
 type DatasetManager struct {
-	Zpool           string // e.g., "zroot/runtimes"
-	BuildID         string // e.g., the hash or inode of the Dockerfile
-	BasePoint       string // Physical mountpoint, e.g., ~/.runtimes
-	RuntimeRootName string // e.g., "runtime-root-ubuntu.dockerfile"
+	Zpool           string 
+	BuildID         string 
+	BasePoint       string 
+	RuntimeRootName string 
 }
 
-// NewDatasetManager creates a new DatasetManager.
 func NewDatasetManager(runtimeDir, buildID, runtimeRootName string) *DatasetManager {
 	zpool := os.Getenv("SST_ZPOOL")
 	return &DatasetManager{
@@ -37,7 +35,6 @@ func (d *DatasetManager) datasetPath(subPath string) string {
 	return fmt.Sprintf("%s/builds/%s/%s", d.Zpool, d.BuildID, subPath)
 }
 
-// MountPath returns the physical host directory.
 func (d *DatasetManager) MountPath(subPath string) string {
 	return filepath.Join(d.BasePoint, "builds", d.BuildID, subPath)
 }
@@ -47,11 +44,7 @@ func (d *DatasetManager) create(subPath string) error {
 
 	if dsPath := d.datasetPath(subPath); dsPath != "" {
 		cmd := exec.Command("zfs", "create", "-p", dsPath)
-		if err := cmd.Run(); err != nil {
-			if !strings.Contains(err.Error(), "already exists") && cmd.ProcessState != nil && cmd.ProcessState.ExitCode() != 1 {
-				// Fallthrough
-			}
-		}
+		_ = cmd.Run()
 	}
 
 	return os.MkdirAll(physicalPath, 0755)
@@ -62,7 +55,7 @@ func (d *DatasetManager) InitBuildEnvironment() error {
 		return err
 	}
 
-	caches := []string{"cache/apt", "cache/apk", "cache/get", "cache/from"}
+	caches := []string{"cache/apt", "cache/apk", "cache/get", "cache/from", "cache/dnf"}
 	for _, cache := range caches {
 		if err := d.create(cache); err != nil {
 			return err
@@ -97,7 +90,6 @@ func (d *DatasetManager) CacheDir(cacheName string) string {
 
 func (d *DatasetManager) Destroy() error {
 	mountPath := d.MountPath("")
-
 	_ = exec.Command("umount", "-R", mountPath).Run()
 
 	if dsPath := d.datasetPath(""); dsPath != "" {
@@ -112,15 +104,10 @@ func (d *DatasetManager) ClearCache() error {
 	caches := []string{"cache/apt", "cache/apk", "cache/get", "cache/from", "cache/dnf"}
 	for _, cache := range caches {
 		if dsPath := d.datasetPath(cache); dsPath != "" {
-			cmd := exec.Command("zfs", "destroy", "-r", dsPath)
-			_ = cmd.Run()
+			_ = exec.Command("zfs", "destroy", "-r", dsPath).Run()
 		}
-
 		_ = os.RemoveAll(d.MountPath(cache))
-
-		if err := d.create(cache); err != nil {
-			return fmt.Errorf("failed to recreate cache %s: %w", cache, err)
-		}
+		_ = d.create(cache)
 	}
 	return nil
 }
@@ -171,10 +158,10 @@ func (d *DatasetManager) RollbackDataset(subPath, tag string) error {
 	return nil
 }
 
-// CheckSnapshot probes the underlying storage to ensure the requested tag actually exists.
 func (d *DatasetManager) CheckSnapshot(subPath, tag string) bool {
 	if d.Zpool == "" {
-		return true // If not using ZFS, we assume the host filesystem state matches the TG JSON state
+		// FIX: Returning false ensures engine proceeds to Action when ZFS is not active
+		return false 
 	}
 	dsPath := d.datasetPath(subPath)
 	cmd := exec.Command("zfs", "list", "-t", "snapshot", fmt.Sprintf("%s@%s", dsPath, tag))

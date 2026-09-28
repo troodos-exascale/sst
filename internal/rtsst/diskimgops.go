@@ -74,6 +74,22 @@ type ImageSB struct {
 	Log           *sst.Logx
 	YamlObject    *mkimagepb.ImageYAML
 	SstRuntimeDir string
+	DiskPath      string // Override for in-flight raw image location
+	OutDir        string // Override for in-flight artifact extraction location
+}
+
+func (sb *ImageSB) getRawImagePath() string {
+	if sb.DiskPath != "" {
+		return sb.DiskPath
+	}
+	return filepath.Join(sb.SstRuntimeDir, "images", sb.YamlObject.Provenance.Name, sb.YamlObject.Storage.RawImage)
+}
+
+func (sb *ImageSB) getOutDir() string {
+	if sb.OutDir != "" {
+		return sb.OutDir
+	}
+	return filepath.Join(sb.SstRuntimeDir, "images", sb.YamlObject.Provenance.Name)
 }
 
 // vdaName safely translates a loop device name to a Virtio block device name.
@@ -90,7 +106,7 @@ func vdaName(devName string) string {
 }
 
 func AnalyseImg(sb *ImageSB) error {
-	rawImage := filepath.Join(sb.SstRuntimeDir, "images", sb.YamlObject.Provenance.Name, sb.YamlObject.Storage.RawImage)
+	rawImage := sb.getRawImagePath()
 
 	sb.Log.Info(sb.Ctx, "Attaching image to loop device for analysis", "image", rawImage)
 
@@ -253,7 +269,7 @@ func AnalyseImg(sb *ImageSB) error {
 }
 
 func ExtractArtifacts(sb *ImageSB) error {
-	rawImage := filepath.Join(sb.SstRuntimeDir, "images", sb.YamlObject.Provenance.Name, sb.YamlObject.Storage.RawImage)
+	rawImage := sb.getRawImagePath()
 	bootfsPartUuid := sb.YamlObject.Boot.BootfsPartUuid
 
 	if bootfsPartUuid == "" {
@@ -299,7 +315,7 @@ func ExtractArtifacts(sb *ImageSB) error {
 		return fmt.Errorf("kernel/initrd not found on boot partition %s", partDev)
 	}
 
-	destDir := filepath.Join(sb.SstRuntimeDir, "images", sb.YamlObject.Provenance.Name)
+	destDir := sb.getOutDir()
 	kernelName, initrdName, err := copyArtifacts(kernelPath, initrdPath, destDir)
 	if err != nil {
 		return err

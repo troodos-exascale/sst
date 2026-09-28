@@ -34,19 +34,16 @@ var rootCmd = &cobra.Command{
 func delegateToLinuxVM() {
 	vmBuildHost := "ub"
 
-	// 1. If no arguments are provided, return to let Cobra show the main help menu.
 	if len(os.Args) == 1 {
 		return
 	}
 
-	// 2. If ANY argument is a help flag, return to let Cobra handle it.
 	for _, arg := range os.Args {
 		if arg == "help" || arg == "-h" || arg == "--help" {
 			return
 		}
 	}
 
-	// 3. Skip delegation for local management commands and completions
 	arg1 := os.Args[1]
 	if arg1 == "completion" || strings.HasPrefix(arg1, "__complete") ||
 		arg1 == "mv-image" || arg1 == "mv-instance" || arg1 == "rm-image" || arg1 == "rm-instance" || arg1 == "catalog" {
@@ -116,7 +113,8 @@ func delegateToLinuxVM() {
 		os.Exit(1)
 	}
 
-	if os.Args[1] == "build" || os.Args[1] == "instance" {
+	// FIX: Ensure all image/instance commands trigger purification
+	if arg1 == "build" || arg1 == "instance" || arg1 == "clone" || arg1 == "runtime" {
 		if err := ProcessPurificationQueue(hostContextDir); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: host purification failed: %v\n", err)
 		}
@@ -162,7 +160,7 @@ func init() {
 	rootCmd.PersistentFlags().BoolVarP(&flagVerbose, "verbose", "v", false, "Verbose logging")
 	rootCmd.PersistentFlags().BoolVar(&flagForce, "force", false, "Overwrite existing image directory")
 
-	rootCmd.AddCommand(pullvmCmd())
+	rootCmd.AddCommand(cloneCmd())
 	rootCmd.AddCommand(clearCacheCmd)
 
 	instCmd := instanceCmd()
@@ -181,39 +179,6 @@ var extractKernelCmd = &cobra.Command{
 		fmt.Printf("--> Extracting raw kernel from %s to %s\n", args[0], args[1])
 		return rtsst.ExtractRawKernel(args[0], args[1])
 	},
-}
-
-func pullvmCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "pullvm <upstream-url-or-local-path>",
-		Short: "Pull an upstream VM image or local archive and create an SST image directory",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			runtimeDir := flagRoot
-			if runtimeDir == "" {
-				runtimeDir = rtsst.RuntimeDir()
-			}
-
-			source := args[0]
-			if !strings.HasPrefix(source, "http://") && !strings.HasPrefix(source, "https://") {
-				if absSource, err := filepath.Abs(source); err == nil {
-					source = absSource
-				}
-			}
-
-			base := filepath.Base(source)
-			name := strings.TrimSuffix(base, filepath.Ext(base))
-			if strings.HasSuffix(base, ".tar.gz") {
-				name = strings.TrimSuffix(name, ".tar")
-			}
-
-			bArgs := map[string]string{
-				"URL":       source,
-				"PULL_NAME": name,
-			}
-			return RunBuildEngine(cmd.Context(), "pullpullvm.dockerfile", ".", flagBuildDir, runtimeDir, flagForce, bArgs, -1)
-		},
-	}
 }
 
 var clearCacheCmd = &cobra.Command{

@@ -75,13 +75,14 @@ func (r *Runctl) syncWorkspace() {
 	}
 }
 
-func (r *Runctl) instanceCompletion(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+func (r *Runctl) runtimeCompletion(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
 	if len(args) != 0 {
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
-	names, err := rtsst.ListCatalogNames("instances")
+	// Updated to look at runtimes, falling back to instances
+	names, err := rtsst.ListCatalogNames("runtimes")
 	if err != nil {
-		return nil, cobra.ShellCompDirectiveError
+		names, _ = rtsst.ListCatalogNames("instances")
 	}
 	var matches []string
 	for _, name := range names {
@@ -95,9 +96,9 @@ func (r *Runctl) instanceCompletion(cmd *cobra.Command, args []string, toComplet
 func (r *Runctl) startCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:               "start <name>",
-		Short:             "Start an instance",
+		Short:             "Start a runtime",
 		Args:              cobra.ExactArgs(1),
-		ValidArgsFunction: r.instanceCompletion,
+		ValidArgsFunction: r.runtimeCompletion,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			r.syncWorkspace()
 			return r.Start(args[0])
@@ -131,6 +132,11 @@ func (r *Runctl) Start(name string) error {
 		"--mem", strconv.FormatUint(memMiB, 10),
 	}
 
+	// NEW PROTOBUF NETWORKS ARRAY
+	for _, net := range inst.Networks {
+		args = append(args, "--net", fmt.Sprintf("mac=%s,tap-name=sst_tap", net.MacAddress))
+	}
+	// LEGACY NETWORK ARRAY
 	for _, netStr := range inst.Network {
 		parts := strings.Split(netStr, "@")
 		mac := parts[0]
@@ -229,7 +235,6 @@ func (r *Runctl) startContainer(inst *runctlpb.Instance, instDir string) error {
 		fmt.Sprintf("--directory=%s", rootfs),
 	}
 
-	// Dynamically detect if we are running an LXC System Container or a raw OCI App Container
 	hasSystemd := false
 	if _, err := os.Stat(filepath.Join(rootfs, "lib/systemd/systemd")); err == nil {
 		hasSystemd = true
@@ -243,7 +248,9 @@ func (r *Runctl) startContainer(inst *runctlpb.Instance, instDir string) error {
 		args = append(args, "--as-pid2", "/.sst/init", "/bin/sh")
 	}
 
-	if len(inst.Network) > 0 {
+	if len(inst.Networks) > 0 {
+		args = append(args, fmt.Sprintf("--network-mac=%s", inst.Networks[0].MacAddress))
+	} else if len(inst.Network) > 0 {
 		mac := strings.Split(inst.Network[0], "@")[0]
 		args = append(args, fmt.Sprintf("--network-mac=%s", mac))
 	}
@@ -376,7 +383,7 @@ func (r *Runctl) stopCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:               "stop <name>",
 		Args:              cobra.ExactArgs(1),
-		ValidArgsFunction: r.instanceCompletion,
+		ValidArgsFunction: r.runtimeCompletion,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			r.syncWorkspace()
 			return r.Stop(args[0])
@@ -402,7 +409,7 @@ func (r *Runctl) pauseCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:               "pause <name>",
 		Args:              cobra.ExactArgs(1),
-		ValidArgsFunction: r.instanceCompletion,
+		ValidArgsFunction: r.runtimeCompletion,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			r.syncWorkspace()
 			lp := rtsst.LockFilePath(args[0])
@@ -419,7 +426,7 @@ func (r *Runctl) resumeCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:               "resume <name>",
 		Args:              cobra.ExactArgs(1),
-		ValidArgsFunction: r.instanceCompletion,
+		ValidArgsFunction: r.runtimeCompletion,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			r.syncWorkspace()
 			lp := rtsst.LockFilePath(args[0])
@@ -436,75 +443,86 @@ func (r *Runctl) listCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:     "list",
 		Aliases: []string{"ls"},
-		Short:   "List all registered instances",
+		Short:   "List all registered runtimes",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			r.syncWorkspace()
 
 			w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 			fmt.Fprintln(w, "NAME\tSTATE\tIP\tIMAGE\tLOCATION")
 
-			baseDir := rtsst.InstanceRoot()
-			ents, err := os.ReadDir(baseDir)
-			if err != nil {
-				return nil
-			}
-
+			// Scan both instances and runtimes to support smooth migration
+			catalogs := []string{"runtimes", "instances"}
 			homeDir := rtsst.Home()
 
-			for _, e := range ents {
-				if strings.HasPrefix(e.Name(), ".") {
-					continue
-				}
-
-				linkPath := filepath.Join(baseDir, e.Name())
-				realPath := linkPath
-
-				info, err := os.Lstat(linkPath)
+			for _, catalogName := range catalogs {
+				baseDir := filepath.Join(rtsst.RuntimeDir(), catalogName)
+				ents, err := os.ReadDir(baseDir)
 				if err != nil {
 					continue
 				}
 
-				if info.Mode()&os.ModeSymlink != 0 {
-					resolved, err := filepath.EvalSymlinks(linkPath)
-					if err != nil {
-						fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", e.Name(), "dangling", "-", "-", linkPath)
+				for _, e := range ents {
+					if strings.HasPrefix(e.Name(), ".") {
 						continue
 					}
-					realPath = resolved
-				} else if !info.IsDir() {
-					continue
-				}
 
-				if _, err := os.Stat(filepath.Join(realPath, "instance.yaml")); os.IsNotExist(err) {
-					continue
-				}
+					linkPath := filepath.Join(baseDir, e.Name())
+					realPath := linkPath
 
-				lp := filepath.Join(realPath, "lockfile")
-				state := "stopped"
-				ip := "-"
-				imageName := "-"
+					info, err := os.Lstat(linkPath)
+					if err != nil {
+						continue
+					}
 
-				inst, loadErr := r.loadInstanceFromDir(realPath)
-				if loadErr == nil && inst.BaseImage != "" {
-					imageName = inst.BaseImage
-				}
+					if info.Mode()&os.ModeSymlink != 0 {
+						resolved, err := filepath.EvalSymlinks(linkPath)
+						if err != nil {
+							fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", e.Name(), "dangling", "-", "-", linkPath)
+							continue
+						}
+						realPath = resolved
+					} else if !info.IsDir() {
+						continue
+					}
 
-				if linfo, err := rtsst.ReadLock(lp); err == nil && rtsst.IsPidAlive(linfo.Pid) {
-					state = "running"
-					if loadErr == nil && len(inst.Network) > 0 {
-						mac := strings.Split(inst.Network[0], "@")[0]
-						if resolvedIP, err := r.resolveIP(mac); err == nil {
-							ip = resolvedIP
+					lp := filepath.Join(realPath, "lockfile")
+					state := "stopped"
+					ip := "-"
+					imageName := "-"
+
+					inst, loadErr := r.loadInstanceFromDir(realPath)
+					if loadErr != nil {
+						continue // If neither runtime.yaml nor instance.yaml exists, skip
+					}
+
+					if inst.BaseImage != "" {
+						imageName = inst.BaseImage
+					}
+
+					if linfo, err := rtsst.ReadLock(lp); err == nil && rtsst.IsPidAlive(linfo.Pid) {
+						state = "running"
+						if loadErr == nil {
+							var mac string
+							if len(inst.Networks) > 0 {
+								mac = inst.Networks[0].MacAddress
+							} else if len(inst.Network) > 0 {
+								mac = strings.Split(inst.Network[0], "@")[0]
+							}
+							if mac != "" {
+								if resolvedIP, err := r.resolveIP(mac); err == nil {
+									ip = resolvedIP
+								}
+							}
 						}
 					}
-				}
 
-				displayLoc := realPath
-				if strings.HasPrefix(realPath, homeDir) {
-					displayLoc = "~" + strings.TrimPrefix(realPath, homeDir)
-				}
+					displayLoc := realPath
+					if strings.HasPrefix(realPath, homeDir) {
+						displayLoc = "~" + strings.TrimPrefix(realPath, homeDir)
+					}
 
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", e.Name(), state, ip, imageName, displayLoc)
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", e.Name(), state, ip, imageName, displayLoc)
+				}
 			}
 
 			w.Flush()
@@ -516,9 +534,9 @@ func (r *Runctl) listCmd() *cobra.Command {
 func (r *Runctl) sshCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:               "ssh <[user@]name>",
-		Short:             "SSH into a running instance",
+		Short:             "SSH into a running runtime",
 		Args:              cobra.MinimumNArgs(1),
-		ValidArgsFunction: r.instanceCompletion,
+		ValidArgsFunction: r.runtimeCompletion,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			r.syncWorkspace()
 
@@ -526,7 +544,6 @@ func (r *Runctl) sshCmd() *cobra.Command {
 			instName := target
 			sshUser := ""
 
-			// Support user@instance syntax
 			if strings.Contains(target, "@") {
 				parts := strings.SplitN(target, "@", 2)
 				sshUser = parts[0]
@@ -535,7 +552,7 @@ func (r *Runctl) sshCmd() *cobra.Command {
 
 			inst, err := r.loadInstance(instName)
 			if err != nil {
-				return fmt.Errorf("failed to load instance: %w", err)
+				return fmt.Errorf("failed to load runtime: %w", err)
 			}
 
 			u, err := user.Current()
@@ -560,32 +577,29 @@ func (r *Runctl) sshCmd() *cobra.Command {
 				"-o", "LogLevel=ERROR",
 			}
 
-			sockPath := filepath.Join(r.instanceDir(instName), "var", "ssh.sock")
-			if _, err := os.Stat(sockPath); err == nil {
-				// VSOCK routing: bypass macOS networking entirely
-				fmt.Printf("Connecting to %s via VSOCK tunnel...\n", sshUser)
-				sshArgs = append(sshArgs, "-o", fmt.Sprintf("ProxyCommand=nc -U %s", sockPath))
-				if term.IsTerminal(int(os.Stdin.Fd())) {
-					sshArgs = append(sshArgs, "-t")
-				}
-				// socat forwards to localhost inside the guest
-				sshArgs = append(sshArgs, fmt.Sprintf("%s@127.0.0.1", sshUser))
-			} else {
-				// Legacy IP Resolution fallback
-				if len(inst.Network) == 0 {
-					return fmt.Errorf("instance has no network configured and no vsock found")
-				}
-				mac := strings.Split(inst.Network[0], "@")[0]
-				ip, err := r.resolveIP(mac)
-				if err != nil {
-					return fmt.Errorf("could not resolve IP for instance %s (MAC: %s): %w\nWait a few seconds after boot or ensure it acquired a DHCP lease", instName, mac, err)
-				}
-				fmt.Printf("Connecting to %s@%s...\n", sshUser, ip)
-				if term.IsTerminal(int(os.Stdin.Fd())) {
-					sshArgs = append(sshArgs, "-t")
-				}
-				sshArgs = append(sshArgs, fmt.Sprintf("%s@%s", sshUser, ip))
+			// Strictly rely on IP Resolution
+			var mac string
+			if len(inst.Networks) > 0 {
+				mac = inst.Networks[0].MacAddress
+			} else if len(inst.Network) > 0 {
+				mac = strings.Split(inst.Network[0], "@")[0]
 			}
+
+			if mac == "" {
+				return fmt.Errorf("instance has no network configured")
+			}
+
+			ip, err := r.resolveIP(mac)
+			if err != nil {
+				return fmt.Errorf("could not resolve IP for instance %s (MAC: %s): %w\nWait a few seconds after boot or ensure it acquired a DHCP lease", instName, mac, err)
+			}
+
+			fmt.Printf("Connecting to %s@%s...\n", sshUser, ip)
+
+			if term.IsTerminal(int(os.Stdin.Fd())) {
+				sshArgs = append(sshArgs, "-t")
+			}
+			sshArgs = append(sshArgs, fmt.Sprintf("%s@%s", sshUser, ip))
 
 			if len(args) > 1 {
 				sshArgs = append(sshArgs, args[1:]...)
@@ -655,7 +669,7 @@ func (r *Runctl) resolveIP(mac string) (string, error) {
 		}
 	}
 
-	if out, err := exec.Command("arp", "-a").Output(); err == nil {
+	if out, err := exec.Command("sudo", "arp", "-a").Output(); err == nil {
 		for _, line := range strings.Split(string(out), "\n") {
 			lowerLine := strings.ToLower(line)
 			if strings.Contains(lowerLine, mac) || strings.Contains(lowerLine, macOSMac) {
@@ -671,14 +685,35 @@ func (r *Runctl) resolveIP(mac string) (string, error) {
 	return "", fmt.Errorf("MAC %s not found in DHCP leases or ARP cache", mac)
 }
 
-func (r *Runctl) instanceDir(name string) string { return rtsst.InstanceDir(name) }
+func (r *Runctl) instanceDir(name string) string {
+	// Try the new runtimes catalog first
+	globalPath := filepath.Join(rtsst.Home(), ".runtimes", "runtimes", name)
+	if realPath, err := filepath.EvalSymlinks(globalPath); err == nil {
+		return realPath
+	}
+	if _, err := os.Stat(globalPath); err == nil {
+		return globalPath
+	}
+
+	// Fallback to legacy instances catalog
+	legacyPath := filepath.Join(rtsst.Home(), ".runtimes", "instances", name)
+	if realPath, err := filepath.EvalSymlinks(legacyPath); err == nil {
+		return realPath
+	}
+	return legacyPath
+}
 
 func (r *Runctl) loadInstanceFromDir(dir string) (*runctlpb.Instance, error) {
 	inst := &runctlpb.Instance{}
+
+	yamlPath := filepath.Join(dir, "runtime.yaml")
+	if _, err := os.Stat(yamlPath); os.IsNotExist(err) {
+		yamlPath = filepath.Join(dir, "instance.yaml")
+	}
+
 	yo := &sst.YamlObject{
-		Path:   filepath.Join(dir, "instance.yaml"),
+		Path:   yamlPath,
 		Schema: "sst.yaml.runctl.v1.Instance",
-		Kind:   "Instance",
 		Msg:    inst,
 	}
 	if diags := yo.Load(r.Ctx, r.Log); diags != nil {

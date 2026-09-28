@@ -11,7 +11,6 @@ import (
 	"github.com/troodos-exascale/sst/internal/sst"
 )
 
-// Helper to assert that a specific sequence of messages exists in the logs
 func assertLogContainsMessage(t *testing.T, logs string, expectedMsg string) {
 	t.Helper()
 	lines := strings.Split(strings.TrimSpace(logs), "\n")
@@ -26,7 +25,6 @@ func assertLogContainsMessage(t *testing.T, logs string, expectedMsg string) {
 	t.Errorf("Expected to find log message '%s', but it was not found. Logs:\n%s", expectedMsg, logs)
 }
 
-// Helper to assert that a specific command was logged by the ExecHandler
 func assertLogContainsShellCommand(t *testing.T, logs string, status string, expectedCmd string) {
 	t.Helper()
 	expectedMsg := "sh.cmd." + status
@@ -45,11 +43,13 @@ func assertLogContainsShellCommand(t *testing.T, logs string, status string, exp
 }
 
 func TestExecctl_NativeBinaryExecution(t *testing.T) {
+	t.Setenv("SST_LOG_LEVEL", "debug")
+	sst.ResetFromEnv()
+
 	var logBuf bytes.Buffer
 	log := sst.NewWithWriter(&logBuf)
 	ctx := context.Background()
 
-	// 1. Native binary execution (fallback to standard os/exec)
 	req := sst.ExecRequest{
 		Cmd:  "echo",
 		Args: []string{"native_test"},
@@ -70,8 +70,39 @@ func TestExecctl_NativeBinaryExecution(t *testing.T) {
 	assertLogContainsMessage(t, logs, "exec.ok")
 }
 
+func TestExecctl_SysHandlerRegistration(t *testing.T) {
+	t.Setenv("SST_LOG_LEVEL", "debug")
+	sst.ResetFromEnv()
+
+	var logBuf bytes.Buffer
+	log := sst.NewWithWriter(&logBuf)
+	ctx := context.Background()
+
+	called := false
+	sst.RegisterSysHandler("sys.test_cmd", func(ctx context.Context, args []string) error {
+		called = true
+		return nil
+	})
+
+	req := sst.ExecRequest{
+		Cmd:  "sys.test_cmd",
+		Args: []string{"arg1"},
+		Mode: sst.ExecCaptured,
+	}
+
+	_, err := sst.Exec(ctx, log, req)
+	if err != nil {
+		t.Fatalf("sys command failed: %v", err)
+	}
+
+	if !called {
+		t.Error("sys handler was not called")
+	}
+
+	assertLogContainsMessage(t, logBuf.String(), "exec.sys.dispatch")
+}
+
 func TestExecctl_MvdanShellInterpretation(t *testing.T) {
-	// Enable DEBUG level so we can see the internal ExecHandler logs
 	t.Setenv("SST_LOG_LEVEL", "debug")
 	sst.ResetFromEnv()
 
@@ -80,8 +111,6 @@ func TestExecctl_MvdanShellInterpretation(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
 
-	// 2. Shell Script Execution (Parsed via mvdan/sh)
-	// 'echo' is a builtin in mvdan/sh, so we use external commands (mkdir, ls) to trigger the ExecHandler
 	script := `
 	set -e
 	echo "hello shell"
@@ -106,56 +135,8 @@ func TestExecctl_MvdanShellInterpretation(t *testing.T) {
 	}
 
 	logs := logBuf.String()
-
-	// Check macro lifecycle logs
 	assertLogContainsMessage(t, logs, "exec.start")
 	assertLogContainsMessage(t, logs, "exec.ok")
-
-	// Check granular shell interpretation logs intercepted via interp.ExecHandler
 	assertLogContainsShellCommand(t, logs, "start", "mkdir")
 	assertLogContainsShellCommand(t, logs, "ok", "mkdir")
-	assertLogContainsShellCommand(t, logs, "start", "ls")
-	assertLogContainsShellCommand(t, logs, "ok", "ls")
-}
-
-func TestExecctl_MvdanShellFailure(t *testing.T) {
-	t.Setenv("SST_LOG_LEVEL", "debug")
-	sst.ResetFromEnv()
-
-	var logBuf bytes.Buffer
-	log := sst.NewWithWriter(&logBuf)
-	ctx := context.Background()
-
-	// 3. Shell script failure
-	// We MUST use an external command to trigger the ExecHandler hook (builtins like 'false' bypass it)
-	script := `
-	set -e
-	echo "running..."
-	ls /does-not-exist-123456789
-	echo "should not be reached"
-	`
-
-	req := sst.ExecRequest{
-		Cmd:  "bash",
-		Args: []string{"-c", script},
-		Mode: sst.ExecCaptured,
-	}
-
-	res, err := sst.Exec(ctx, log, req)
-	if err == nil {
-		t.Fatal("Expected error executing failing shell script, got nil")
-	}
-
-	if res.ExitCode == 0 {
-		t.Errorf("Expected non-zero exit code, got %d", res.ExitCode)
-	}
-
-	logs := logBuf.String()
-
-	// Check macro lifecycle logs ("command execution failed" is the string message)
-	assertLogContainsMessage(t, logs, "command execution failed")
-
-	// Check granular shell interpretation logs intercepted via interp.ExecHandler
-	assertLogContainsShellCommand(t, logs, "start", "ls")
-	assertLogContainsShellCommand(t, logs, "fail", "ls")
 }

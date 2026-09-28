@@ -4,13 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"golang.org/x/term"
 	"io"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/term"
 )
 
 type Level string
@@ -27,7 +29,13 @@ const (
 	colorRed    = "\033[31m"
 	colorYellow = "\033[33m"
 	colorBlue   = "\033[36m"
-	colorGray   = "\033[37m" // Light grey for Monokai Pro
+	colorGray   = "\033[37m"
+)
+
+type contextKey string
+
+const (
+	spanDepthKey contextKey = "sst.span_depth"
 )
 
 type Logx struct {
@@ -106,38 +114,54 @@ func (l *Logx) WithError(err error) *Logx {
 	return l
 }
 
-func (l *Logx) Debug(ctx interface{}, msg string, kv ...interface{}) {
-	l.emit(LevelDebug, msg, kv...)
+func (l *Logx) Debug(ctx context.Context, msg string, kv ...interface{}) {
+	l.emit(ctx, LevelDebug, msg, kv...)
 }
 
-func (l *Logx) Info(ctx interface{}, msg string, kv ...interface{}) {
-	l.emit(LevelInfo, msg, kv...)
+func (l *Logx) Info(ctx context.Context, msg string, kv ...interface{}) {
+	l.emit(ctx, LevelInfo, msg, kv...)
 }
 
-func (l *Logx) Warn(ctx interface{}, msg string, kv ...interface{}) {
-	l.emit(LevelWarn, msg, kv...)
+func (l *Logx) Warn(ctx context.Context, msg string, kv ...interface{}) {
+	l.emit(ctx, LevelWarn, msg, kv...)
 }
 
-func (l *Logx) Error(ctx interface{}, msg string, kv ...interface{}) {
-	l.emit(LevelError, msg, kv...)
+func (l *Logx) Error(ctx context.Context, msg string, kv ...interface{}) {
+	l.emit(ctx, LevelError, msg, kv...)
 }
 
-func (l *Logx) Diagnose(ctx interface{}, code string, msg string, kv ...interface{}) {
+func (l *Logx) Diagnose(ctx context.Context, code string, msg string, kv ...interface{}) {
 	kv = append(kv, "diagnostic", true, "retain", true, "code", code)
-	l.emit(LevelError, msg, kv...)
+	l.emit(ctx, LevelError, msg, kv...)
 }
 
 func SafeExit(ctx context.Context, log *Logx, code int) {
 	os.Exit(code)
 }
 
-func (l *Logx) emit(level Level, msg string, kv ...interface{}) {
+func (l *Logx) emit(ctx context.Context, level Level, msg string, kv ...interface{}) {
 	envLevel := os.Getenv("SST_LOG_LEVEL")
 	if envLevel == "" {
 		envLevel = "info"
 	}
 	if !isLevelEnabled(Level(envLevel), level) {
 		return
+	}
+
+	// Depth Filtering
+	currentDepth := 0
+	if ctx != nil {
+		if d, ok := ctx.Value(spanDepthKey).(int); ok {
+			currentDepth = d
+		}
+	}
+	
+	if depthLimitStr := os.Getenv("SST_LOG_DEPTH"); depthLimitStr != "" {
+		if limit, err := strconv.Atoi(depthLimitStr); err == nil && limit > 0 {
+			if currentDepth > limit {
+				return
+			}
+		}
 	}
 
 	now := time.Now()
@@ -152,6 +176,10 @@ func (l *Logx) emit(level Level, msg string, kv ...interface{}) {
 		if k, ok := kv[i].(string); ok {
 			finalFields[k] = kv[i+1]
 		}
+	}
+
+	if currentDepth > 0 {
+		finalFields["span_depth"] = currentDepth
 	}
 
 	ev := map[string]interface{}{
@@ -180,7 +208,7 @@ func (l *Logx) emit(level Level, msg string, kv ...interface{}) {
 		l.emitPretty(level, msg, finalFields)
 	} else if l.outJSON != nil {
 		b, _ := json.Marshal(ev)
-		fmt.Fprintf(l.outJSON, "%s\r\n", string(b))
+		fmt.Fprintf(l.outJSON, "%s\n", string(b))
 	}
 }
 
@@ -206,19 +234,16 @@ func (l *Logx) emitPretty(level Level, msg string, fields map[string]interface{}
 		out = l.outJSON
 	}
 	if out != nil {
-		fmt.Fprintf(out, "%s\r\n", line)
+		fmt.Fprintf(out, "%s\n", line)
 	}
 }
 
 func formatPretty(sub string, level Level, msg string, f map[string]interface{}) string {
 	var sb strings.Builder
-
-	// 1. Time (Dim)
 	sb.WriteString(colorGray)
 	sb.WriteString(time.Now().Format("15:04:05.000 "))
 	sb.WriteString(colorReset)
 
-	// 2. Level (Omit if INFO for cleaner output)
 	if level != LevelInfo {
 		lvlStr := fmt.Sprintf("%-5s", strings.ToUpper(string(level)))
 		switch level {
@@ -232,7 +257,6 @@ func formatPretty(sub string, level Level, msg string, f map[string]interface{})
 		sb.WriteString(" ")
 	}
 
-	// 3. Subsystem
 	if sub != "" {
 		sb.WriteString(colorGray + "[" + sub + "] " + colorReset)
 	}
@@ -243,12 +267,7 @@ func formatPretty(sub string, level Level, msg string, f map[string]interface{})
 		delete(f, "stderr")
 	}
 
-	// 4. Message
 	switch msg {
-	case "image.convert":
-		sb.WriteString(fmt.Sprintf("converting image → raw\r\n  %v → %v", f["from"], f["to"]))
-		delete(f, "from")
-		delete(f, "to")
 	case "exec.start":
 		cmdline := fmt.Sprintf("%v", f["cmdline"])
 		if strings.HasPrefix(cmdline, "bash -c ") {
@@ -278,23 +297,24 @@ func formatPretty(sub string, level Level, msg string, f map[string]interface{})
 		}
 	}
 
-	// 5. Append context
 	if len(f) > 0 {
 		var keys []string
 		for k := range f {
+			if k == "span_depth" { continue }
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
-		sb.WriteString(colorGray + " |")
-		for _, k := range keys {
-			sb.WriteString(fmt.Sprintf(" %s=%v", k, f[k]))
+		if len(keys) > 0 {
+			sb.WriteString(colorGray + " |")
+			for _, k := range keys {
+				sb.WriteString(fmt.Sprintf(" %s=%v", k, f[k]))
+			}
+			sb.WriteString(colorReset)
 		}
-		sb.WriteString(colorReset)
 	}
 
-	// 6. Append stderr
 	if stderrStr != "" {
-		sb.WriteString("\r\n" + colorRed + indent(stderrStr) + colorReset)
+		sb.WriteString("\n" + colorRed + indent(stderrStr) + colorReset)
 	}
 
 	return sb.String()
@@ -305,11 +325,20 @@ func indent(s string) string {
 	for i := range lines {
 		lines[i] = "  " + strings.TrimRight(lines[i], "\r")
 	}
-	return strings.Join(lines, "\r\n")
+	return strings.Join(lines, "\n")
 }
 
-func ResetFromEnv() {}
+func ResetFromEnv() {
+	// In this implementation, emit() reads env directly for dynamic testing.
+}
 
 func StartSpan(ctx context.Context, name string) (context.Context, func(error)) {
-	return ctx, func(error) {}
+	depth := 0
+	if ctx != nil {
+		if d, ok := ctx.Value(spanDepthKey).(int); ok {
+			depth = d
+		}
+	}
+	newCtx := context.WithValue(ctx, spanDepthKey, depth+1)
+	return newCtx, func(err error) {}
 }

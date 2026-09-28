@@ -1,30 +1,53 @@
 syntax = "proto3";
-
 package sst.yaml.runctl.v1;
-
 option go_package = "github.com/troodos-exascale/sst/proto/yaml/runctl/v1;runctlpb";
 
 message Instance {
-  string api_version = 1; // "sst.io/v1"
-  string kind        = 2; // "Instance"
+  string api_version = 1;
+  string kind = 2;
   string name = 3;
-  bool gui =4;
-  string cpu_count = 5;
-  string memory_size =  6;
-  string memory_size_suffix = 7;
-  repeated string disk = 8;
-  repeated string rwdisk = 9;
-  repeated string cdrom = 10;
-  repeated string shared_dir = 11;
-  string hostname = 12;
-  repeated string network = 13;
-  bool balloon = 14; 
+  string hostname = 4;
+  string domain_name = 5;
+  string base_image = 6;
+
+  string cpu_count = 7;
+  string memory_size = 8;
+  string memory_size_suffix = 9;
+
+  repeated User users = 10;
+  repeated EthInterface networks = 11;
+
+  repeated string disk = 12;
+  repeated string rwdisk = 13;
+  repeated string shared_dir = 14;
+
   string bootloader = 15;
-  string efi_vars = 16;
-  string kernel = 18;
-  string initrd = 19;
-  repeated string params = 20;
-  string escape_sequence = 21;
-  string shutdown_timeout = 22;
-  string base_image = 23;
+  string kernel = 16;
+  string initrd = 17;
+  string efi_vars = 18;
+  repeated string params = 19;
+  
+  // Legacy network array preserved for backwards compatibility
+  repeated string network = 20; 
+
+  // Hardware/Virtualization flags restored for backwards compatibility
+  bool balloon = 21;
+  bool nested_virt = 22;
+  bool gui = 23;
+  repeated string cdrom = 24;
+}
+
+message User {
+  string username = 1;
+  repeated string ssh_authorized_keys = 2;
+  repeated string groups = 3;
+}
+
+message EthInterface {
+  string name = 1;
+  string mac_address = 2;
+  string duid = 3;
+  string ipv4_cidr = 4;
+  string ipv4_gateway = 5;
+  string fabric = 6;
 }

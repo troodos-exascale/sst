@@ -121,7 +121,6 @@ func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runti
 
 				tag := fmt.Sprintf("step_%02d_hash_%s", inst.Index, nextHashStub)
 				
-				// Ensure the filesystem matches the mathematical ledger
 				if !builder.DatasetMgr.CheckSnapshot(builder.DatasetMgr.RuntimeRootName, tag) {
 					log.Warn(ctx, "zfs out of sync with state.json; pruning future", "step", inst.Index, "missing_tag", tag)
 					delete(runner.Completed, inst.Hash)
@@ -193,16 +192,7 @@ func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runti
 		parentHash = inst.Hash
 	}
 
-	// Terminate the graph with the Finalization step
-	if prev != nil {
-		prev.Interpret = func(res *sst.Result) ([]*sst.Context, error) {
-			if strings.HasSuffix(builder.Dockerfile, "instance.dockerfile") {
-				return nil, builder.FinalizeInstance(ctx)
-			}
-			return nil, builder.FinalizeVM(ctx)
-		}
-	}
-
+	// No monolithic finalization router! The graph runs to EOF naturally.
 	return runner.Run(ctx, root)
 }
 
@@ -223,7 +213,6 @@ var buildCmd = &cobra.Command{
 
 		bArgs := make(map[string]string)
 		for _, arg := range buildArgs {
-			// FIXED: Added the missing "=" separator
 			parts := strings.SplitN(arg, "=", 2)
 			if len(parts) == 2 {
 				bArgs[parts[0]] = parts[1]
@@ -235,6 +224,7 @@ var buildCmd = &cobra.Command{
 		return RunBuildEngine(cmd.Context(), flagFile, contextDir, flagBuildDir, runtimeDir, flagForce, bArgs, flagRestart)
 	},
 }
+
 func init() {
 	buildCmd.Flags().StringSliceVar(&buildArgs, "build-arg", nil, "Set build-time variables (e.g., DEBARCH=amd64)")
 	buildCmd.Flags().StringVarP(&flagFile, "file", "f", "./Dockerfile", "path to the Dockerfile")

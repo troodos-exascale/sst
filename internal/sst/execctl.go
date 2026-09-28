@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -15,6 +16,19 @@ import (
 	"mvdan.cc/sh/v3/interp"
 	"mvdan.cc/sh/v3/syntax"
 )
+
+// Registry for Go-native "sys." commands
+var (
+	sysMu       sync.RWMutex
+	sysHandlers = make(map[string]func(context.Context, []string) error)
+)
+
+// RegisterSysHandler allows external packages (like rtsst) to hook Go logic into the Exec engine.
+func RegisterSysHandler(name string, fn func(context.Context, []string) error) {
+	sysMu.Lock()
+	defer sysMu.Unlock()
+	sysHandlers[name] = fn
+}
 
 type ExecMode int
 
@@ -50,14 +64,6 @@ func (e *ExecError) Error() string {
 	if len(e.Args) > 0 {
 		cmdline += " " + strings.Join(e.Args, " ")
 	}
-	if e.Stderr != "" {
-		return fmt.Sprintf(
-			"command failed (%d): %s\n%s",
-			e.ExitCode,
-			cmdline,
-			strings.TrimSpace(e.Stderr),
-		)
-	}
 	return fmt.Sprintf("command failed (%d): %s", e.ExitCode, cmdline)
 }
 
@@ -71,21 +77,29 @@ func ExecShell(ctx context.Context, log *Logx, cmd string, args ...string) (*Exe
 
 func Exec(ctx context.Context, log *Logx, req ExecRequest) (*ExecResult, error) {
 	start := time.Now()
+	log.Debug(ctx, "exec.start", "cmd", req.Cmd)
 
-	cmdline := req.Cmd
-	if len(req.Args) > 0 {
-		cmdline += " " + strings.Join(req.Args, " ")
+	// 1. Check Global Sys Registry
+	sysMu.RLock()
+	handler, isSys := sysHandlers[req.Cmd]
+	sysMu.RUnlock()
+
+	if isSys {
+		log.Debug(ctx, "exec.sys.dispatch", "cmd", req.Cmd)
+		err := handler(ctx, req.Args)
+		dur := time.Since(start)
+		res := &ExecResult{ExitCode: 0, Duration: dur}
+		if err != nil {
+			res.ExitCode = 1
+			res.Stderr = err.Error()
+			return res, &ExecError{Cmd: req.Cmd, Args: req.Args, ExitCode: 1, Stderr: err.Error()}
+		}
+		log.Info(ctx, "exec.ok", "cmd", req.Cmd, "duration_us", dur.Microseconds())
+		return res, nil
 	}
 
-	log.Info(ctx, "exec.start",
-		"cmd", req.Cmd,
-		"args", req.Args,
-		"cmdline", cmdline,
-		"mode", req.Mode,
-	)
-
+	// 2. Prepare Standard Execution
 	var stdoutBuf, stderrBuf bytes.Buffer
-
 	var stdout io.Writer = &stdoutBuf
 	var stderr io.Writer = &stderrBuf
 	var stdin io.Reader = nil
@@ -98,28 +112,13 @@ func Exec(ctx context.Context, log *Logx, req ExecRequest) (*ExecResult, error) 
 
 	var exitCode int
 	var waitErr error
-
 	isShell := false
-	var script string
-	var scriptName string
-	var scriptArgs []string
-
 	if (req.Cmd == "bash" || req.Cmd == "sh") && len(req.Args) >= 2 && req.Args[0] == "-c" {
 		isShell = true
-		script = req.Args[1]
-
-		if len(req.Args) > 2 {
-			scriptName = req.Args[2]
-		} else {
-			scriptName = req.Cmd
-		}
-		if len(req.Args) > 3 {
-			scriptArgs = req.Args[3:]
-		}
 	}
 
 	if isShell {
-		waitErr = executeShell(ctx, log, script, scriptName, scriptArgs, req, stdin, stdout, stderr)
+		waitErr = executeShell(ctx, log, req.Args[1], req.Cmd, req.Args[2:], req, stdin, stdout, stderr)
 		if waitErr != nil {
 			if stat, ok := interp.IsExitStatus(waitErr); ok {
 				exitCode = int(stat)
@@ -132,8 +131,6 @@ func Exec(ctx context.Context, log *Logx, req ExecRequest) (*ExecResult, error) 
 	}
 
 	dur := time.Since(start)
-	durUS := dur.Microseconds()
-
 	res := &ExecResult{
 		ExitCode: exitCode,
 		Stdout:   stdoutBuf.String(),
@@ -142,35 +139,12 @@ func Exec(ctx context.Context, log *Logx, req ExecRequest) (*ExecResult, error) 
 	}
 
 	if exitCode != 0 || waitErr != nil {
-		stderrStr := strings.TrimSpace(res.Stderr)
-		stdoutStr := strings.TrimSpace(res.Stdout)
-
-		errMsg := stderrStr
-		if errMsg == "" && stdoutStr != "" {
-			errMsg = stdoutStr
-		}
-		if errMsg == "" && waitErr != nil {
-			errMsg = waitErr.Error()
-		}
-
-		log.Diagnose(ctx, "EXEC_FAILED", "command execution failed",
-			"cmd", req.Cmd, "args", req.Args, "cmdline", cmdline,
-			"exit_code", exitCode, "stderr", errMsg, "duration_us", durUS,
-		)
-
-		if errMsg != "" && req.Mode != ExecForeground {
-			fmt.Fprintln(os.Stderr, errMsg)
-		}
-
-		return res, &ExecError{
-			Cmd:      req.Cmd,
-			Args:     req.Args,
-			ExitCode: exitCode,
-			Stderr:   errMsg,
-		}
+		errMsg := strings.TrimSpace(res.Stderr)
+		log.Diagnose(ctx, "EXEC_FAILED", "command failed", "cmd", req.Cmd, "exit_code", exitCode, "duration_us", dur.Microseconds())
+		return res, &ExecError{Cmd: req.Cmd, Args: req.Args, ExitCode: exitCode, Stderr: errMsg}
 	}
 
-	log.Info(ctx, "exec.ok", "cmd", req.Cmd, "cmdline", cmdline, "duration_us", durUS)
+	log.Info(ctx, "exec.ok", "cmd", req.Cmd, "duration_us", dur.Microseconds())
 	return res, nil
 }
 
@@ -179,43 +153,41 @@ func executeShell(ctx context.Context, log *Logx, script, scriptName string, scr
 	if req.Cmd == "bash" {
 		lang = syntax.LangBash
 	}
-	
 	parser := syntax.NewParser(syntax.Variant(lang))
 	prog, err := parser.Parse(strings.NewReader(script), scriptName)
 	if err != nil {
-		return fmt.Errorf("failed to parse shell script: %w", err)
+		return err
 	}
 
-	envMap := make(map[string]string)
-	for _, e := range os.Environ() {
-		parts := strings.SplitN(e, "=", 2)
-		if len(parts) == 2 {
-			envMap[parts[0]] = parts[1]
-		}
-	}
-	for _, e := range req.Env {
-		parts := strings.SplitN(e, "=", 2)
-		if len(parts) == 2 {
-			envMap[parts[0]] = parts[1]
-		}
-	}
-	var envList []string
-	for k, v := range envMap {
-		envList = append(envList, k+"="+v)
-	}
+	envList := append(os.Environ(), req.Env...)
 
 	execHandler := func(ictx context.Context, args []string) error {
 		start := time.Now()
 		if len(args) > 0 {
-			log.Debug(ctx, "sh.cmd.start", "cmd", args[0], "args", args[1:])
+			sysMu.RLock()
+			handler, ok := sysHandlers[args[0]]
+			sysMu.RUnlock()
+			if ok {
+				err := handler(ictx, args[1:])
+				dur := time.Since(start)
+				if err != nil {
+					log.Error(ctx, "sh.sys.fail", "cmd", args[0], "error", err.Error())
+				} else {
+					log.Debug(ctx, "sh.sys.ok", "cmd", args[0], "duration_us", dur.Microseconds())
+				}
+				return err
+			}
 		}
 
+		if len(args) > 0 {
+			log.Debug(ctx, "sh.cmd.start", "cmd", args[0])
+		}
 		err := interp.DefaultExecHandler(0)(ictx, args)
-
 		dur := time.Since(start)
 		if len(args) > 0 {
 			if err != nil {
-				log.Error(ctx, "sh.cmd.fail", "cmd", args[0], "error", err.Error(), "duration_us", dur.Microseconds())
+				// Downgraded to Debug to prevent handled sub-command exits (like if grep -q ...) from polluting the trace
+				log.Debug(ctx, "sh.cmd.fail", "cmd", args[0], "error", err.Error())
 			} else {
 				log.Debug(ctx, "sh.cmd.ok", "cmd", args[0], "duration_us", dur.Microseconds())
 			}
@@ -223,17 +195,13 @@ func executeShell(ctx context.Context, log *Logx, script, scriptName string, scr
 		return err
 	}
 
-	runner, err := interp.New(
+	runner, _ := interp.New(
 		interp.Env(expand.ListEnviron(envList...)),
 		interp.Dir(req.Dir),
 		interp.Params(scriptArgs...),
 		interp.StdIO(stdin, stdout, stderr),
 		interp.ExecHandler(execHandler),
 	)
-	if err != nil {
-		return fmt.Errorf("failed to initialize shell interpreter: %w", err)
-	}
-
 	return runner.Run(ctx, prog)
 }
 
@@ -241,14 +209,10 @@ func executeBinary(ctx context.Context, log *Logx, req ExecRequest, stdin io.Rea
 	cmd := exec.Command(req.Cmd, req.Args...)
 	cmd.Dir = req.Dir
 	cmd.Env = append(os.Environ(), req.Env...)
-	cmd.Stdin = stdin
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, stderr
 	if err := cmd.Start(); err != nil {
 		return err, 1
 	}
-
 	waitErr := cmd.Wait()
 	exitCode := 0
 	if waitErr != nil {

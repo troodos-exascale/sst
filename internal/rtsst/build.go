@@ -32,14 +32,14 @@ type Instruction struct {
 }
 
 type BuildApp struct {
-	Log          *sst.Logx
-	Files        sst.Files
-	ContextDir   string
-	Dockerfile   string
-	BaseImage    string
-	Name         string
-	Emits        []string
-	Instructions []Instruction
+	Log           *sst.Logx
+	Files         sst.Files
+	ContextDir    string
+	Dockerfile    string
+	BaseImage     string
+	Name          string
+	Emits         []string
+	Instructions  []Instruction
 	IncludedFiles map[string]string
 
 	BuildArgs map[string]string
@@ -59,9 +59,9 @@ type BuildApp struct {
 	RootDir     string
 	ImageOutput string
 
-	DatasetMgr  *DatasetManager
-	BuildID     string
-	Force       bool
+	DatasetMgr *DatasetManager
+	BuildID    string
+	Force      bool
 }
 
 func NewBuilder(log *sst.Logx, files sst.Files, dockerfile, contextDir, buildDir, runtimeDir string) *BuildApp {
@@ -152,14 +152,15 @@ func desugarCopy(args string, loc string, conds []string) Instruction {
 	var modifiedSrcs []string
 	for _, s := range srcs {
 		if from != "" {
-			modifiedSrcs = append(modifiedSrcs, fmt.Sprintf("\"${BASEDIR}/as-roots/%s/%s\"", from, strings.TrimPrefix(s, "/")))
+			modifiedSrcs = append(modifiedSrcs, fmt.Sprintf(`"${BASEDIR}/as-roots/%s/%s"`, from, strings.TrimPrefix(s, "/")))
 		} else {
-			modifiedSrcs = append(modifiedSrcs, fmt.Sprintf("\"%s\"", s))
+			modifiedSrcs = append(modifiedSrcs, fmt.Sprintf(`"%s"`, s))
 		}
 	}
 
-	script := fmt.Sprintf("DST=\"${ROOTFS}/%s\"\nmkdir -p \"$(dirname \"$DST\")\"\ncp -a %s \"$DST\"",
-		strings.TrimPrefix(dst, "/"), strings.Join(modifiedSrcs, " "))
+	script := fmt.Sprintf(`DST="${ROOTFS}/%s"
+mkdir -p "$(dirname "$DST")"
+cp -a %s "$DST"`, strings.TrimPrefix(dst, "/"), strings.Join(modifiedSrcs, " "))
 
 	if chown != "" {
 		script += fmt.Sprintf("\nchown -R %s \"$DST\"", chown)
@@ -192,14 +193,18 @@ func desugarAdd(args string, loc string, conds []string) Instruction {
 	dst := realParts[len(realParts)-1]
 	src := realParts[0]
 
-	var script string
-	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
-		script = fmt.Sprintf("DST=\"${ROOTFS}/%s\"\nmkdir -p \"$(dirname \"$DST\")\"\ncurl -sSL '%s' -o \"$DST\"", strings.TrimPrefix(dst, "/"), src)
-	} else if strings.HasSuffix(src, ".tar.gz") || strings.HasSuffix(src, ".tgz") {
-		script = fmt.Sprintf("DST=\"${ROOTFS}/%s\"\nmkdir -p \"$DST\"\ntar -xzf '%s' -C \"$DST\"", strings.TrimPrefix(dst, "/"), src)
-	} else {
-		script = fmt.Sprintf("DST=\"${ROOTFS}/%s\"\nmkdir -p \"$(dirname \"$DST\")\"\ncp -a '%s' \"$DST\"", strings.TrimPrefix(dst, "/"), src)
-	}
+	script := fmt.Sprintf(`DST="${ROOTFS}/%s"
+mkdir -p "$(dirname "$DST")"
+SRC="%s"
+
+if echo "$SRC" | grep -qE '^https?://'; then
+    curl -sSL "$SRC" -o "$DST"
+elif echo "$SRC" | grep -qE '\.(tar\.gz|tgz|tar\.xz|txz|tar\.bz2|tbz2|tar)$'; then
+    mkdir -p "$DST"
+    tar -xf "$SRC" -C "$DST"
+else
+    cp -a "$SRC" "$DST"
+fi`, strings.TrimPrefix(dst, "/"), src)
 
 	if chown != "" {
 		script += fmt.Sprintf("\nchown -R %s \"$DST\"", chown)
@@ -351,8 +356,10 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 			if baseType == "EMIT" {
 				b.Instructions = append(b.Instructions, Instruction{Type: baseType, Args: args})
 				formats := strings.Split(args, ",")
+				hasCapsule := false
 				for _, f := range formats {
 					format := strings.TrimSpace(f)
+					if format == "capsule" { hasCapsule = true }
 					relPath := "emit/" + format
 					resolvedPath, err := b.resolveIncludePath(absPath, relPath)
 					if err == nil {
@@ -364,6 +371,13 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 					} else {
 						b.Log.Warn(ctx, "no template found for EMIT format", "format", format)
 					}
+				}
+				if strings.Contains(args, "runtime") {
+					b.Instructions = append(b.Instructions, Instruction{Type: "RUN", Args: "sys.export_runtime", Location: "root", Context: "host", Conditions: []string{"all"}})
+				} else if strings.Contains(args, "instance") {
+					b.Instructions = append(b.Instructions, Instruction{Type: "RUN", Args: "sys.finalize_instance", Location: "root", Context: "host", Conditions: []string{"all"}})
+				} else if !hasCapsule && !strings.Contains(args, "container") {
+					b.Instructions = append(b.Instructions, Instruction{Type: "RUN", Args: "sys.finalize_vm", Location: "root", Context: "host", Conditions: []string{"all"}})
 				}
 				continue
 			}
@@ -475,7 +489,6 @@ func cloneMap(m map[string]string) map[string]string {
 
 // PreProcess executes Pass 1: State accumulation and Hash computation.
 func (b *BuildApp) PreProcess(ctx context.Context) error {
-	// Active running state
 	activeArgs := make(map[string]string)
 	for k, v := range b.BuildArgs {
 		activeArgs[k] = v
@@ -487,17 +500,22 @@ func (b *BuildApp) PreProcess(ctx context.Context) error {
 
 	substitute := func(val string) string {
 		return os.Expand(val, func(k string) string {
-			if v, ok := activeEnv[k]; ok { return v }
-			if v, ok := activeArgs[k]; ok { return v }
+			if v, ok := activeEnv[k]; ok {
+				return v
+			}
+			if v, ok := activeArgs[k]; ok {
+				return v
+			}
 			return ""
 		})
 	}
 
 	h := sha256.New()
-	
-	// Pre-seed the hash with build args to ensure different args yield different graphs
+
 	var keys []string
-	for k := range b.BuildArgs { keys = append(keys, k) }
+	for k := range b.BuildArgs {
+		keys = append(keys, k)
+	}
 	sort.Strings(keys)
 	for _, k := range keys {
 		h.Write([]byte(k + "=" + b.BuildArgs[k]))
@@ -513,21 +531,20 @@ func (b *BuildApp) PreProcess(ctx context.Context) error {
 		cleanArgs := strings.SplitN(args, " #", 2)[0]
 		cleanArgs = strings.TrimSpace(cleanArgs)
 
-		// State Accumulation
 		switch inst.Type {
 		case "ARG":
 			parts := strings.SplitN(cleanArgs, "=", 2)
 			if len(parts) == 2 {
-				activeArgs[parts[0]] = parts[1]
+				activeArgs[parts[0]] = strings.Trim(strings.TrimSpace(parts[1]), `"'`)
 			}
 		case "ENV":
 			parts := strings.SplitN(cleanArgs, "=", 2)
 			if len(parts) == 2 {
-				activeEnv[parts[0]] = parts[1]
+				activeEnv[parts[0]] = strings.Trim(strings.TrimSpace(parts[1]), `"'`)
 			} else {
 				parts = strings.SplitN(cleanArgs, " ", 2)
 				if len(parts) == 2 {
-					activeEnv[parts[0]] = parts[1]
+					activeEnv[parts[0]] = strings.Trim(strings.TrimSpace(parts[1]), `"'`)
 				}
 			}
 		case "FROM":
@@ -535,7 +552,9 @@ func (b *BuildApp) PreProcess(ctx context.Context) error {
 				b.BaseImage = cleanArgs
 			}
 			activeArgs = make(map[string]string)
-			for k, v := range b.BuildArgs { activeArgs[k] = v }
+			for k, v := range b.BuildArgs {
+				activeArgs[k] = v
+			}
 		case "WORKDIR":
 			activeWorkdir = cleanArgs
 		case "USER":
@@ -574,7 +593,6 @@ func (b *BuildApp) PreProcess(ctx context.Context) error {
 				for _, p := range parts {
 					if strings.HasPrefix(p, "--target=") {
 						target := strings.TrimPrefix(p, "--target=")
-						// We map the expected future directory path 
 						activeStageMounts[target] = fmt.Sprintf("as-roots/%s", target)
 					}
 				}
@@ -584,7 +602,7 @@ func (b *BuildApp) PreProcess(ctx context.Context) error {
 		// Snapshot freezing
 		inst.Env = cloneMap(activeEnv)
 		for k, v := range activeArgs {
-			inst.Env[k] = v // Merge args into env snapshot for execution context
+			inst.Env[k] = v 
 		}
 		inst.Workdir = activeWorkdir
 		inst.User = activeUser
@@ -594,7 +612,7 @@ func (b *BuildApp) PreProcess(ctx context.Context) error {
 		h := sha256.New()
 		h.Write([]byte(prevHash))
 		h.Write([]byte(inst.Type))
-		h.Write([]byte(inst.Args))
+		h.Write([]byte(args)) // Hash the EVALUATED arguments to ensure cache invalidation
 		h.Write([]byte(inst.Context))
 		h.Write([]byte(inst.Location))
 		h.Write([]byte(strings.Join(inst.Conditions, ",")))

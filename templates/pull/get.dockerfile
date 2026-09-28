@@ -5,14 +5,22 @@ RUN [$TARGET_STAGE, host]: |
     exit 1
   fi
   
-  HASH=$(echo -n "${GET_URL}" | sha256sum | awk '{print $1}')
-  CACHE_FILE="${SST_CACHE_GET}/${HASH}"
-  
-  if [ ! -f "$CACHE_FILE" ]; then
-    echo "--> GET cache miss: downloading payload..."
-    curl -fsSL "${GET_URL}" -o "$CACHE_FILE"
+  if echo "${GET_URL}" | grep -qE '^https?://'; then
+      HASH=$(echo -n "${GET_URL}" | sha256sum | awk '{print $1}')
+      CACHE_FILE="${SST_CACHE_GET}/${HASH}"
+      
+      if [ ! -f "$CACHE_FILE" ]; then
+        echo "--> GET cache miss: downloading payload..."
+        curl -fsSL "${GET_URL}" -o "$CACHE_FILE"
+      else
+        echo "--> GET cache hit: ${GET_URL}"
+      fi
   else
-    echo "--> GET cache hit: ${GET_URL}"
+      if [ ! -f "${GET_URL}" ]; then
+        echo "Error: Local file ${GET_URL} does not exist."
+        exit 1
+      fi
+      CACHE_FILE="${GET_URL}"
   fi
   
   DST="${ROOTFS}/${GET_DEST}"
@@ -23,5 +31,5 @@ RUN [$TARGET_STAGE, host]: |
   esac
   
   mkdir -p "$(dirname "$DST")"
-  echo "--> Injecting cached payload to $DST"
+  echo "--> Injecting payload to $DST"
   cp -a "$CACHE_FILE" "$DST"
