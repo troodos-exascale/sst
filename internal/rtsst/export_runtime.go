@@ -39,45 +39,51 @@ func (b *BuildApp) ExportRuntime(ctx context.Context) error {
 		duid = "00:01:00:01:" + mac
 	}
 
-	// 2. Hydrate the Protobuf Struct natively FIRST
-	inst := &runctlpb.Instance{
-		ApiVersion: "sst.io/v1",
-		Kind:       "Runtime",
-		Name:       runtimeName,
-		Hostname:   lastEnv["INST_HOSTNAME"],
-		DomainName: lastEnv["INST_DOMAIN"],
-		BaseImage:  baseImage,
-		CpuCount:   lastEnv["INST_CPUS"],
-		MemorySize: lastEnv["INST_MEM"],
-		Bootloader: "linux",
-		Kernel:     "kernel",
-		Initrd:     "initrd",
-		Params: []string{
-			"console=hvc0",
-			"root=/dev/vda rw",
-		},
-	}
+	// 2. Hydrate the Protobuf Struct natively FIRST (using persisted state)
+	b.initActiveInstance()
+	inst := b.ActiveInstance
 
+	inst.ApiVersion = "sst.io/v1"
+	inst.Kind = "Runtime"
+	
+	if inst.Name == "" { inst.Name = runtimeName }
+	if inst.Hostname == "" { inst.Hostname = lastEnv["INST_HOSTNAME"] }
 	if inst.Hostname == "" { inst.Hostname = runtimeName }
+	if inst.DomainName == "" { inst.DomainName = lastEnv["INST_DOMAIN"] }
+	if inst.BaseImage == "" { inst.BaseImage = baseImage }
+	if inst.CpuCount == "" { inst.CpuCount = lastEnv["INST_CPUS"] }
 	if inst.CpuCount == "" { inst.CpuCount = "2" }
-	if inst.MemorySize == "" {
-		inst.MemorySize = "2048"
-		inst.MemorySizeSuffix = "MiB"
+	if inst.MemorySize == "" { inst.MemorySize = lastEnv["INST_MEM"] }
+	if inst.MemorySize == "" { inst.MemorySize = "2048"; inst.MemorySizeSuffix = "MiB" }
+	if inst.Bootloader == "" { inst.Bootloader = "linux" }
+	if inst.Kernel == "" { inst.Kernel = "kernel" }
+	if inst.Initrd == "" { inst.Initrd = "initrd" }
+	if len(inst.Params) == 0 {
+		inst.Params = []string{"console=hvc0", "root=/dev/vda rw"}
 	}
 
-	net := &runctlpb.EthInterface{
-		Name:        "eth0",
-		MacAddress:  mac,
-		Duid:        duid,
-		Ipv4Cidr:    lastEnv["INST_IPV4"],
-		Ipv4Gateway: lastEnv["INST_GATEWAY"],
-		Fabric:      "nat",
+	if len(inst.Networks) == 0 {
+		net := &runctlpb.EthInterface{
+			Name:        "eth0",
+			MacAddress:  mac,
+			Duid:        duid,
+			Ipv4Cidr:    lastEnv["INST_IPV4"],
+			Ipv4Gateway: lastEnv["INST_GATEWAY"],
+			Fabric:      "nat",
+		}
+		inst.Networks = []*runctlpb.EthInterface{net}
 	}
-	inst.Networks = []*runctlpb.EthInterface{net}
 
 	if shares := lastEnv["INST_SHARE_HOST_DIRS"]; shares != "" {
 		for _, share := range strings.Split(shares, ",") {
-			inst.SharedDir = append(inst.SharedDir, strings.TrimSpace(share))
+			s := strings.TrimSpace(share)
+			found := false
+			for _, existing := range inst.SharedDir {
+				if existing == s { found = true; break }
+			}
+			if !found {
+				inst.SharedDir = append(inst.SharedDir, s)
+			}
 		}
 	}
 
@@ -85,7 +91,14 @@ func (b *BuildApp) ExportRuntime(ctx context.Context) error {
 	if baseDiskName == "" {
 		baseDiskName = "disk.raw"
 	}
-	inst.Rwdisk = append(inst.Rwdisk, baseDiskName)
+	
+	foundBaseDisk := false
+	for _, existing := range inst.Rwdisk {
+		if existing == baseDiskName { foundBaseDisk = true; break }
+	}
+	if !foundBaseDisk {
+		inst.Rwdisk = append(inst.Rwdisk, baseDiskName)
+	}
 
 	// 3. Map and Provision Secondary Block Devices
 	if devs := lastEnv["INST_DEVICES"]; devs != "" {
@@ -100,12 +113,20 @@ func (b *BuildApp) ExportRuntime(ctx context.Context) error {
 				}
 				
 				devPath := filepath.Join(targetDir, devName)
-				b.Log.Info(ctx, "provisioning secondary sparse block device", "device", devName, "size", devSize)
-				if err := CreateSparse(devPath, devSize); err != nil {
-					return fmt.Errorf("failed to create sparse device %s: %w", devPath, err)
+				if _, err := os.Stat(devPath); os.IsNotExist(err) {
+					b.Log.Info(ctx, "provisioning secondary sparse block device", "device", devName, "size", devSize)
+					if err := CreateSparse(devPath, devSize); err != nil {
+						return fmt.Errorf("failed to create sparse device %s: %w", devPath, err)
+					}
 				}
 				
-				inst.Rwdisk = append(inst.Rwdisk, devName)
+				foundSecondary := false
+				for _, existing := range inst.Rwdisk {
+					if existing == devName { foundSecondary = true; break }
+				}
+				if !foundSecondary {
+					inst.Rwdisk = append(inst.Rwdisk, devName)
+				}
 			}
 		}
 	}

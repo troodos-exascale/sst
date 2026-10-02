@@ -13,6 +13,8 @@ import (
 	"strings"
 
 	"github.com/troodos-exascale/sst/internal/sst"
+	mkimagepb "github.com/troodos-exascale/sst/proto/yaml/mkimage/v1"
+	runctlpb "github.com/troodos-exascale/sst/proto/yaml/runctl/v1"
 )
 
 type Instruction struct {
@@ -24,7 +26,7 @@ type Instruction struct {
 	Conditions []string
 	Hash       string
 
-	// Frozen State (Populated during PreProcess for execution safety)
+	// Frozen State
 	Env         map[string]string
 	Workdir     string
 	User        string
@@ -32,36 +34,38 @@ type Instruction struct {
 }
 
 type BuildApp struct {
-	Log           *sst.Logx
-	Files         sst.Files
-	ContextDir    string
-	Dockerfile    string
-	BaseImage     string
-	Name          string
-	Emits         []string
-	Instructions  []Instruction
-	IncludedFiles map[string]string
+	Log            *sst.Logx
+	Files          sst.Files
+	ContextDir     string
+	Dockerfile     string
+	BaseImage      string
+	Name           string
+	Emits          []string
+	Instructions   []Instruction
+	IncludedFiles  map[string]string
 
-	BuildArgs map[string]string
-	Args      map[string]string
-	Env       map[string]string
+	BuildArgs      map[string]string
+	Args           map[string]string
+	Env            map[string]string
 
-	Workdir      string
-	User         string
-	Cmd          string
-	EntryPoint   string
-	Labels       map[string]string
-	Volumes      map[string]struct{}
-	ExposedPorts map[string]struct{}
+	Workdir        string
+	User           string
+	Cmd            string
+	EntryPoint     string
+	Labels         map[string]string
+	Volumes        map[string]struct{}
+	ExposedPorts   map[string]struct{}
 
-	BuildDir    string
-	RuntimeDir  string
-	RootDir     string
-	ImageOutput string
+	BuildDir       string
+	RuntimeDir     string
+	RootDir        string
+	ImageOutput    string
 
-	DatasetMgr *DatasetManager
-	BuildID    string
-	Force      bool
+	ActiveManifest *mkimagepb.ImageYAML
+	ActiveInstance *runctlpb.Instance
+	DatasetMgr     *DatasetManager
+	BuildID        string
+	Force          bool
 }
 
 func NewBuilder(log *sst.Logx, files sst.Files, dockerfile, contextDir, buildDir, runtimeDir string) *BuildApp {
@@ -81,6 +85,16 @@ func NewBuilder(log *sst.Logx, files sst.Files, dockerfile, contextDir, buildDir
 		ExposedPorts:  make(map[string]struct{}),
 		Workdir:       "/",
 		User:          "root",
+		ActiveManifest: &mkimagepb.ImageYAML{
+			ApiVersion: "sst.io/v1",
+			Kind:       "Image",
+			Storage:    &mkimagepb.StoragePlan{},
+			Boot:       &mkimagepb.BootStructure{},
+		},
+		ActiveInstance: &runctlpb.Instance{
+			ApiVersion: "sst.io/v1",
+			Kind:       "Instance",
+		},
 	}
 }
 
@@ -356,10 +370,8 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 			if baseType == "EMIT" {
 				b.Instructions = append(b.Instructions, Instruction{Type: baseType, Args: args})
 				formats := strings.Split(args, ",")
-				hasCapsule := false
 				for _, f := range formats {
 					format := strings.TrimSpace(f)
-					if format == "capsule" { hasCapsule = true }
 					relPath := "emit/" + format
 					resolvedPath, err := b.resolveIncludePath(absPath, relPath)
 					if err == nil {
@@ -371,13 +383,6 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 					} else {
 						b.Log.Warn(ctx, "no template found for EMIT format", "format", format)
 					}
-				}
-				if strings.Contains(args, "runtime") {
-					b.Instructions = append(b.Instructions, Instruction{Type: "RUN", Args: "sys.export_runtime", Location: "root", Context: "host", Conditions: []string{"all"}})
-				} else if strings.Contains(args, "instance") {
-					b.Instructions = append(b.Instructions, Instruction{Type: "RUN", Args: "sys.finalize_instance", Location: "root", Context: "host", Conditions: []string{"all"}})
-				} else if !hasCapsule && !strings.Contains(args, "container") {
-					b.Instructions = append(b.Instructions, Instruction{Type: "RUN", Args: "sys.finalize_vm", Location: "root", Context: "host", Conditions: []string{"all"}})
 				}
 				continue
 			}
@@ -487,7 +492,6 @@ func cloneMap(m map[string]string) map[string]string {
 	return c
 }
 
-// PreProcess executes Pass 1: State accumulation and Hash computation.
 func (b *BuildApp) PreProcess(ctx context.Context) error {
 	activeArgs := make(map[string]string)
 	for k, v := range b.BuildArgs {
@@ -599,7 +603,6 @@ func (b *BuildApp) PreProcess(ctx context.Context) error {
 			}
 		}
 
-		// Snapshot freezing
 		inst.Env = cloneMap(activeEnv)
 		for k, v := range activeArgs {
 			inst.Env[k] = v 
@@ -608,11 +611,10 @@ func (b *BuildApp) PreProcess(ctx context.Context) error {
 		inst.User = activeUser
 		inst.StageMounts = cloneMap(activeStageMounts)
 
-		// Hashing
 		h := sha256.New()
 		h.Write([]byte(prevHash))
 		h.Write([]byte(inst.Type))
-		h.Write([]byte(args)) // Hash the EVALUATED arguments to ensure cache invalidation
+		h.Write([]byte(args))
 		h.Write([]byte(inst.Context))
 		h.Write([]byte(inst.Location))
 		h.Write([]byte(strings.Join(inst.Conditions, ",")))

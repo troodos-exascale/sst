@@ -40,12 +40,21 @@ type Runner struct {
 	StatePath string
 	State     map[string]interface{}
 	Completed map[string]bool
+
+	registeredState map[string]interface{}
 }
 
 type persistedGraphState struct {
 	Updated   time.Time
-	State     map[string]interface{}
+	State     map[string]json.RawMessage
 	Completed map[string]bool
+}
+
+func (r *Runner) RegisterState(key string, target interface{}) {
+	if r.registeredState == nil {
+		r.registeredState = make(map[string]interface{})
+	}
+	r.registeredState[key] = target
 }
 
 func (r *Runner) LoadState() error {
@@ -60,8 +69,25 @@ func (r *Runner) LoadState() error {
 	if err := json.Unmarshal(data, &p); err != nil {
 		return fmt.Errorf("load graph state: %w", err)
 	}
+
+	if r.State == nil {
+		r.State = make(map[string]interface{})
+	}
+
 	if p.State != nil {
-		r.State = p.State
+		for k, raw := range p.State {
+			if target, ok := r.registeredState[k]; ok {
+				if err := json.Unmarshal(raw, target); err != nil {
+					r.Log.WithError(err).Warn(context.Background(), "tg.runner.registered_state_unmarshal_failed", "key", k)
+				}
+				r.State[k] = target
+			} else {
+				var val interface{}
+				if err := json.Unmarshal(raw, &val); err == nil {
+					r.State[k] = val
+				}
+			}
+		}
 	}
 	if p.Completed != nil {
 		r.Completed = p.Completed
@@ -73,11 +99,27 @@ func (r *Runner) SaveState() error {
 	if r.StatePath == "" {
 		return nil
 	}
+	if r.State == nil {
+		r.State = make(map[string]interface{})
+	}
+	for k, ptr := range r.registeredState {
+		r.State[k] = ptr
+	}
+
 	p := persistedGraphState{
 		Updated:   time.Now().UTC(),
-		State:     r.State,
+		State:     make(map[string]json.RawMessage),
 		Completed: r.Completed,
 	}
+
+	for k, v := range r.State {
+		b, err := json.Marshal(v)
+		if err != nil {
+			continue
+		}
+		p.State[k] = b
+	}
+
 	data, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return err
@@ -153,7 +195,7 @@ func (r *Runner) runRecursive(ctx context.Context, tgCtx *Context) error {
 			if tgCtx.Action != nil {
 				actionValue, actionErr = tgCtx.Action(ctx)
 			}
-			
+
 			if actionErr == nil && tgCtx.ID != "" {
 				r.Completed[tgCtx.ID] = true
 				_ = r.SaveState()

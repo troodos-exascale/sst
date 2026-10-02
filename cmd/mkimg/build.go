@@ -85,7 +85,6 @@ func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runti
 		return err
 	}
 
-	// 1. Initialize the generic Task Graph Engine
 	runner := &sst.Runner{
 		Log:       log,
 		StatePath: filepath.Join(builder.DatasetMgr.MountPath(""), "state.json"),
@@ -93,12 +92,12 @@ func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runti
 		Completed: make(map[string]bool),
 	}
 
-	// === RECONCILIATION LAYER ===
+	builder.RegisterHandlers(runner)
+
 	if err := runner.LoadState(); err == nil {
 		stateMutated := false
 
 		for i, inst := range builder.Instructions {
-			// 1. User-Requested Pruning (--restart)
 			if restartIndex >= 0 && inst.Index >= restartIndex {
 				if runner.Completed[inst.Hash] {
 					delete(runner.Completed, inst.Hash)
@@ -107,7 +106,6 @@ func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runti
 				continue
 			}
 
-			// 2. Physical Reality Check (ZFS Sync)
 			if runner.Completed[inst.Hash] && builder.DatasetMgr != nil {
 				var nextHashStub string
 				if i+1 < len(builder.Instructions) {
@@ -133,9 +131,7 @@ func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runti
 			_ = runner.SaveState()
 		}
 	}
-	// === END RECONCILIATION ===
 
-	// 2. Overview Mode (--show)
 	if flagShow {
 		fmt.Printf("--- Build Summary: %s ---\n", builder.Name)
 		for _, inst := range builder.Instructions {
@@ -157,7 +153,6 @@ func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runti
 		return nil
 	}
 
-	// 3. Construct the Protosh DAG
 	var root *sst.Context
 	var prev *sst.Context
 
@@ -173,7 +168,6 @@ func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runti
 		if prev != nil {
 			nextCtx := stepCtx
 			prev.Interpret = func(res *sst.Result) ([]*sst.Context, error) {
-				// Successfully completed action! Snapshot the ZFS dataset now that it's clean.
 				if builder.DatasetMgr != nil {
 					hashStub := nextCtx.ID
 					if len(hashStub) >= 8 { hashStub = hashStub[:8] }
@@ -181,7 +175,6 @@ func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runti
 					for stageTarget := range inst.StageMounts {
 						_ = builder.DatasetMgr.SnapshotDataset(stageTarget, tag)
 					}
-					// Also snapshot the core runtime root
 					_ = builder.DatasetMgr.SnapshotDataset(builder.DatasetMgr.RuntimeRootName, tag)
 				}
 				return []*sst.Context{nextCtx}, nil
@@ -192,7 +185,6 @@ func RunBuildEngine(ctx context.Context, dockerfile, contextDir, buildDir, runti
 		parentHash = inst.Hash
 	}
 
-	// No monolithic finalization router! The graph runs to EOF naturally.
 	return runner.Run(ctx, root)
 }
 

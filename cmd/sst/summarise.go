@@ -24,14 +24,63 @@ type summariseApp struct {
 	repoRoot   string
 	files      []string
 	outputPath string
-	builder    strings.Builder
 	submodules []string
+
+	// chunking state
+	currentBuilder strings.Builder
+	fileIndex      int
+	maxChunkSize   int
 
 	// behavior
 	methods summariseMethods
 
 	// framework execution state
 	steps *sst.StepsRunState
+}
+
+// flush writes the current buffered data to disk with an incremented suffix
+func (app *summariseApp) flush() error {
+	if app.currentBuilder.Len() == 0 {
+		return nil
+	}
+
+	data := app.currentBuilder.String()
+	app.currentBuilder.Reset()
+	app.fileIndex++
+
+	out := app.outputPath
+	if out == "-" {
+		fmt.Print(data)
+		return nil
+	}
+
+	if !filepath.IsAbs(out) {
+		out = filepath.Join(app.repoRoot, out)
+	}
+
+	// Insert chunk suffix (_1, _2, etc.) before the extension
+	ext := filepath.Ext(out)
+	base := strings.TrimSuffix(out, ext)
+	finalOut := fmt.Sprintf("%s_%d%s", base, app.fileIndex, ext)
+
+	if err := os.MkdirAll(filepath.Dir(finalOut), 0o755); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr, "[summarise] Writing chunk %d (%d bytes) to %s\n", app.fileIndex, len(data), finalOut)
+	return os.WriteFile(finalOut, []byte(data), 0o644)
+}
+
+// appendBlock ensures that adding a new file string block won't exceed the max size.
+// If it does, we flush the current buffer to a new file first.
+func (app *summariseApp) appendBlock(block string) error {
+	if app.currentBuilder.Len() > 0 && app.currentBuilder.Len()+len(block) > app.maxChunkSize {
+		if err := app.flush(); err != nil {
+			return err
+		}
+	}
+	app.currentBuilder.WriteString(block)
+	return nil
 }
 
 //
@@ -44,7 +93,7 @@ type summariseMethods struct {
 	FindRepo     func(*summariseApp) error
 	ListFiles    func(*summariseApp) error
 	WriteResult  func(*summariseApp) error
-	AppendLsTree func(*summariseApp) error // NEW
+	AppendLsTree func(*summariseApp) error
 	WriteOutput  func(*summariseApp) error
 }
 
@@ -65,16 +114,18 @@ var summariseOps = summariseMethods{
 var (
 	repoRootFlag string
 	outputFile   string
+	chunkSizeKB  int
 )
 
 var summariseCmd = &cobra.Command{
 	Use:   "summarise [submodules...]",
-	Short: "Consolidate repository files into a single report.",
+	Short: "Consolidate repository files into chunked reports.",
 	RunE: func(cmd *cobra.Command, args []string) error {
 
 		app := &summariseApp{
-			submodules: args,
-			outputPath: outputFile,
+			submodules:   args,
+			outputPath:   outputFile,
+			maxChunkSize: chunkSizeKB * 1024,
 		}
 
 		app.methods = summariseOps
@@ -112,6 +163,7 @@ func init() {
 	rootCmd.AddCommand(summariseCmd)
 	summariseCmd.Flags().StringVarP(&repoRootFlag, "repo-root", "r", "", "Repo root")
 	summariseCmd.Flags().StringVarP(&outputFile, "output", "o", "docs/repo-summary.md", "Output file")
+	summariseCmd.Flags().IntVar(&chunkSizeKB, "chunk-size", 300, "Max size of each chunk file in KB")
 }
 
 //
@@ -136,9 +188,8 @@ func summariseFindRepo(app *summariseApp) error {
 	}
 	app.repoRoot = strings.TrimSpace(string(out))
 
-	fmt.Fprintf(&app.builder, "# Repository Summary: %s\n", app.repoRoot)
-	fmt.Fprintf(&app.builder, "* **Date:** %s\n\n", time.Now().UTC().Format(time.RFC1123))
-	return nil
+	header := fmt.Sprintf("# Repository Summary: %s\n* **Date:** %s\n\n", app.repoRoot, time.Now().UTC().Format(time.RFC1123))
+	return app.appendBlock(header)
 }
 
 func summariseListFiles(app *summariseApp) error {
@@ -166,28 +217,40 @@ func summariseWriteResult(app *summariseApp) error {
 	for _, f := range app.files {
 		data, err := os.ReadFile(filepath.Join(app.repoRoot, f))
 		if err != nil {
-			fmt.Fprintf(&app.builder, "FILE: %s\n--- ERROR: %v ---\nEND: %s\n\n", f, err, f)
+			errBlock := fmt.Sprintf("FILE: %s\n--- ERROR: %v ---\nEND: %s\n\n", f, err, f)
+			if appendErr := app.appendBlock(errBlock); appendErr != nil {
+				return appendErr
+			}
 			continue
 		}
 
 		// Quick heuristic to skip binaries: check for null bytes
 		if bytes.Contains(data, []byte{0}) {
-			fmt.Fprintf(&app.builder, "FILE: %s\n--- SKIPPED BINARY FILE ---\nEND: %s\n\n", f, f)
+			skipBlock := fmt.Sprintf("FILE: %s\n--- SKIPPED BINARY FILE ---\nEND: %s\n\n", f, f)
+			if appendErr := app.appendBlock(skipBlock); appendErr != nil {
+				return appendErr
+			}
 			continue
 		}
 
-		fmt.Fprintf(&app.builder, "FILE: %s\n", f)
-		app.builder.Write(data)
+		var block strings.Builder
+		fmt.Fprintf(&block, "FILE: %s\n", f)
+		block.Write(data)
 		if len(data) > 0 && data[len(data)-1] != '\n' {
-			app.builder.WriteByte('\n')
+			block.WriteByte('\n')
 		}
-		fmt.Fprintf(&app.builder, "END: %s\n\n", f)
+		fmt.Fprintf(&block, "END: %s\n\n", f)
+
+		if appendErr := app.appendBlock(block.String()); appendErr != nil {
+			return appendErr
+		}
 	}
 	return nil
 }
 
 func summariseAppendLsTree(app *summariseApp) error {
-	fmt.Fprintf(&app.builder, "\n\n---\n\n# Repository tree (ls -R)\n\n")
+	var block strings.Builder
+	fmt.Fprintf(&block, "\n\n---\n\n# Repository tree (ls -R)\n\n")
 
 	cmd := exec.Command("ls", "-R")
 	cmd.Dir = app.repoRoot
@@ -196,24 +259,14 @@ func summariseAppendLsTree(app *summariseApp) error {
 		return err
 	}
 
-	app.builder.Write(out)
+	block.Write(out)
 	if len(out) > 0 && out[len(out)-1] != '\n' {
-		app.builder.WriteByte('\n')
+		block.WriteByte('\n')
 	}
-	return nil
+	
+	return app.appendBlock(block.String())
 }
 
 func summariseWriteOutput(app *summariseApp) error {
-	out := app.outputPath
-	if out == "-" {
-		fmt.Print(app.builder.String())
-		return nil
-	}
-	if !filepath.IsAbs(out) {
-		out = filepath.Join(app.repoRoot, out)
-	}
-	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(out, []byte(app.builder.String()), 0o644)
+	return app.flush()
 }
