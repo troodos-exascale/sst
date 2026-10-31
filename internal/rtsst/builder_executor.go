@@ -1,3 +1,17 @@
+// Copyright 2025-2026 Peter Braam
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package rtsst
 
 import (
@@ -7,11 +21,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/troodos-exascale/sst/internal/sst"
-	mkimagepb "github.com/troodos-exascale/sst/proto/yaml/mkimage/v1"
-	runctlpb "github.com/troodos-exascale/sst/proto/yaml/runctl/v1"
 )
 
 func (b *BuildApp) InitEnvironment(ctx context.Context) error {
@@ -50,12 +61,6 @@ func (b *BuildApp) InitEnvironment(ctx context.Context) error {
 	if b.Force {
 		b.Log.Info(ctx, "force flag provided, annihilating existing build environment", "build_id", b.BuildID)
 		_ = b.DatasetMgr.Destroy()
-		
-		if b.Name != "" && !strings.HasSuffix(b.Dockerfile, "instance.dockerfile") {
-			outDir := filepath.Join(b.RuntimeDir, "images", b.Name)
-			b.Log.Info(ctx, "force flag provided, wiping output directory", "dir", outDir)
-			_ = os.RemoveAll(outDir)
-		}
 	}
 
 	if err := b.DatasetMgr.InitBuildEnvironment(); err != nil {
@@ -332,7 +337,12 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 		}
 	}()
 
-	sst.ExecShell(ctx, b.Log, "cp", "-L", "/etc/resolv.conf", filepath.Join(targetDir, "etc/resolv.conf"))
+	// Fix DNS within the isolated chroot safely
+	if _, err := os.Stat("/run/systemd/resolve/resolv.conf"); err == nil {
+		sst.ExecShell(ctx, b.Log, "cp", "-L", "/run/systemd/resolve/resolv.conf", filepath.Join(targetDir, "etc/resolv.conf"))
+	} else {
+		sst.ExecShell(ctx, b.Log, "cp", "-L", "/etc/resolv.conf", filepath.Join(targetDir, "etc/resolv.conf"))
+	}
 
 	workdir := inst.Workdir
 	if workdir == "" {
@@ -384,317 +394,6 @@ func (b *BuildApp) execChrootRun(ctx context.Context, cmdStr string, targetDir s
 	
 	if err != nil {
 		return fmt.Errorf("chroot command failed: %w", err)
-	}
-	return nil
-}
-
-// ---------------------------------------------------------
-// Granular Finalization Builders
-// ---------------------------------------------------------
-
-func (b *BuildApp) BuildImageState(ctx context.Context, outDir string) error {
-	if err := os.MkdirAll(outDir, 0755); err != nil {
-		return err
-	}
-
-	semanticName := ""
-	upstreamBuildID := ""
-	if osInfo, err := ParseOSRelease(b.RootDir); err == nil {
-		semanticName = GenerateSemanticName(osInfo)
-		upstreamBuildID = osInfo["BUILD_ID"]
-	}
-
-	buildID := time.Now().UTC().Format("20060102-150405")
-	b.initActiveManifest()
-	b.ActiveManifest.Provenance.Name = b.Name
-	b.ActiveManifest.Provenance.BuildId = buildID
-	if b.ActiveManifest.Provenance.UpstreamOs == "" { b.ActiveManifest.Provenance.UpstreamOs = semanticName }
-	if b.ActiveManifest.Provenance.UpstreamBuildId == "" { b.ActiveManifest.Provenance.UpstreamBuildId = upstreamBuildID }
-	if b.ActiveManifest.Storage.RawImage == "" { b.ActiveManifest.Storage.RawImage = b.Name + ".raw" }
-
-	sb := &ImageSB{
-		Ctx:           ctx,
-		Log:           b.Log,
-		YamlObject:    b.ActiveManifest,
-		SstRuntimeDir: b.RuntimeDir,
-	}
-
-	rawDiskPath := filepath.Join(outDir, b.Name+".raw")
-	kernelPath := filepath.Join(outDir, "kernel")
-	initrdPath := filepath.Join(outDir, "initrd")
-
-	_, rawErr := os.Stat(rawDiskPath)
-	_, kernErr := os.Stat(kernelPath)
-	_, initErr := os.Stat(initrdPath)
-
-	if rawErr != nil && (kernErr == nil || initErr == nil) {
-		b.Log.Info(ctx, "microvm detected without raw disk; generating dummy block device to satisfy vm constraints")
-		_ = CreateSparse(rawDiskPath, 1024*1024)
-		rawErr = nil
-	}
-
-	if rawErr == nil || kernErr == nil || initErr == nil {
-		hasEFI := false
-		for relPath := range b.IncludedFiles {
-			if strings.Contains(relPath, "boot-efi") || strings.Contains(relPath, "efiboot") { hasEFI = true; break }
-		}
-		if _, err := os.Stat(filepath.Join(b.RootDir, "boot", "efi")); err == nil { hasEFI = true }
-
-		if hasEFI {
-			sb.YamlObject.Storage.RootfsDevice = "/dev/vda2"
-			sb.YamlObject.Storage.RootfsType = "ext4"
-			sb.YamlObject.Boot.BootfsDevice = "/dev/vda1"
-			sb.YamlObject.Boot.BootfsType = "vfat"
-		} else {
-			sb.YamlObject.Storage.RootfsDevice = "/dev/vda"
-			sb.YamlObject.Storage.RootfsType = "ext4"
-			sb.YamlObject.Boot.BootfsDevice = "/dev/vda"
-			sb.YamlObject.Boot.BootfsType = "ext4"
-		}
-
-		if kernErr == nil { sb.YamlObject.Boot.Kernel = "kernel" }
-		if initErr == nil { sb.YamlObject.Boot.Initrd = "initrd" }
-
-		if (kernErr != nil || initErr != nil) && rawErr == nil {
-			bootDir := filepath.Join(b.RootDir, "boot")
-			if k, i, ok := scanPartitionForArtifacts(bootDir); ok {
-				kName, iName, _ := copyArtifacts(k, i, outDir)
-				sb.YamlObject.Boot.Kernel = kName
-				sb.YamlObject.Boot.Initrd = iName
-			} else if k, i, ok := scanPartitionForArtifacts(b.RootDir); ok {
-				kName, iName, _ := copyArtifacts(k, i, outDir)
-				sb.YamlObject.Boot.Kernel = kName
-				sb.YamlObject.Boot.Initrd = iName
-			}
-		}
-		if rawErr == nil { QueuePurification(b.RuntimeDir, []string{rawDiskPath}) }
-	} else {
-		sb.YamlObject.Storage.RawImage = ""
-		rootfsDest := filepath.Join(outDir, "rootfs")
-		if b.DatasetMgr != nil {
-			if err := b.DatasetMgr.PromoteTo(b.DatasetMgr.RuntimeRootName, "images", b.Name+"/rootfs"); err != nil {
-				_ = os.Rename(b.RootDir, rootfsDest)
-			}
-		} else {
-			_ = os.Rename(b.RootDir, rootfsDest)
-		}
-	}
-	return nil
-}
-
-func (b *BuildApp) BuildRuntimeState(ctx context.Context, targetDir, kind string) error {
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
-		return err
-	}
-
-	lastEnv := b.getLastEnv()
-	b.initActiveInstance()
-	inst := b.ActiveInstance
-
-	inst.ApiVersion = "sst.io/v1"
-	inst.Kind = kind
-
-	runtimeName := lastEnv["RUNTIME_NAME"]
-	if runtimeName == "" { runtimeName = b.BuildArgs["INST_NAME"] }
-	if runtimeName == "" { runtimeName = b.Name }
-
-	baseImage := lastEnv["BASE_IMAGE"]
-	if baseImage == "" { baseImage = b.BaseImage }
-
-	inst.Name = runtimeName
-	inst.BaseImage = baseImage
-
-	mac := lastEnv["INST_MAC"]
-	if mac == "" { mac, _ = GenerateMAC() }
-
-	if inst.Hostname == "" { inst.Hostname = lastEnv["INST_HOSTNAME"] }
-	if inst.Hostname == "" { inst.Hostname = runtimeName }
-	if inst.DomainName == "" { inst.DomainName = lastEnv["INST_DOMAIN"] }
-	if inst.CpuCount == "" { inst.CpuCount = lastEnv["INST_CPUS"] }
-	if inst.CpuCount == "" { inst.CpuCount = "2" }
-	if inst.MemorySize == "" { inst.MemorySize = lastEnv["INST_MEM"] }
-	if inst.MemorySize == "" { inst.MemorySize = "2048"; inst.MemorySizeSuffix = "MiB" }
-
-	if kind == "Runtime" {
-		duid := lastEnv["INST_DUID"]
-		if duid == "" { duid = "00:01:00:01:" + mac }
-		if len(inst.Networks) == 0 {
-			net := &runctlpb.EthInterface{
-				Name:        "eth0",
-				MacAddress:  mac,
-				Duid:        duid,
-				Ipv4Cidr:    lastEnv["INST_IPV4"],
-				Ipv4Gateway: lastEnv["INST_GATEWAY"],
-				Fabric:      "nat",
-			}
-			inst.Networks = []*runctlpb.EthInterface{net}
-		}
-		if len(inst.Params) == 0 {
-			inst.Params = []string{"console=hvc0", "root=/dev/vda rw"}
-		}
-	} else {
-		if len(inst.Network) == 0 && len(inst.Networks) == 0 {
-			inst.Network = []string{mac + "@nat"}
-		}
-		if len(inst.Disk) == 0 { inst.Disk = []string{"cidata.iso"} }
-		
-		rootDev := "/dev/vda2"
-		rootType := "ext4"
-		imgManifest := &mkimagepb.ImageYAML{}
-		yoImg := &sst.YamlObject{
-			Path:   filepath.Join(b.RuntimeDir, "images", baseImage, "image.yaml"),
-			Schema: "sst.yaml.mkimage.v1.ImageYAML",
-			Msg:    imgManifest,
-		}
-		if diags := yoImg.Load(ctx, b.Log); diags == nil || !diags.HasAny() {
-			if imgManifest.Storage != nil {
-				if imgManifest.Storage.RawImage == "" {
-					inst.Bootloader = "container"
-				}
-				if imgManifest.Storage.RootfsDevice != "" { rootDev = imgManifest.Storage.RootfsDevice }
-				if imgManifest.Storage.RootfsType != "" { rootType = imgManifest.Storage.RootfsType }
-			}
-		}
-
-		if inst.Bootloader != "container" {
-			if inst.Bootloader == "" { inst.Bootloader = "linux" }
-			if inst.Kernel == "" { inst.Kernel = "kernel" }
-			if inst.Initrd == "" { inst.Initrd = "initrd" }
-			if len(inst.Params) == 0 {
-				inst.Params = []string{
-					"console=hvc0", "oops=panic", "panic=10",
-					"sysrq_always_enabled=1", "loglevel=4", "cpuidle.off=1",
-					"root=" + rootDev, "rootfstype=" + rootType,
-				}
-			}
-		}
-	}
-
-	if shares := lastEnv["INST_SHARE_HOST_DIRS"]; shares != "" {
-		for _, share := range strings.Split(shares, ",") {
-			s := strings.TrimSpace(share)
-			found := false
-			for _, existing := range inst.SharedDir {
-				if existing == s { found = true; break }
-			}
-			if !found { inst.SharedDir = append(inst.SharedDir, s) }
-		}
-	}
-
-	baseDiskName := lastEnv["INST_BASE_DISK"]
-	if baseDiskName == "" {
-		if kind == "Instance" {
-			baseDiskName = inst.Name + ".raw"
-		} else {
-			baseDiskName = "disk.raw"
-		}
-	}
-	
-	foundBaseDisk := false
-	for _, existing := range inst.Rwdisk {
-		if existing == baseDiskName { foundBaseDisk = true; break }
-	}
-	if !foundBaseDisk {
-		inst.Rwdisk = append(inst.Rwdisk, baseDiskName)
-	}
-
-	if devs := lastEnv["INST_DEVICES"]; devs != "" {
-		for _, dev := range strings.Split(devs, ",") {
-			parts := strings.Split(dev, ":")
-			if len(parts) == 2 {
-				devName := strings.TrimSpace(parts[0]) + ".raw"
-				devSize, _ := ParseSize(parts[1])
-				devPath := filepath.Join(targetDir, devName)
-				if _, err := os.Stat(devPath); os.IsNotExist(err) {
-					CreateSparse(devPath, devSize)
-				}
-				foundSecondary := false
-				for _, existing := range inst.Rwdisk {
-					if existing == devName { foundSecondary = true; break }
-				}
-				if !foundSecondary { inst.Rwdisk = append(inst.Rwdisk, devName) }
-			}
-		}
-	}
-
-	if inst.Bootloader == "container" {
-		b.Log.Info(ctx, "configured manifest for container execution", "instance", inst.Name)
-		return nil
-	}
-
-	for _, diskName := range inst.Rwdisk {
-		if diskName != baseDiskName { continue }
-		srcDiskPath := filepath.Join(b.RootDir, diskName)
-		dstDiskPath := filepath.Join(targetDir, diskName)
-		if _, err := os.Stat(dstDiskPath); os.IsNotExist(err) {
-			if _, err := os.Stat(srcDiskPath); err == nil {
-				CopySparse(srcDiskPath, dstDiskPath)
-			}
-		}
-	}
-
-	bootAssets := []string{"kernel", "initrd"}
-	baseImageDir := filepath.Join(b.RuntimeDir, "images", baseImage)
-
-	for _, asset := range bootAssets {
-		dstPath := filepath.Join(targetDir, asset)
-		if _, err := os.Stat(dstPath); err == nil { continue } 
-		
-		srcPath := filepath.Join(b.RootDir, asset)
-		if _, err := os.Stat(srcPath); os.IsNotExist(err) {
-			srcPath = filepath.Join(baseImageDir, asset)
-		}
-		if _, err := os.Stat(srcPath); err == nil {
-			CopySparse(srcPath, dstPath)
-		}
-	}
-
-	if kind == "Instance" {
-		QueuePurification(b.RuntimeDir, []string{
-			filepath.Join(targetDir, baseDiskName),
-			filepath.Join(targetDir, "cidata.iso"),
-		})
-	}
-
-	return nil
-}
-
-func (b *BuildApp) CopyBlueprints(ctx context.Context, outDir string) error {
-	blueprintDir := filepath.Join(outDir, "blueprint")
-	os.MkdirAll(blueprintDir, 0755)
-
-	if b.Dockerfile != "" {
-		if data, err := os.ReadFile(b.Dockerfile); err == nil {
-			lines := strings.Split(string(data), "\n")
-			var newLines []string
-			
-			if b.ActiveManifest != nil && b.ActiveManifest.Provenance != nil && b.ActiveManifest.Provenance.BuildId != "" {
-				newLines = append(newLines, fmt.Sprintf("# CANONICAL_NAME: %s", b.Name))
-				newLines = append(newLines, fmt.Sprintf("# LAST_BUILD: %s", b.ActiveManifest.Provenance.BuildId))
-			}
-
-			for _, line := range lines {
-				if strings.HasPrefix(line, "# CANONICAL_NAME:") || strings.HasPrefix(line, "# LAST_BUILD:") {
-					continue
-				}
-				newLines = append(newLines, line)
-			}
-			
-			destPath := filepath.Join(blueprintDir, filepath.Base(b.Dockerfile))
-			_ = os.WriteFile(destPath, []byte(strings.Join(newLines, "\n")), 0644)
-		}
-	}
-
-	for relPath, absPath := range b.IncludedFiles {
-		targetRel := relPath
-		if !strings.HasSuffix(targetRel, ".dockerfile") {
-			targetRel += ".dockerfile"
-		}
-		destPath := filepath.Join(blueprintDir, targetRel)
-		os.MkdirAll(filepath.Dir(destPath), 0755)
-		if data, err := os.ReadFile(absPath); err == nil {
-			_ = os.WriteFile(destPath, data, 0644)
-		}
 	}
 	return nil
 }

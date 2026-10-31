@@ -1,3 +1,17 @@
+// Copyright 2025-2026 Peter Braam
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package rtsst
 
 import (
@@ -368,10 +382,37 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 			}
 
 			if baseType == "EMIT" {
-				b.Instructions = append(b.Instructions, Instruction{Type: baseType, Args: args})
-				formats := strings.Split(args, ",")
-				for _, f := range formats {
-					format := strings.TrimSpace(f)
+				parts := strings.Split(args, ",")
+				for i := range parts { parts[i] = strings.TrimSpace(parts[i]) }
+
+				// Late binding: Delay the resolution of the target directory to execution time 
+				// so it correctly captures the evaluated NAME instruction.
+				targetDir := "${NAME}" 
+				knownFormats := map[string]bool{"raw": true, "kernel": true, "qcow2": true, "runtime": true, "instance": true, "capsule": true, "image": true}
+
+				// If the first token isn't a recognized format, treat it as the target directory name
+				if len(parts) > 0 && !knownFormats[parts[0]] {
+					targetDir = parts[0]
+					parts = parts[1:]
+				}
+
+				if len(parts) == 0 {
+					continue
+				}
+
+				// Set up environment block for the templates
+				b.Instructions = append(b.Instructions, Instruction{Type: "ARG", Args: "CAPSULE_NAME=" + targetDir})
+				b.Instructions = append(b.Instructions, Instruction{Type: "ARG", Args: "CAPSULE_DIR=${BASEDIR}/capsules/${CAPSULE_NAME}"})
+				b.Instructions = append(b.Instructions, Instruction{Type: "ARG", Args: "ARTEFACTS_DIR=${CAPSULE_DIR}/capsule-${CAPSULE_NAME}-artifacts"})
+
+				// 1. Initialize ZFS layout & Check Clobbering
+				b.Instructions = append(b.Instructions, Instruction{
+					Type: "RUN", Args: "sys.init_capsule --target=${CAPSULE_NAME}",
+					Location: "root", Context: "host", Conditions: []string{"all"},
+				})
+
+				// 2. Desugar into templates
+				for _, format := range parts {
 					relPath := "emit/" + format
 					resolvedPath, err := b.resolveIncludePath(absPath, relPath)
 					if err == nil {
@@ -384,6 +425,12 @@ func (b *BuildApp) parseFile(ctx context.Context, filePath string, visited map[s
 						b.Log.Warn(ctx, "no template found for EMIT format", "format", format)
 					}
 				}
+
+				// 3. Finalize YAML metadata and Promote Dataset
+				b.Instructions = append(b.Instructions, Instruction{
+					Type: "RUN", Args: "sys.finalize_capsule --target=${CAPSULE_NAME} --formats=" + strings.Join(parts, "|"),
+					Location: "root", Context: "host", Conditions: []string{"all"},
+				})
 				continue
 			}
 
@@ -497,7 +544,17 @@ func (b *BuildApp) PreProcess(ctx context.Context) error {
 	for k, v := range b.BuildArgs {
 		activeArgs[k] = v
 	}
+
+	// Pre-calculate the default name so it can be interpolated by EMIT macros
+	defaultName := b.Name
+	if defaultName == "" {
+		base := filepath.Base(b.Dockerfile)
+		defaultName = strings.TrimSuffix(base, filepath.Ext(base))
+	}
+
 	activeEnv := make(map[string]string)
+	activeEnv["NAME"] = defaultName // Pre-seed for AST interpolation
+
 	activeWorkdir := "/"
 	activeUser := "root"
 	activeStageMounts := make(map[string]string)
@@ -510,7 +567,8 @@ func (b *BuildApp) PreProcess(ctx context.Context) error {
 			if v, ok := activeArgs[k]; ok {
 				return v
 			}
-			return ""
+			// CRITICAL FIX: Retain unknown variables so they can be securely expanded at runtime.
+			return "${" + k + "}"
 		})
 	}
 
@@ -585,7 +643,10 @@ func (b *BuildApp) PreProcess(ctx context.Context) error {
 				b.Volumes[strings.Trim(strings.TrimSpace(vol), `"`)] = struct{}{}
 			}
 		case "NAME", "VMOUT":
-			b.Name = cleanArgs
+			if b.Name == "" {
+				b.Name = cleanArgs
+			}
+			activeEnv["NAME"] = cleanArgs
 		case "EMIT":
 			emits := strings.Split(cleanArgs, ",")
 			for _, e := range emits {
@@ -624,8 +685,7 @@ func (b *BuildApp) PreProcess(ctx context.Context) error {
 	}
 
 	if b.Name == "" {
-		base := filepath.Base(b.Dockerfile)
-		b.Name = strings.TrimSuffix(base, filepath.Ext(base))
+		b.Name = defaultName
 	}
 
 	if len(b.Emits) == 0 {

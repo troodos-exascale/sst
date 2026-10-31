@@ -1,11 +1,28 @@
+// Copyright 2025-2026 Peter Braam
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package rtsst
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/troodos-exascale/sst/internal/sst"
 )
 
 type DatasetManager struct {
@@ -112,24 +129,46 @@ func (d *DatasetManager) ClearCache() error {
 	return nil
 }
 
-func (d *DatasetManager) PromoteTo(subPath, destCategory, destName string) error {
-	srcPath := d.MountPath(subPath)
-	dstPath := filepath.Join(d.BasePoint, destCategory, destName)
+// PromoteCapsule takes an assembled capsule directory from the build area
+// and atomically moves it into the permanent catalog (images or instances).
+// If ZFS is active, the artefacts/ subdirectory is natively 'zfs rename'd.
+func (d *DatasetManager) PromoteCapsule(target, srcCapsuleDir, kind string) error {
+	destCapsuleDir := filepath.Join(d.BasePoint, kind, target)
+	_ = os.MkdirAll(filepath.Dir(destCapsuleDir), 0755)
+
+	// Clean out any previous incomplete or overwritten state
+	_ = os.RemoveAll(destCapsuleDir)
 
 	if d.Zpool != "" {
-		srcDS := d.datasetPath(subPath)
-		dstDS := fmt.Sprintf("%s/%s/%s", d.Zpool, destCategory, destName)
+		// e.g. <pool>/builds/<id>/capsules/ubuntu-efi-artifacts
+		srcDS := fmt.Sprintf("%s/capsules/%s-artifacts", d.datasetPath(""), target)
+		// We nest it structurally in ZFS as <pool>/catalog/<kind>/<target>-artifacts
+		dstDS := fmt.Sprintf("%s/catalog/%s/%s-artifacts", d.Zpool, kind, target)
 
+		// Create parent dataset structure if needed
 		_ = exec.Command("zfs", "create", "-p", filepath.Dir(dstDS)).Run()
-		if err := exec.Command("zfs", "rename", srcDS, dstDS).Run(); err != nil {
-			return fmt.Errorf("zfs rename failed: %w", err)
+
+		// 1. Move the plain text directory (image.yaml, blueprint/) FIRST
+		if err := os.Rename(srcCapsuleDir, destCapsuleDir); err != nil {
+			// Fallback if renaming across mount boundaries
+			_, cpErr := sst.ExecShell(context.Background(), nil, "cp", "-a", srcCapsuleDir, destCapsuleDir)
+			if cpErr != nil {
+				return fmt.Errorf("failed to copy capsule directory to catalog: %w", cpErr)
+			}
 		}
-		_ = exec.Command("zfs", "set", "mountpoint="+dstPath, dstDS).Run()
+
+		// 2. Atomically rename the artifacts dataset to rest under the new mountpoint
+		if err := exec.Command("zfs", "rename", "-f", srcDS, dstDS).Run(); err == nil {
+			newMount := filepath.Join(destCapsuleDir, fmt.Sprintf("capsule-%s-artifacts", target))
+			_ = exec.Command("zfs", "set", "mountpoint="+newMount, dstDS).Run()
+		} else {
+			return fmt.Errorf("zfs rename of artifacts failed: %w", err)
+		}
 		return nil
 	}
 
-	os.MkdirAll(filepath.Dir(dstPath), 0755)
-	return os.Rename(srcPath, dstPath)
+	// No ZFS: simply rename the directory structure directly
+	return os.Rename(srcCapsuleDir, destCapsuleDir)
 }
 
 func (d *DatasetManager) SnapshotDataset(subPath, tag string) error {
@@ -160,7 +199,7 @@ func (d *DatasetManager) RollbackDataset(subPath, tag string) error {
 
 func (d *DatasetManager) CheckSnapshot(subPath, tag string) bool {
 	if d.Zpool == "" {
-		// FIX: Returning false ensures engine proceeds to Action when ZFS is not active
+		// Returning false ensures engine proceeds to Action when ZFS is not active
 		return false 
 	}
 	dsPath := d.datasetPath(subPath)

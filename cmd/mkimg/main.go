@@ -1,3 +1,17 @@
+// Copyright 2025-2026 Peter Braam
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package main
 
 import (
@@ -50,16 +64,9 @@ func delegateToLinuxVM() {
 		return
 	}
 
-	hostContextDir := "."
 	instanceName := ""
 
 	if len(os.Args) >= 3 {
-		for i := len(os.Args) - 1; i >= 2; i-- {
-			if info, err := os.Stat(os.Args[i]); err == nil && info.IsDir() {
-				hostContextDir = os.Args[i]
-				break
-			}
-		}
 		if os.Args[1] == "instance" {
 			var positionals []string
 			for i := 2; i < len(os.Args); i++ {
@@ -97,6 +104,11 @@ func delegateToLinuxVM() {
 	}
 	vmCmd = append(vmCmd, fmt.Sprintf("SST_LOG_FORMAT='%s'", logFmt))
 	vmCmd = append(vmCmd, fmt.Sprintf("HOME='%s'", rtsst.Home()))
+
+	// Propagate custom runtime directory environment variable INTO the VM
+	if rd := os.Getenv("SST_RUNTIME_DIR"); rd != "" {
+		vmCmd = append(vmCmd, fmt.Sprintf("SST_RUNTIME_DIR='%s'", rd))
+	}
 	
 	if pubKey, err := rtsst.GetLocalPublicKey(); err == nil && pubKey != "" {
 		vmCmd = append(vmCmd, fmt.Sprintf("SST_HOST_PUBKEY='%s'", strings.TrimSpace(pubKey)))
@@ -106,6 +118,17 @@ func delegateToLinuxVM() {
 	vmCmd = append(vmCmd, os.Args[1:]...)
 
 	hostCmd := exec.Command(hostRunctlPath, "ssh", vmBuildHost, strings.Join(vmCmd, " "))
+	
+	// CRITICAL FIX: We must strip SST_RUNTIME_DIR from the host execution environment so that 
+	// `runctl ssh ub` successfully looks in the global ~/.runtimes catalog to find the VM!
+	var cleanEnv []string
+	for _, env := range os.Environ() {
+		if !strings.HasPrefix(env, "SST_RUNTIME_DIR=") {
+			cleanEnv = append(cleanEnv, env)
+		}
+	}
+	hostCmd.Env = cleanEnv
+
 	hostCmd.Stdin, hostCmd.Stdout, hostCmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 
 	if err := hostCmd.Run(); err != nil {
@@ -113,9 +136,13 @@ func delegateToLinuxVM() {
 		os.Exit(1)
 	}
 
-	// FIX: Ensure all image/instance commands trigger purification
+	// Ensure all image/instance commands trigger purification (using the correct runtime dir)
 	if arg1 == "build" || arg1 == "instance" || arg1 == "clone" || arg1 == "runtime" {
-		if err := ProcessPurificationQueue(hostContextDir); err != nil {
+		hostRuntimeDir := os.Getenv("SST_RUNTIME_DIR")
+		if hostRuntimeDir == "" {
+			hostRuntimeDir = rtsst.RuntimeDir()
+		}
+		if err := ProcessPurificationQueue(hostRuntimeDir); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: host purification failed: %v\n", err)
 		}
 	}

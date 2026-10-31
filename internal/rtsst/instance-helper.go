@@ -1,3 +1,17 @@
+// Copyright 2025-2026 Peter Braam
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package rtsst
 
 import (
@@ -30,6 +44,9 @@ func Home() string {
 }
 
 func RuntimeDir() string {
+	if rd := os.Getenv("SST_RUNTIME_DIR"); rd != "" {
+		return rd
+	}
 	return filepath.Join(Home(), ".runtimes")
 }
 
@@ -38,7 +55,7 @@ func InstanceRoot() string {
 }
 
 // InstanceDir resolves the absolute path to a runtime instance.
-// It checks the current working directory first, then falls back to the global ~/.runtimes catalog.
+// It checks the current working directory first, then falls back to the global catalog.
 func InstanceDir(name string) string {
 	// 1. Local CWD check
 	if cwd, err := os.Getwd(); err == nil {
@@ -56,7 +73,7 @@ func InstanceDir(name string) string {
 	}
 
 	// 2. Global Catalog check (~/.runtimes/instances/<name> -> symlink to host context)
-	globalPath := filepath.Join(Home(), ".runtimes", "instances", name)
+	globalPath := filepath.Join(RuntimeDir(), "instances", name)
 	if info, err := os.Lstat(globalPath); err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
 			if realPath, err := filepath.EvalSymlinks(globalPath); err == nil {
